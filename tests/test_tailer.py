@@ -211,3 +211,17 @@ def test_locator_discovers_non_default_uid_session(tmp_path: Path, monkeypatch) 
     path.write_text("CREATE_GAME\n", encoding="utf-8")
 
     assert PowerLogLocator().resolve() == path.resolve()
+
+
+def test_configured_logs_directory_discovers_nested_session(tmp_path: Path) -> None:
+    logs = tmp_path / "Logs"
+    older = logs / "Hearthstone_2026_08_19_010000" / "Power.log"
+    newer = logs / "uid" / "Hearthstone_2026_08_19_020000" / "Power.log"
+    older.parent.mkdir(parents=True)
+    newer.parent.mkdir(parents=True)
+    older.write_text("old\n", encoding="utf-8")
+    newer.write_text("new\n", encoding="utf-8")
+    os.utime(older, ns=(1_000_000_000, 1_000_000_000))
+    os.utime(newer, ns=(2_000_000_000, 2_000_000_000))
+
+    assert PowerLogLocator(str(logs)).resolve() == newer.resolve()

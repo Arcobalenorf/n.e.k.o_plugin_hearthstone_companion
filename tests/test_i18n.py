@@ -63,3 +63,45 @@ def test_package_versions_match() -> None:
         package for package in lock["package"] if package["name"] == "hearthstone-companion"
     )
     assert manifest["plugin"]["version"] == project["project"]["version"] == locked_project["version"]
+
+
+def test_network_user_agent_matches_package_version() -> None:
+    with (ROOT / "plugin.toml").open("rb") as handle:
+        version = tomllib.load(handle)["plugin"]["version"]
+    catalog_source = (ROOT / "card_catalog.py").read_text(encoding="utf-8")
+
+    assert f'"NEKO-Hearthstone-Companion/{version} "' in catalog_source
+
+
+def test_primary_setup_is_offline_first_and_keeps_log_details_in_diagnostics() -> None:
+    panel_source = (ROOT / "ui" / "panel.tsx").read_text(encoding="utf-8")
+    setup_start = panel_source.index('<Card title={t("sections.setup.title")}>')
+    setup_end = panel_source.index('{game.mode === "battlegrounds"', setup_start)
+    setup_source = panel_source[setup_start:setup_end]
+
+    assert 't("setup.offlineHelp")' in setup_source
+    assert 'actionAvailable("save_settings")' in setup_source
+    assert "monitorReady" not in setup_source
+    assert "prepare_power_log" not in setup_source
+    assert "settings.logPath" not in setup_source
+    assert "actions.enable_companion.questionsOnly" in panel_source
+    assert "actions.enable_companion.withCommentary" in panel_source
+
+
+def test_successful_action_is_not_reclassified_when_followup_refresh_fails() -> None:
+    panel_source = (ROOT / "ui" / "panel.tsx").read_text(encoding="utf-8")
+
+    assert "let refreshed = true" in panel_source
+    assert 't("warnings.refreshAfterAction")' in panel_source
+    assert "return { ok: true, refreshed, result }" in panel_source
+    assert "preserveDraftOnCleanRef.current = !outcome.refreshed" in panel_source
+
+
+def test_quickstart_keeps_technical_log_details_out_of_primary_flow() -> None:
+    quickstart = (ROOT / "docs" / "quickstart.md").read_text(encoding="utf-8")
+
+    assert "不需要先打开炉石" in quickstart
+    assert "%LOCALAPPDATA%" not in quickstart
+    assert "```ini" not in quickstart
+    assert "monitor_running" not in quickstart
+    assert "source_state" not in quickstart

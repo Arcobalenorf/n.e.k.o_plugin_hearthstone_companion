@@ -27,7 +27,7 @@ class PowerLogLocator:
         if self.configured_path:
             configured = _expanded_path(self.configured_path)
             if configured.is_dir():
-                return [configured / "Power.log"]
+                return self._directory_candidates(configured)
             return [configured]
 
         local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
@@ -42,14 +42,19 @@ class PowerLogLocator:
                 pass
         candidates: list[Path] = []
         for logs_root in log_roots:
-            candidates.append(logs_root / "Power.log")
-            if logs_root.is_dir():
-                try:
-                    candidates.extend(logs_root.glob("*/Power.log"))
-                    candidates.extend(logs_root.glob("*/*/Power.log"))
-                except OSError:
-                    pass
+            candidates.extend(self._directory_candidates(logs_root))
         return list(dict.fromkeys(path.resolve() for path in candidates))
+
+    @staticmethod
+    def _directory_candidates(root: Path) -> list[Path]:
+        candidates = [root / "Power.log"]
+        if root.is_dir():
+            try:
+                candidates.extend(root.glob("*/Power.log"))
+                candidates.extend(root.glob("*/*/Power.log"))
+            except OSError:
+                pass
+        return candidates
 
     def resolve(self) -> Path | None:
         existing: list[tuple[int, Path]] = []

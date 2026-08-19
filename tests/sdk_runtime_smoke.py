@@ -114,8 +114,9 @@ class _HostContext:
             "config": effective["config"],
         }
 
-    def push_message(self, **_kwargs: Any) -> dict[str, bool]:
-        return {"submitted": True}
+    def push_message(self, **_kwargs: Any) -> None:
+        # N.E.K.O v0.8.3 accepted pushes successfully but returned no receipt.
+        return None
 
     def update_status(self, _status: dict[str, object]) -> None:
         return None
@@ -176,11 +177,21 @@ async def _exercise_lifecycle(plugin: Any, unwrap_or: Any) -> None:
             raise RuntimeError("stable SDK smoke unexpectedly started the log monitor")
         if startup.get("card_catalog_started") is not False:
             raise RuntimeError("stable SDK smoke unexpectedly started the network catalog")
-        saved = unwrap_or(await plugin.save_settings(llm_data_consent=True), {})
-        if saved.get("llm_enabled") is not False:
+        saved = unwrap_or(
+            await plugin.save_settings(
+                llm_data_consent=True,
+                llm_commentary_enabled=True,
+            ),
+            {},
+        )
+        if saved.get("llm_enabled") is not True:
             raise RuntimeError(f"unexpected settings save result: {saved!r}")
         if plugin.cfg.llm_data_consent is not True:
             raise RuntimeError("stable SDK smoke did not persist LLM data consent")
+        plugin._monitor_dispatch_enabled = True
+        commentary = unwrap_or(await plugin.test_commentary(), {})
+        if commentary.get("llm_submitted") is not True:
+            raise RuntimeError(f"stable SDK legacy push receipt was rejected: {commentary!r}")
     finally:
         shutdown = unwrap_or(await plugin.shutdown(), {})
     if shutdown.get("status") != "stopped":

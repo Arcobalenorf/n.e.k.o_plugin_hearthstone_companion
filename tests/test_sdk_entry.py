@@ -139,6 +139,129 @@ def test_plugin_constructs_and_starts_with_stable_sdk_surface(
     assert shutdown_result["status"] == "stopped"
 
 
+def test_legacy_none_push_receipt_is_treated_as_accepted(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+
+    assert entry._submitted(None) is True
+    assert entry._submitted({"submitted": True}) is True
+    assert entry._submitted({"submitted": False}) is False
+
+
+def test_legacy_none_push_receipt_preserves_targeted_context_lifecycle(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    submitted: list[dict[str, Any]] = []
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(
+        llm_commentary_enabled=True,
+        llm_data_consent=True,
+        target_lanlan="兰兰A",
+    )
+    plugin._context_target = None
+    plugin._ownership_lock = threading.RLock()
+    plugin._last_user_chat_at = 0.0
+    plugin._started = True
+    plugin._monitor_dispatch_enabled = True
+    plugin._settings_transition = False
+    plugin.ctx = types.SimpleNamespace(_current_lanlan="兰兰A")
+    plugin.push_message = lambda **kwargs: submitted.append(kwargs)
+
+    assert plugin._dispatch_llm(
+        "structured event prompt",
+        GameEvent("battlegrounds_triple", 9, "triple", 101.0, {}),
+        GameSnapshot(mode="battlegrounds", phase="playing"),
+    )
+    assert plugin._dispatch_llm(
+        "terminal prompt",
+        GameEvent("battlegrounds_game_ended", 10, "ended", 102.0, {"placement": 1}),
+        GameSnapshot(mode="battlegrounds", phase="ended"),
+    )
+
+    assert [item["ai_behavior"] for item in submitted] == ["read", "respond", "respond", "read"]
+    assert submitted[-1]["metadata"]["context_expired"] is True
+    assert plugin._context_target is None
+
+
+def test_legacy_none_push_receipt_counts_default_target_submission(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    submitted: list[dict[str, Any]] = []
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(llm_commentary_enabled=True, llm_data_consent=True)
+    plugin._context_target = None
+    plugin._ownership_lock = threading.RLock()
+    plugin._last_user_chat_at = 0.0
+    plugin._started = True
+    plugin._monitor_dispatch_enabled = True
+    plugin._settings_transition = False
+    plugin.ctx = types.SimpleNamespace()
+    plugin.push_message = lambda **kwargs: submitted.append(kwargs)
+    monitor = entry.CompanionMonitor(
+        plugin.cfg,
+        types.SimpleNamespace(warning=lambda *_args: None),
+        on_llm=plugin._dispatch_llm,
+    )
+
+    monitor._handle_event(
+        GameEvent("battlegrounds_triple", 9, "triple", 100.0, {}),
+        GameSnapshot(mode="battlegrounds", phase="playing"),
+        100.0,
+    )
+
+    assert [item["ai_behavior"] for item in submitted] == ["respond"]
+    assert "target_lanlan" not in submitted[0]
+    assert monitor.status().llm_submissions == 1
+
+
+def test_startup_failure_rolls_back_started_workers(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+
+    async def no_op() -> None:
+        return None
+
+    class Writer:
+        running = False
+
+        def start(self) -> bool:
+            self.running = True
+            return True
+
+        def stop(self, **_kwargs: Any) -> bool:
+            self.running = False
+            return True
+
+        def is_running(self) -> bool:
+            return self.running
+
+    writer = Writer()
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(
+        monitor_on_start=False,
+        card_catalog_network_enabled=False,
+        overlay_auto_start=False,
+    )
+    plugin._reload_config = no_op
+    plugin._load_stats = no_op
+    plugin._store_writer = writer
+    plugin._catalog = types.SimpleNamespace(start=lambda: False, stop=lambda **_kwargs: True)
+    plugin._overlay = types.SimpleNamespace(stop=lambda **_kwargs: {"ok": True, "running": False})
+    plugin._monitor = None
+    plugin._ensure_monitor = lambda: (_ for _ in ()).throw(RuntimeError("monitor init failed"))
+    plugin._ownership_lock = threading.RLock()
+    plugin._monitor_action_lock = asyncio.Lock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._context_target = None
+    plugin._started = False
+    plugin._monitor_dispatch_enabled = False
+    plugin._settings_transition = False
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args, **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="monitor init failed"):
+        asyncio.run(plugin.startup())
+
+    assert writer.is_running() is False
+    assert plugin._started is False
+    assert plugin._monitor_dispatch_enabled is False
+
+
 def test_llm_state_tool_does_not_read_state_without_data_consent(monkeypatch) -> None:
     entry = _load_sdk_entry(monkeypatch)
 
@@ -572,6 +695,60 @@ def test_save_settings_patches_only_explicit_fields(monkeypatch) -> None:
     assert plugin.cfg.target_lanlan == "兰兰A"
     assert plugin.cfg.overlay_height_percent == 41
     assert plugin.cfg.overlay_font_size == 29
+
+
+def test_save_settings_succeeds_without_hearthstone_or_power_log(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    current = CompanionConfig(monitor_on_start=True).to_dict()
+    persisted: list[dict[str, Any]] = []
+    monitor_updates: list[CompanionConfig] = []
+
+    class Config:
+        async def update(self, patch: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+            persisted.append(patch)
+            current.update(patch[entry._CONFIG_SECTION])
+            return {entry._CONFIG_SECTION: dict(current)}
+
+    monitor = types.SimpleNamespace(
+        update_config=lambda config: monitor_updates.append(config),
+        status=lambda: (_ for _ in ()).throw(AssertionError("save must not inspect log status")),
+        snapshot=lambda: (_ for _ in ()).throw(AssertionError("save must not read game state")),
+        start=lambda: (_ for _ in ()).throw(AssertionError("save must not start Hearthstone monitoring")),
+    )
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig.from_mapping(current)
+    plugin._context_target = None
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._settings_transition = False
+    plugin._started = True
+    plugin.ctx = types.SimpleNamespace(_current_lanlan="")
+    plugin.config = Config()
+    plugin._monitor = monitor
+    plugin._catalog = types.SimpleNamespace(configure=lambda **_kwargs: None)
+    plugin._overlay = types.SimpleNamespace(
+        status=lambda: {"running": False},
+        configure=lambda _config: None,
+    )
+    plugin._ensure_monitor = lambda: monitor
+
+    result = asyncio.run(
+        plugin.save_settings(
+            llm_data_consent=True,
+            llm_commentary_enabled=True,
+        )
+    )
+
+    assert result["llm_enabled"] is True
+    assert persisted == [
+        {
+            entry._CONFIG_SECTION: {
+                "llm_commentary_enabled": True,
+                "llm_data_consent": True,
+            }
+        }
+    ]
+    assert len(monitor_updates) == 1
 
 
 def test_save_settings_creates_default_profile_for_stable_sdk(monkeypatch) -> None:
@@ -1514,6 +1691,26 @@ def test_commentary_reports_error_when_no_output_channel_accepts(monkeypatch) ->
 
     assert isinstance(result, RuntimeError)
     assert "no commentary output channel" in str(result)
+
+
+def test_commentary_reports_error_when_character_rejects_but_overlay_accepts(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(llm_commentary_enabled=True, llm_data_consent=True)
+    plugin._ownership_lock = threading.RLock()
+    plugin._context_target = None
+    plugin._started = True
+    plugin._monitor_dispatch_enabled = True
+    plugin._settings_transition = False
+    plugin._last_user_chat_at = 0.0
+    plugin._overlay = types.SimpleNamespace(push=lambda *_args, **_kwargs: True)
+    plugin._ensure_monitor = lambda: types.SimpleNamespace(snapshot=GameSnapshot)
+    plugin.push_message = lambda **_kwargs: {"submitted": False}
+
+    result = asyncio.run(plugin.test_commentary())
+
+    assert isinstance(result, RuntimeError)
+    assert "current NEKO character did not accept" in str(result)
 
 
 def test_stop_overlay_reports_process_stop_failure(monkeypatch) -> None:

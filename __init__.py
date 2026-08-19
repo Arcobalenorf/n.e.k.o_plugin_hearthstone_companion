@@ -89,6 +89,10 @@ def _unwrap_persisted_config(value: Any) -> dict[str, Any]:
 
 
 def _submitted(result: Any) -> bool:
+    # Stable hosts through N.E.K.O v0.8.3 returned None after accepting a push.
+    # Newer hosts expose an explicit submitted flag, including explicit rejects.
+    if result is None:
+        return True
     if isinstance(result, Mapping):
         return bool(result.get("submitted"))
     try:
@@ -171,18 +175,28 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
 
     @lifecycle(id="startup")
     async def startup(self, **_: Any):
-        await self._reload_config()
-        await self._load_stats()
-        self._store_writer.start()
-        catalog_started = self._catalog.start()
-        self._ensure_monitor()
-        with self._ownership_lock:
-            self._started = True
-            self._monitor_dispatch_enabled = self.cfg.monitor_on_start
-        monitor_started = self._monitor.start() if self.cfg.monitor_on_start and self._monitor else False
-        overlay_result: dict[str, Any] = {"ok": True, "running": False, "auto_start": False}
-        if self.cfg.overlay_enabled and self.cfg.overlay_auto_start:
-            overlay_result = await asyncio.to_thread(self._overlay.start)
+        try:
+            await self._reload_config()
+            await self._load_stats()
+            self._store_writer.start()
+            catalog_started = self._catalog.start()
+            self._ensure_monitor()
+            with self._ownership_lock:
+                self._started = True
+                self._monitor_dispatch_enabled = self.cfg.monitor_on_start
+            monitor_started = self._monitor.start() if self.cfg.monitor_on_start and self._monitor else False
+            overlay_result: dict[str, Any] = {"ok": True, "running": False, "auto_start": False}
+            if self.cfg.overlay_enabled and self.cfg.overlay_auto_start:
+                overlay_result = await asyncio.to_thread(self._overlay.start)
+        except BaseException:
+            try:
+                await self.shutdown()
+            except BaseException as cleanup_exc:
+                self.logger.warning(
+                    "Hearthstone startup rollback failed code=%s",
+                    type(cleanup_exc).__name__,
+                )
+            raise
         self.logger.info(
             "Hearthstone companion ready monitor=%s overlay=%s llm=%s consent=%s",
             bool(self._monitor and self._monitor.status().monitor_running),
@@ -1005,13 +1019,16 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         snapshot = self._ensure_monitor().snapshot()
         overlay_ok = self._overlay.push("独立浮层诊断成功", priority=event.priority, style="diagnostic")
         llm_ok = False
-        if self.cfg.llm_commentary_enabled and self.cfg.llm_data_consent:
+        llm_expected = self.cfg.llm_commentary_enabled and self.cfg.llm_data_consent
+        if llm_expected:
             prompt = (
                 "Hearthstone companion commentary boundary:\n"
                 f"请保持当前角色人设，只输出一句不超过 {self.cfg.llm_max_reply_chars} 个汉字的测试台词；"
                 "不要提问，不要给出牌建议。"
             )
             llm_ok = self._dispatch_llm(prompt, event, snapshot)
+        if llm_expected and not llm_ok:
+            return Err(SdkError("current NEKO character did not accept the commentary test message"))
         if not overlay_ok and not llm_ok:
             return Err(SdkError("no commentary output channel accepted the test message"))
         return Ok(

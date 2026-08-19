@@ -25,6 +25,7 @@ import {
   useConfirm,
   useEffect,
   useMemo,
+  useRef,
   useState,
   useToast,
 } from "@neko/plugin-ui"
@@ -215,6 +216,12 @@ type SettingsDraft = {
   overlay_speed_px_per_second: number
 }
 
+type ActionOutcome = {
+  ok: boolean
+  refreshed: boolean
+  result: Record<string, unknown>
+}
+
 const DEFAULT_SETTINGS: SettingsDraft = {
   log_path: "",
   llm_commentary_enabled: false,
@@ -247,7 +254,7 @@ function stateTone(value: string): Tone {
   if (["watching", "playing", "running"].includes(value)) return "success"
   if (["degraded", "unavailable", "error"].includes(value)) return "danger"
   if (["waiting", "waiting_for_log", "starting", "mulligan"].includes(value)) return "warning"
-  if (["spectator", "ended"].includes(value)) return "info"
+  if (["bootstrap_incomplete", "spectator", "ended"].includes(value)) return "info"
   return "default"
 }
 
@@ -255,6 +262,15 @@ function errorText(error: unknown, fallback: string): string {
   if (error instanceof Error && error.message) return error.message
   if (typeof error === "string" && error) return error
   return fallback
+}
+
+function unwrapActionResult(envelope: unknown): Record<string, unknown> {
+  if (!envelope || typeof envelope !== "object") return {}
+  const value = envelope as Record<string, unknown>
+  if (value.result && typeof value.result === "object") {
+    return value.result as Record<string, unknown>
+  }
+  return value
 }
 
 export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<DashboardState>) {
@@ -283,9 +299,16 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
   const [busyAction, setBusyAction] = useState("")
   const [notice, setNotice] = useState("")
   const [failure, setFailure] = useState("")
+  const [refreshWarning, setRefreshWarning] = useState("")
+  const preserveDraftOnCleanRef = useRef(false)
 
   useEffect(() => {
-    if (!draftDirty) setDraft(asSettingsDraft(safeState.settings))
+    if (draftDirty) return
+    if (preserveDraftOnCleanRef.current) {
+      preserveDraftOnCleanRef.current = false
+      return
+    }
+    setDraft(asSettingsDraft(safeState.settings))
   }, [safeState.settings, draftDirty])
 
   const recentCards = useMemo<RecentCardRow[]>(
@@ -364,24 +387,33 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
   async function runAction(
     actionId: string,
     args: Record<string, unknown>,
-    successKey: string,
-  ): Promise<boolean> {
+    successKey: string | ((result: Record<string, unknown>) => string),
+  ): Promise<ActionOutcome> {
     if (!actionAvailable(actionId)) {
       const message = t("errors.actionUnavailable", { action: actionId })
       setFailure(message)
       toast.error(message)
-      return false
+      return { ok: false, refreshed: false, result: {} }
     }
     setBusyAction(actionId)
     setFailure("")
     setNotice("")
+    setRefreshWarning("")
     try {
-      await props.api.call(actionId, args)
-      await props.api.refresh()
-      const message = t(successKey)
+      const result = unwrapActionResult(await props.api.call(actionId, args))
+      let refreshed = true
+      try {
+        await props.api.refresh()
+      } catch {
+        refreshed = false
+        const refreshMessage = t("warnings.refreshAfterAction")
+        setRefreshWarning(refreshMessage)
+        toast.warning(refreshMessage)
+      }
+      const message = t(typeof successKey === "function" ? successKey(result) : successKey)
       setNotice(message)
       toast.success(message)
-      return true
+      return { ok: true, refreshed, result }
     } catch (error) {
       try {
         await props.api.refresh()
@@ -391,7 +423,7 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
       const message = errorText(error, t("errors.actionFailed"))
       setFailure(message)
       toast.error(message)
-      return false
+      return { ok: false, refreshed: false, result: {} }
     } finally {
       setBusyAction("")
     }
@@ -405,7 +437,13 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
       confirmLabel: t("confirm.prepareLog.confirm"),
       cancelLabel: t("common.cancel"),
     })
-    if (accepted) await runAction("prepare_power_log", {}, "messages.logPrepared")
+    if (accepted) {
+      await runAction(
+        "prepare_power_log",
+        {},
+        (result) => result.changed ? "messages.logPreparedChanged" : "messages.logPreparedReady",
+      )
+    }
   }
 
   async function resetBattlegroundsStats() {
@@ -426,7 +464,14 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
       toast.warning(message)
       return
     }
-    if (await runAction("save_settings", draft, "messages.settingsSaved")) {
+    const successKey = !draft.llm_data_consent
+      ? "messages.savedLocalOnly"
+      : draft.llm_commentary_enabled
+        ? "messages.savedWithCommentary"
+        : "messages.savedQuestionsOnly"
+    const outcome = await runAction("save_settings", draft, successKey)
+    if (outcome.ok) {
+      preserveDraftOnCleanRef.current = !outcome.refreshed
       setDraftDirty(false)
     }
   }
@@ -456,11 +501,20 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
   const phase = String(game.phase || "unknown")
   const overlayStatus = overlay.running ? "running" : overlay.available === false ? "unavailable" : "stopped"
   const overlaySettingEnabled = draft.overlay_enabled && safeState.settings?.overlay_enabled !== false
-  const monitorReady = Boolean(runtime.monitor_running) && sourceState === "watching"
-  const consentReady = Boolean(safeState.settings?.llm_data_consent)
-  const commentaryReady = Boolean(
-    safeState.settings?.llm_data_consent && safeState.settings?.llm_commentary_enabled,
-  )
+  const connectionKey = sourceState === "watching"
+    ? "setup.connection.connected"
+    : sourceState === "bootstrap_incomplete"
+      ? "setup.connection.bootstrap"
+      : sourceState === "degraded" || Boolean(runtime.last_error_code)
+        ? "setup.connection.degraded"
+        : runtime.monitor_running
+          ? "setup.connection.waiting"
+          : "setup.connection.stopped"
+  const enableActionKey = !draft.llm_data_consent
+    ? "actions.enable_companion.localOnly"
+    : draft.llm_commentary_enabled
+      ? "actions.enable_companion.withCommentary"
+      : "actions.enable_companion.questionsOnly"
 
   return (
     <Page title={t("panel.title")} subtitle={t("panel.subtitle")}>
@@ -477,6 +531,7 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
         </Inline>
 
         {notice ? <Alert tone="success">{notice}</Alert> : null}
+        {refreshWarning ? <Warning>{refreshWarning}</Warning> : null}
         {failure ? <InlineError title={t("errors.title")} error={failure} /> : null}
         {props.warnings?.length ? (
           <Warning>{t("warnings.hosted", { count: props.warnings.length })}</Warning>
@@ -484,63 +539,39 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
 
         <Card title={t("sections.setup.title")}>
           <Stack>
-            <Text>{t("setup.subtitle")}</Text>
-            <Grid cols={3}>
-              <Stack>
-                <Heading as="h3">{t("setup.monitor.title")}</Heading>
-                <StatusBadge
-                  tone={monitorReady ? "success" : runtime.monitor_running ? "warning" : "default"}
-                  label={t(monitorReady ? "setup.monitor.ready" : runtime.monitor_running ? "setup.monitor.waiting" : "setup.monitor.stopped")}
-                />
-                <Text>{t(monitorReady ? "setup.monitor.readyHelp" : "setup.monitor.actionHelp")}</Text>
-              </Stack>
-              <Stack>
-                <Heading as="h3">{t("setup.consent.title")}</Heading>
-                <StatusBadge
-                  tone={consentReady ? "success" : "warning"}
-                  label={t(consentReady ? "setup.enabled" : "setup.disabled")}
-                />
-                <Text>{t(consentReady ? "setup.consent.enabledHelp" : "setup.consent.disabledHelp")}</Text>
-              </Stack>
-              <Stack>
-                <Heading as="h3">{t("setup.commentary.title")}</Heading>
-                <StatusBadge
-                  tone={commentaryReady ? "success" : "default"}
-                  label={t(commentaryReady ? "setup.enabled" : "setup.disabled")}
-                />
-                <Text>{t(commentaryReady ? "setup.commentary.enabledHelp" : "setup.commentary.disabledHelp")}</Text>
-              </Stack>
-            </Grid>
+            <Alert tone="info">{t("setup.offlineHelp")}</Alert>
+            <Inline align="center" wrap>
+              <Text>{t("setup.connection.label")}</Text>
+              <StatusBadge tone={stateTone(sourceState)} label={localized("status.source", sourceState)} />
+              <Text>{t(connectionKey)}</Text>
+            </Inline>
             <Divider />
+            <Heading as="h3">{t("setup.consent.title")}</Heading>
             <Switch
               checked={draft.llm_data_consent}
               label={t("settings.llmConsent")}
               onChange={setConsent}
             />
-            <Text>{t("settings.llmConsentHelp")}</Text>
+            <Text>{t("setup.consent.help")}</Text>
+            <Heading as="h3">{t("setup.commentary.title")}</Heading>
             <Switch
               checked={draft.llm_commentary_enabled}
               disabled={!draft.llm_data_consent}
               label={t("settings.llmCommentary")}
               onChange={setCommentary}
             />
-            {!draft.llm_data_consent ? <Text>{t("settings.llmDisabledHelp")}</Text> : null}
-            <ButtonGroup>
-              <Button
-                tone="primary"
-                disabled={Boolean(busyAction) || !actionAvailable("prepare_power_log")}
-                onClick={preparePowerLog}
-              >
-                {t("actions.prepare_power_log.label")}
-              </Button>
+            <Text>{t(draft.llm_data_consent ? "setup.commentary.help" : "settings.llmDisabledHelp")}</Text>
+            <Divider />
+            <Inline align="center" wrap>
+              {draftDirty ? <StatusBadge tone="warning" label={t("setup.pending")} /> : null}
               <Button
                 tone="success"
                 disabled={Boolean(busyAction) || !actionAvailable("save_settings")}
                 onClick={saveSettings}
               >
-                {t("actions.enable_companion.label")}
+                {t(enableActionKey)}
               </Button>
-            </ButtonGroup>
+            </Inline>
           </Stack>
         </Card>
 
@@ -750,14 +781,6 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
 
         <Card title={t("sections.settings.title")}>
           <Stack>
-            <Field label={t("settings.logPath")} help={t("settings.logPathHelp")}>
-              <Input
-                value={draft.log_path}
-                placeholder={t("settings.logPathPlaceholder")}
-                onChange={(value) => updateDraft({ log_path: value })}
-              />
-            </Field>
-
             <Switch
               checked={draft.card_catalog_network_enabled}
               label={t("settings.cardCatalogNetwork")}
@@ -831,6 +854,7 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
                 { key: "names", label: t("privacy.playerNamesRetained"), value: yesNo(privacy.player_names_retained) },
                 { key: "hidden", label: t("privacy.hiddenCardsExposed"), value: yesNo(privacy.hidden_opponent_cards_exposed) },
                 { key: "sharing", label: t("privacy.publicStateSharing"), value: yesNo(privacy.llm_public_state_sharing_enabled) },
+                { key: "commentary", label: t("privacy.proactiveCommentary"), value: yesNo(safeState.settings?.llm_commentary_enabled) },
                 { key: "catalogNetwork", label: t("privacy.cardCatalogNetwork"), value: yesNo(privacy.card_catalog_network_enabled) },
                 { key: "catalogState", label: t("privacy.cardCatalogGameState"), value: yesNo(privacy.card_catalog_sends_game_state) },
               ]}
@@ -878,6 +902,14 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
                   details={runtime.last_error_code}
                 />
               ) : null}
+              <Divider />
+              <Field label={t("settings.logPath")} help={t("settings.logPathHelp")}>
+                <Input
+                  value={draft.log_path}
+                  placeholder={t("settings.logPathPlaceholder")}
+                  onChange={(value) => updateDraft({ log_path: value })}
+                />
+              </Field>
               <ButtonGroup>
                 <Button
                   tone="success"
@@ -938,7 +970,15 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
                 <Button
                   tone="info"
                   disabled={Boolean(busyAction) || !actionAvailable("test_commentary")}
-                  onClick={async () => { await runAction("test_commentary", {}, "messages.testSubmitted") }}
+                  onClick={async () => {
+                    await runAction(
+                      "test_commentary",
+                      {},
+                      (result) => result.llm_submitted
+                        ? "messages.testCharacterSubmitted"
+                        : "messages.testOverlaySubmitted",
+                    )
+                  }}
                 >
                   {t("actions.test_commentary.label")}
                 </Button>
