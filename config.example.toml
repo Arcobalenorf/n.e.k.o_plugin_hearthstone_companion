@@ -1,5 +1,5 @@
 [hearthstone_companion]
-# 留空时自动检测 %LOCALAPPDATA%/Blizzard/Hearthstone/Logs/Power.log。
+# 留空时自动检测本机默认目录和正在运行的 Hearthstone.exe 同目录 Logs。
 log_path = ""
 monitor_on_start = true
 

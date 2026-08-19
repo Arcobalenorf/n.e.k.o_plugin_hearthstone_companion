@@ -188,6 +188,18 @@ async def _exercise_lifecycle(plugin: Any, unwrap_or: Any) -> None:
             raise RuntimeError(f"unexpected settings save result: {saved!r}")
         if plugin.cfg.llm_data_consent is not True:
             raise RuntimeError("stable SDK smoke did not persist LLM data consent")
+        path_saved = unwrap_or(
+            await plugin.save_settings(log_path=r"  C:\Games\Hearthstone\Logs  "),
+            {},
+        )
+        if path_saved.get("llm_enabled") is not True:
+            raise RuntimeError(f"partial log-path save reset companion settings: {path_saved!r}")
+        if plugin.cfg.log_path != r"C:\Games\Hearthstone\Logs":
+            raise RuntimeError(f"log path was not normalized and applied: {plugin.cfg.log_path!r}")
+        if not plugin.cfg.llm_data_consent or not plugin.cfg.llm_commentary_enabled:
+            raise RuntimeError("partial log-path save did not preserve LLM settings")
+        if plugin._monitor._tailer.locator.configured_path != plugin.cfg.log_path:
+            raise RuntimeError("partial log-path save did not rebuild the monitor reader")
         plugin._monitor_dispatch_enabled = True
         commentary = unwrap_or(await plugin.test_commentary(), {})
         if commentary.get("llm_submitted") is not True:

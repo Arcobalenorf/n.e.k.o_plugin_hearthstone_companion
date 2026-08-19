@@ -97,6 +97,17 @@ def test_successful_action_is_not_reclassified_when_followup_refresh_fails() -> 
     assert "preserveDraftOnCleanRef.current = !outcome.refreshed" in panel_source
 
 
+def test_custom_log_path_has_an_independent_save_action_in_diagnostics() -> None:
+    panel_source = (ROOT / "ui" / "panel.tsx").read_text(encoding="utf-8")
+
+    assert 'runAction("save_settings", { log_path: normalized }, successKey, false)' in panel_source
+    assert "if (announce) {\n      setFailure(\"\")\n      setNotice(\"\")" in panel_source
+    assert "const [logPathDirty, setLogPathDirty] = useState(false)" in panel_source
+    assert '!logPathDirty || !actionAvailable("save_settings")' in panel_source
+    assert 't("actions.save_log_path.label")' in panel_source
+    assert 't("actions.restore_auto_log_path.label")' in panel_source
+
+
 def test_quickstart_keeps_technical_log_details_out_of_primary_flow() -> None:
     quickstart = (ROOT / "docs" / "quickstart.md").read_text(encoding="utf-8")
 

@@ -323,13 +323,15 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             await self._reload_config_locked()
 
     async def _reload_config_locked(self) -> None:
-        base: dict[str, Any] = {}
         try:
             dumped = await self.config.dump(timeout=5.0)
-            if isinstance(dumped, dict) and isinstance(dumped.get(_CONFIG_SECTION), dict):
-                base = dict(dumped[_CONFIG_SECTION])
         except Exception as exc:
             self.logger.warning("Hearthstone config load failed code=%s", type(exc).__name__)
+            return
+        if not isinstance(dumped, Mapping) or not isinstance(dumped.get(_CONFIG_SECTION), Mapping):
+            self.logger.warning("Hearthstone config load failed code=InvalidSection")
+            return
+        base = dict(dumped[_CONFIG_SECTION])
         updated = CompanionConfig.from_mapping(base)
         if updated.llm_commentary_enabled and not updated.llm_data_consent:
             updated.llm_commentary_enabled = False
@@ -779,7 +781,8 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
     async def _persist_settings_config(self, submitted: Mapping[str, Any]) -> Mapping[str, Any]:
         patch = {_CONFIG_SECTION: dict(submitted)}
         try:
-            return await self.config.update(patch, timeout=5.0)
+            persisted = await self.config.update(patch, timeout=5.0)
+            return await self._confirmed_settings_config(persisted, submitted)
         except Exception as exc:
             if not _is_missing_active_profile_error(exc):
                 raise
@@ -793,7 +796,8 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 {_CONFIG_SECTION: self.cfg.to_dict()},
                 timeout=5.0,
             )
-            return await self.config.update(patch, timeout=5.0)
+            persisted = await self.config.update(patch, timeout=5.0)
+            return await self._confirmed_settings_config(persisted, submitted)
         except Exception as profile_exc:
             profile_methods = (
                 "upsert_own_profile_config",
@@ -816,11 +820,25 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         raw = await updater(patch, timeout=5.0)
         _unwrap_persisted_config(raw)
 
-        confirmed = await self.config.dump(timeout=5.0)
+        return await self._confirmed_settings_config(None, submitted)
+
+    async def _confirmed_settings_config(
+        self,
+        persisted: Mapping[str, Any] | None,
+        submitted: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        section = persisted.get(_CONFIG_SECTION) if isinstance(persisted, Mapping) else None
+        expected_fields = self.cfg.to_dict().keys()
+        if not isinstance(section, Mapping) or not all(key in section for key in expected_fields):
+            confirmed = await self.config.dump(timeout=5.0)
+            section = confirmed.get(_CONFIG_SECTION) if isinstance(confirmed, Mapping) else None
+        else:
+            confirmed = persisted
         section = confirmed.get(_CONFIG_SECTION) if isinstance(confirmed, Mapping) else None
         if not isinstance(section, Mapping):
             raise RuntimeError("settings config read-back returned no Hearthstone section")
-        mismatched = [key for key, value in submitted.items() if section.get(key) != value]
+        normalized = CompanionConfig.from_mapping(section).to_dict()
+        mismatched = [key for key, value in submitted.items() if normalized.get(key) != value]
         if mismatched:
             raise RuntimeError(f"settings config read-back mismatch: {', '.join(sorted(mismatched))}")
         return confirmed

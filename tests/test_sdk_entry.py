@@ -654,6 +654,30 @@ def test_reload_config_uses_only_native_config(monkeypatch) -> None:
     assert plugin.cfg.initial_read_max_bytes == 64 * 1024 * 1024
 
 
+def test_reload_config_failure_preserves_current_runtime_config(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    monitor_updates: list[CompanionConfig] = []
+
+    class Config:
+        async def dump(self, **_kwargs: Any) -> dict[str, Any]:
+            raise TimeoutError("config IPC timed out")
+
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(log_path="keep.log", overlay_font_size=31)
+    plugin._context_target = None
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin.config = Config()
+    plugin._monitor = types.SimpleNamespace(update_config=lambda cfg: monitor_updates.append(cfg))
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
+
+    asyncio.run(plugin._reload_config())
+
+    assert plugin.cfg.log_path == "keep.log"
+    assert plugin.cfg.overlay_font_size == 31
+    assert monitor_updates == []
+
+
 def test_save_settings_patches_only_explicit_fields(monkeypatch) -> None:
     entry = _load_sdk_entry(monkeypatch)
     patches: list[dict[str, Any]] = []
@@ -695,6 +719,57 @@ def test_save_settings_patches_only_explicit_fields(monkeypatch) -> None:
     assert plugin.cfg.target_lanlan == "兰兰A"
     assert plugin.cfg.overlay_height_percent == 41
     assert plugin.cfg.overlay_font_size == 29
+
+
+def test_save_settings_reads_back_full_config_after_sparse_profile_result(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    current = CompanionConfig(
+        log_path="old.log",
+        llm_data_consent=True,
+        target_lanlan="lanlan-a",
+        overlay_font_size=31,
+    ).to_dict()
+    patches: list[dict[str, Any]] = []
+    dump_calls = 0
+    monitor_updates: list[CompanionConfig] = []
+
+    class Config:
+        async def update(self, patch: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+            patches.append(patch)
+            current.update(patch[entry._CONFIG_SECTION])
+            return {entry._CONFIG_SECTION: dict(patch[entry._CONFIG_SECTION])}
+
+        async def dump(self, **_kwargs: Any) -> dict[str, Any]:
+            nonlocal dump_calls
+            dump_calls += 1
+            return {entry._CONFIG_SECTION: dict(current)}
+
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig.from_mapping(current)
+    plugin._context_target = None
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._settings_transition = False
+    plugin._started = True
+    plugin.ctx = types.SimpleNamespace(_current_lanlan="lanlan-a")
+    plugin.config = Config()
+    plugin._monitor = types.SimpleNamespace(update_config=lambda cfg: monitor_updates.append(cfg))
+    plugin._catalog = types.SimpleNamespace(configure=lambda **_kwargs: None)
+    plugin._overlay = types.SimpleNamespace(
+        status=lambda: {"running": False},
+        configure=lambda _config: None,
+    )
+    plugin._ensure_monitor = lambda: plugin._monitor
+
+    result = asyncio.run(plugin.save_settings(log_path="  new.log  "))
+
+    assert result["llm_enabled"] is False
+    assert patches == [{entry._CONFIG_SECTION: {"log_path": "new.log"}}]
+    assert dump_calls == 1
+    assert plugin.cfg.log_path == "new.log"
+    assert plugin.cfg.target_lanlan == "lanlan-a"
+    assert plugin.cfg.overlay_font_size == 31
+    assert monitor_updates[-1].log_path == "new.log"
 
 
 def test_save_settings_succeeds_without_hearthstone_or_power_log(monkeypatch) -> None:

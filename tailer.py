@@ -3,8 +3,12 @@ from __future__ import annotations
 import os
 import re
 import stat as stat_module
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Iterable
+
+from .process_discovery import hearthstone_executable_paths
 
 MAX_LINE_BYTES = 256 * 1024
 _SPECTATOR_START_MARKERS = (b"Start Spectator Game", b"Begin Spectating 1st player", b"Begin Spectating 2nd player")
@@ -20,8 +24,18 @@ def _expanded_path(value: str) -> Path:
 
 
 class PowerLogLocator:
-    def __init__(self, configured_path: str = "") -> None:
+    def __init__(
+        self,
+        configured_path: str = "",
+        *,
+        executable_paths_provider: Callable[[], Iterable[Path]] = hearthstone_executable_paths,
+        process_scan_interval_seconds: float = 15.0,
+    ) -> None:
         self.configured_path = configured_path.strip()
+        self._executable_paths_provider = executable_paths_provider
+        self._process_scan_interval_seconds = max(1.0, float(process_scan_interval_seconds))
+        self._process_log_roots: tuple[Path, ...] = ()
+        self._next_process_scan_at = 0.0
 
     def candidates(self) -> list[Path]:
         if self.configured_path:
@@ -30,6 +44,15 @@ class PowerLogLocator:
                 return self._directory_candidates(configured)
             return [configured]
 
+        log_roots = self._default_log_roots()
+        log_roots.extend(self._running_game_log_roots())
+        candidates: list[Path] = []
+        for logs_root in log_roots:
+            candidates.extend(self._directory_candidates(logs_root))
+        return list(dict.fromkeys(path.resolve() for path in candidates))
+
+    @staticmethod
+    def _default_log_roots() -> list[Path]:
         local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
         if not local_app_data:
             return []
@@ -40,10 +63,27 @@ class PowerLogLocator:
                 log_roots.extend(path / "Logs" for path in hearthstone_root.iterdir() if path.is_dir())
             except OSError:
                 pass
-        candidates: list[Path] = []
-        for logs_root in log_roots:
-            candidates.extend(self._directory_candidates(logs_root))
-        return list(dict.fromkeys(path.resolve() for path in candidates))
+        return log_roots
+
+    def _running_game_log_roots(self) -> list[Path]:
+        now = time.monotonic()
+        if now < self._next_process_scan_at:
+            return list(self._process_log_roots)
+        self._next_process_scan_at = now + self._process_scan_interval_seconds
+        try:
+            executable_paths = tuple(self._executable_paths_provider())
+        except (OSError, RuntimeError, ValueError):
+            executable_paths = ()
+        roots: list[Path] = []
+        for raw_path in executable_paths:
+            try:
+                path = Path(raw_path)
+                if path.name.casefold() == "hearthstone.exe":
+                    roots.append(path.resolve().parent / "Logs")
+            except (OSError, RuntimeError, TypeError, ValueError):
+                continue
+        self._process_log_roots = tuple(dict.fromkeys(roots))
+        return list(self._process_log_roots)
 
     @staticmethod
     def _directory_candidates(root: Path) -> list[Path]:

@@ -205,7 +205,6 @@ type DashboardState = {
 }
 
 type SettingsDraft = {
-  log_path: string
   llm_commentary_enabled: boolean
   llm_data_consent: boolean
   target_lanlan: string
@@ -220,10 +219,10 @@ type ActionOutcome = {
   ok: boolean
   refreshed: boolean
   result: Record<string, unknown>
+  error?: string
 }
 
 const DEFAULT_SETTINGS: SettingsDraft = {
-  log_path: "",
   llm_commentary_enabled: false,
   llm_data_consent: false,
   target_lanlan: "",
@@ -236,7 +235,6 @@ const DEFAULT_SETTINGS: SettingsDraft = {
 
 function asSettingsDraft(value?: SettingsState): SettingsDraft {
   return {
-    log_path: String(value?.log_path || ""),
     llm_commentary_enabled: Boolean(value?.llm_commentary_enabled && value?.llm_data_consent),
     llm_data_consent: Boolean(value?.llm_data_consent),
     target_lanlan: String(value?.target_lanlan || ""),
@@ -296,11 +294,16 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
   const confirm = useConfirm()
   const [draft, setDraft] = useState<SettingsDraft>(() => asSettingsDraft(safeState.settings))
   const [draftDirty, setDraftDirty] = useState(false)
+  const [logPathDraft, setLogPathDraft] = useState(() => String(safeState.settings?.log_path || ""))
+  const [logPathDirty, setLogPathDirty] = useState(false)
+  const [logPathNotice, setLogPathNotice] = useState("")
+  const [logPathFailure, setLogPathFailure] = useState("")
   const [busyAction, setBusyAction] = useState("")
   const [notice, setNotice] = useState("")
   const [failure, setFailure] = useState("")
   const [refreshWarning, setRefreshWarning] = useState("")
   const preserveDraftOnCleanRef = useRef(false)
+  const preserveLogPathOnCleanRef = useRef(false)
 
   useEffect(() => {
     if (draftDirty) return
@@ -310,6 +313,15 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
     }
     setDraft(asSettingsDraft(safeState.settings))
   }, [safeState.settings, draftDirty])
+
+  useEffect(() => {
+    if (logPathDirty) return
+    if (preserveLogPathOnCleanRef.current) {
+      preserveLogPathOnCleanRef.current = false
+      return
+    }
+    setLogPathDraft(String(safeState.settings?.log_path || ""))
+  }, [safeState.settings, logPathDirty])
 
   const recentCards = useMemo<RecentCardRow[]>(
     () => [...(game.recent_cards || [])].reverse().map((card, index) => ({
@@ -388,16 +400,21 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
     actionId: string,
     args: Record<string, unknown>,
     successKey: string | ((result: Record<string, unknown>) => string),
+    announce = true,
   ): Promise<ActionOutcome> {
     if (!actionAvailable(actionId)) {
       const message = t("errors.actionUnavailable", { action: actionId })
-      setFailure(message)
-      toast.error(message)
-      return { ok: false, refreshed: false, result: {} }
+      if (announce) {
+        setFailure(message)
+        toast.error(message)
+      }
+      return { ok: false, refreshed: false, result: {}, error: message }
     }
     setBusyAction(actionId)
-    setFailure("")
-    setNotice("")
+    if (announce) {
+      setFailure("")
+      setNotice("")
+    }
     setRefreshWarning("")
     try {
       const result = unwrapActionResult(await props.api.call(actionId, args))
@@ -411,8 +428,10 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
         toast.warning(refreshMessage)
       }
       const message = t(typeof successKey === "function" ? successKey(result) : successKey)
-      setNotice(message)
-      toast.success(message)
+      if (announce) {
+        setNotice(message)
+        toast.success(message)
+      }
       return { ok: true, refreshed, result }
     } catch (error) {
       try {
@@ -421,9 +440,11 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
         // Preserve the action error; refresh is best-effort on failure.
       }
       const message = errorText(error, t("errors.actionFailed"))
-      setFailure(message)
-      toast.error(message)
-      return { ok: false, refreshed: false, result: {} }
+      if (announce) {
+        setFailure(message)
+        toast.error(message)
+      }
+      return { ok: false, refreshed: false, result: {}, error: message }
     } finally {
       setBusyAction("")
     }
@@ -474,6 +495,22 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
       preserveDraftOnCleanRef.current = !outcome.refreshed
       setDraftDirty(false)
     }
+  }
+
+  async function saveLogPath() {
+    const normalized = logPathDraft.trim()
+    setLogPathNotice("")
+    setLogPathFailure("")
+    const successKey = normalized ? "messages.logPathSaved" : "messages.logPathAutoDetection"
+    const outcome = await runAction("save_settings", { log_path: normalized }, successKey, false)
+    if (!outcome.ok) {
+      setLogPathFailure(outcome.error || t("errors.actionFailed"))
+      return
+    }
+    preserveLogPathOnCleanRef.current = !outcome.refreshed
+    setLogPathDraft(normalized)
+    setLogPathDirty(false)
+    setLogPathNotice(t(successKey))
   }
 
   function setConsent(enabled: boolean) {
@@ -905,11 +942,25 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
               <Divider />
               <Field label={t("settings.logPath")} help={t("settings.logPathHelp")}>
                 <Input
-                  value={draft.log_path}
+                  value={logPathDraft}
                   placeholder={t("settings.logPathPlaceholder")}
-                  onChange={(value) => updateDraft({ log_path: value })}
+                  onChange={(value) => {
+                    setLogPathDraft(value)
+                    setLogPathDirty(true)
+                    setLogPathNotice("")
+                    setLogPathFailure("")
+                  }}
                 />
               </Field>
+              {logPathNotice ? <Alert tone="success">{logPathNotice}</Alert> : null}
+              {logPathFailure ? <InlineError title={t("errors.title")} error={logPathFailure} /> : null}
+              <Button
+                tone="primary"
+                disabled={Boolean(busyAction) || !logPathDirty || !actionAvailable("save_settings")}
+                onClick={saveLogPath}
+              >
+                {logPathDraft.trim() ? t("actions.save_log_path.label") : t("actions.restore_auto_log_path.label")}
+              </Button>
               <ButtonGroup>
                 <Button
                   tone="success"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from hearthstone_companion_under_test import tailer as tailer_module
 from hearthstone_companion_under_test.tailer import MAX_LINE_BYTES, PowerLogLocator, PowerLogTailer
 
 
@@ -181,7 +182,7 @@ def test_locator_and_tailer_rotate_to_newest_session_directory(
     os.utime(old_path, ns=(1_000_000_000, 1_000_000_000))
     os.utime(new_path, ns=(2_000_000_000, 2_000_000_000))
 
-    locator = PowerLogLocator()
+    locator = PowerLogLocator(executable_paths_provider=lambda: ())
     tailer = PowerLogTailer(locator)
     first = tailer.poll()
     assert first.path == new_path.resolve()
@@ -210,7 +211,7 @@ def test_locator_discovers_non_default_uid_session(tmp_path: Path, monkeypatch) 
     path.parent.mkdir(parents=True)
     path.write_text("CREATE_GAME\n", encoding="utf-8")
 
-    assert PowerLogLocator().resolve() == path.resolve()
+    assert PowerLogLocator(executable_paths_provider=lambda: ()).resolve() == path.resolve()
 
 
 def test_configured_logs_directory_discovers_nested_session(tmp_path: Path) -> None:
@@ -225,3 +226,112 @@ def test_configured_logs_directory_discovers_nested_session(tmp_path: Path) -> N
     os.utime(newer, ns=(2_000_000_000, 2_000_000_000))
 
     assert PowerLogLocator(str(logs)).resolve() == newer.resolve()
+
+
+def test_locator_discovers_logs_beside_running_game_executable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    game = tmp_path / "gameLibrary" / "Hearthstone" / "Hearthstone.exe"
+    log_path = game.parent / "Logs" / "Hearthstone_2026_08_20_011437" / "Power.log"
+    log_path.parent.mkdir(parents=True)
+    log_path.write_text("CREATE_GAME\n", encoding="utf-8")
+
+    locator = PowerLogLocator(executable_paths_provider=lambda: (game,))
+
+    assert locator.resolve() == log_path.resolve()
+
+
+def test_locator_chooses_newest_session_beside_running_game(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    game = tmp_path / "Hearthstone" / "Hearthstone.exe"
+    older = game.parent / "Logs" / "Hearthstone_old" / "Power.log"
+    current = game.parent / "Logs" / "Hearthstone_current" / "Power.log"
+    older.parent.mkdir(parents=True)
+    current.parent.mkdir(parents=True)
+    older.write_text("old\n", encoding="utf-8")
+    current.write_text("current\n", encoding="utf-8")
+    os.utime(older, ns=(1_000_000_000, 1_000_000_000))
+    os.utime(current, ns=(2_000_000_000, 2_000_000_000))
+
+    locator = PowerLogLocator(executable_paths_provider=lambda: (game,))
+
+    assert locator.resolve() == current.resolve()
+
+
+def test_locator_retries_running_game_discovery_after_cache_interval(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    now = [10.0]
+    monkeypatch.setattr(tailer_module.time, "monotonic", lambda: now[0])
+    game = tmp_path / "Hearthstone" / "Hearthstone.exe"
+    log_path = game.parent / "Logs" / "session" / "Power.log"
+    calls = 0
+
+    def executable_paths() -> tuple[Path, ...]:
+        nonlocal calls
+        calls += 1
+        return () if calls == 1 else (game,)
+
+    locator = PowerLogLocator(
+        executable_paths_provider=executable_paths,
+        process_scan_interval_seconds=1.0,
+    )
+    assert locator.resolve() is None
+    log_path.parent.mkdir(parents=True)
+    log_path.write_text("CREATE_GAME\n", encoding="utf-8")
+    assert locator.resolve() is None
+    assert calls == 1
+    now[0] = 11.1
+
+    assert locator.resolve() == log_path.resolve()
+    assert calls == 2
+
+
+def test_configured_path_never_queries_running_processes(tmp_path: Path) -> None:
+    log_path = tmp_path / "Power.log"
+    log_path.write_text("CREATE_GAME\n", encoding="utf-8")
+
+    def unexpected_provider() -> tuple[Path, ...]:
+        raise AssertionError("configured path must take precedence")
+
+    assert PowerLogLocator(
+        str(log_path), executable_paths_provider=unexpected_provider
+    ).resolve() == log_path.resolve()
+
+
+def test_process_discovery_failure_keeps_appdata_fallback(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    log_path = (
+        tmp_path / "Blizzard" / "Hearthstone" / "Logs" / "session" / "Power.log"
+    )
+    log_path.parent.mkdir(parents=True)
+    log_path.write_text("CREATE_GAME\n", encoding="utf-8")
+
+    def denied_provider() -> tuple[Path, ...]:
+        raise OSError("access denied")
+
+    assert PowerLogLocator(executable_paths_provider=denied_provider).resolve() == log_path.resolve()
+
+
+def test_locator_chooses_newest_log_across_appdata_and_running_game(
+    tmp_path: Path, monkeypatch
+) -> None:
+    local_data = tmp_path / "local"
+    monkeypatch.setenv("LOCALAPPDATA", str(local_data))
+    appdata_log = (
+        local_data / "Blizzard" / "Hearthstone" / "Logs" / "old" / "Power.log"
+    )
+    game = tmp_path / "installed" / "Hearthstone.exe"
+    game_log = game.parent / "Logs" / "current" / "Power.log"
+    appdata_log.parent.mkdir(parents=True)
+    game_log.parent.mkdir(parents=True)
+    appdata_log.write_text("old\n", encoding="utf-8")
+    game_log.write_text("current\n", encoding="utf-8")
+    os.utime(appdata_log, ns=(1_000_000_000, 1_000_000_000))
+    os.utime(game_log, ns=(2_000_000_000, 2_000_000_000))
+
+    assert PowerLogLocator(executable_paths_provider=lambda: (game,)).resolve() == game_log.resolve()
