@@ -94,12 +94,15 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
 
     def __init__(self, ctx: Any) -> None:
         super().__init__(ctx)
-        self.logger = ctx.logger
         self.cfg = CompanionConfig()
         self._monitor: CompanionMonitor | None = None
-        self._overlay = OverlayManager(self.logger, plugin_dir=Path(self.plugin_dir), config=self.cfg)
+        self._overlay = OverlayManager(
+            self.logger,
+            plugin_dir=Path(self.config_dir),
+            config=self.cfg,
+        )
         self._catalog = BattlegroundsCardCatalog(
-            self.cache_path("battlegrounds", "hsbg-cards-current-v1.json.gz"),
+            self.data_path("battlegrounds", "hsbg-cards-current-v1.json.gz"),
             self.logger,
             network_enabled=self.cfg.card_catalog_network_enabled,
             refresh_hours=self.cfg.card_catalog_refresh_hours,

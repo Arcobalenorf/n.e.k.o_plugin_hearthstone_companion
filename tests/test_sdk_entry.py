@@ -36,7 +36,21 @@ def _load_sdk_entry(monkeypatch: pytest.MonkeyPatch):
     sdk_module = types.ModuleType("plugin.sdk.plugin")
 
     class FakePluginBase:
-        pass
+        def __init__(self, ctx: Any) -> None:
+            self.ctx = ctx
+            self.logger = getattr(ctx, "logger", None) or ctx.fallback_logger
+            self.config = ctx.config
+            self.store = ctx.store
+
+        @property
+        def config_dir(self) -> Path:
+            return Path(self.ctx.config_path).parent
+
+        def data_path(self, *parts: str) -> Path:
+            return Path(self.ctx.data_dir).joinpath(*parts)
+
+        def report_status(self, _status: dict[str, Any]) -> None:
+            return None
 
     sdk_module.Err = lambda value: value
     sdk_module.NekoPluginBase = FakePluginBase
@@ -62,6 +76,67 @@ def _load_sdk_entry(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setitem(sys.modules, module_name, module)
     spec.loader.exec_module(module)
     return module
+
+
+def test_plugin_constructs_and_starts_with_stable_sdk_surface(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    logger = types.SimpleNamespace(
+        debug=lambda *_args, **_kwargs: None,
+        info=lambda *_args, **_kwargs: None,
+        warning=lambda *_args, **_kwargs: None,
+        error=lambda *_args, **_kwargs: None,
+        exception=lambda *_args, **_kwargs: None,
+    )
+
+    class Config:
+        async def dump(self, **_kwargs: Any) -> dict[str, Any]:
+            return {
+                "hearthstone_companion": {
+                    "monitor_on_start": False,
+                    "card_catalog_network_enabled": False,
+                    "overlay_auto_start": False,
+                }
+            }
+
+    class Store:
+        async def get(self, _key: str) -> None:
+            return None
+
+        async def set(self, _key: str, _value: dict[str, Any]) -> None:
+            return None
+
+    plugin_dir = tmp_path / "installed" / "hearthstone_companion"
+    data_dir = tmp_path / "runtime-data"
+    plugin_dir.mkdir(parents=True)
+    ctx = types.SimpleNamespace(
+        logger=None,
+        fallback_logger=logger,
+        config=Config(),
+        store=Store(),
+        config_path=plugin_dir / "plugin.toml",
+        data_dir=data_dir,
+    )
+
+    plugin = entry.HearthstoneCompanionPlugin(ctx)
+
+    assert not hasattr(plugin, "plugin_dir")
+    assert not hasattr(plugin, "cache_path")
+    assert plugin.logger is logger
+    assert plugin._overlay.plugin_dir == plugin_dir
+    assert plugin._catalog.cache_file == (
+        data_dir / "battlegrounds" / "hsbg-cards-current-v1.json.gz"
+    )
+
+    startup_result = asyncio.run(plugin.startup())
+    assert startup_result["status"] == "ready"
+    assert startup_result["monitor_started"] is False
+    assert startup_result["card_catalog_started"] is False
+
+    shutdown_result = asyncio.run(plugin.shutdown())
+    assert shutdown_result["status"] == "stopped"
 
 
 def test_llm_state_tool_does_not_read_state_without_data_consent(monkeypatch) -> None:

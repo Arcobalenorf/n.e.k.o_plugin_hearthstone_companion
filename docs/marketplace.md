@@ -46,6 +46,12 @@
 - 独立浮层只作显式诊断，不自动显示事件，也不声称显示角色最终文本；
 - 所有可能改配置、启动子进程或删除统计的入口均需要用户操作。
 
+## v0.1.1 修复说明
+
+- 修复在 N.E.K.O 稳定版 `v0.8.3` 启动时访问 main-only `plugin_dir`/`cache_path` API 导致的进程崩溃；
+- 插件目录和持久数据目录改用稳定 SDK 的 `config_dir`/`data_path`；
+- 保留 SDK 初始化的后备 logger，并增加稳定版 SDK 表面的真实构造与生命周期回归测试。
+
 ## v0.1.0 发布说明
 
 以下内容用于当前独立仓库的首个 `v0.1.0` Release 和后续市场投稿。
@@ -75,7 +81,7 @@
 - Python 测试、Ruff 和 compileall 通过；
 - Hosted UI 通过官方 SDK 编译；
 - `check --release --market-release`、`build`、`inspect`、`verify` 通过；
-- `plugin.toml`、`pyproject.toml` 和构建产物版本均为 `0.1.0`，tag 与 Release 资产使用一致的 `v0.1.0`；
+- `plugin.toml`、`pyproject.toml` 和构建产物版本均为 `0.1.1`，tag 与 Release 资产使用一致的 `v0.1.1`；
 - 在 Windows 验证日志监听、配置服务持久化、Store 聚合统计、场景 context、工具查询和显式浮层测试；
 - 截图不包含 BattleTag、聊天、好友或其他个人信息；
 - Release 记录正式资产 SHA-256。

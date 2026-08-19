@@ -1,0 +1,41 @@
+name: Stable N.E.K.O SDK Smoke
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stable-sdk-v083:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out plugin
+        uses: actions/checkout@v4
+        with:
+          path: plugin-source
+      - name: Check out stable N.E.K.O SDK
+        uses: actions/checkout@v4
+        with:
+          repository: Project-N-E-K-O/N.E.K.O
+          ref: eab8da4b521e419d2c36280e7b6fafd08291b640 # N.E.K.O v0.8.3
+          path: neko-stable
+          sparse-checkout: |
+            plugin/sdk
+          sparse-checkout-cone-mode: false
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: plugin-source/pyproject.toml
+      - name: Install SDK smoke dependency
+        run: python -m pip install "msgpack==1.1.1" "pydantic==2.13.4"
+      - name: Exercise stable SDK lifecycle
+        run: >-
+          python plugin-source/tests/sdk_runtime_smoke.py
+          --sdk-root neko-stable
+          --plugin-root plugin-source

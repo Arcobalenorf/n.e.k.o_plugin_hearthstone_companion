@@ -27,7 +27,7 @@ _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 _MAX_CARDS = 5_000
 _PAGE_SIZE = 100
 _USER_AGENT = (
-    "NEKO-Hearthstone-Companion/0.3 "
+    "NEKO-Hearthstone-Companion/0.1.1 "
     "(+https://github.com/Arcobalenorf/n.e.k.o_plugin_hearthstone_companion)"
 )
 

@@ -16,7 +16,7 @@
 
 ## 酒馆战棋支持
 
-v0.1.0 支持单排和双排的可验证公开状态：
+v0.1.1 支持单排和双排的可验证公开状态：
 
 - 战棋模式、Bob、本地玩家与最多八名英雄；
 - 英雄选择、招募/战斗阶段、逐轮胜负、回合、当前对手；
@@ -28,7 +28,7 @@ v0.1.0 支持单排和双排的可验证公开状态：
 
 随包赛季资料当前固定为战棋第 14 赛季、补丁 36.2.2、`Dark Gifts of Dalaran`，来源链包含 Blizzard 36.2 赛季说明和 36.2.2 平衡补丁，验证日期为 2026-08-19。它是版本化规则资料，不是胜率数据。
 
-插件每日从公开的 [hsbg.cards API](https://hsbg.cards/api-docs) 更新当前卡池与卡牌规则，并在 N.E.K.O 分配的缓存目录离线降级。咨询工具只返回牌面中已观察卡牌的去重事实和不针对具体大厅的卡池计数；不在本地计算流派评分，也不生成角色台词。Card data: [hsbg.cards](https://hsbg.cards/about), subject to its [terms](https://hsbg.cards/terms).
+插件每日从公开的 [hsbg.cards API](https://hsbg.cards/api-docs) 更新当前卡池与卡牌规则，并在 N.E.K.O 分配的插件数据目录离线降级。咨询工具只返回牌面中已观察卡牌的去重事实和不针对具体大厅的卡池计数；不在本地计算流派评分，也不生成角色台词。Card data: [hsbg.cards](https://hsbg.cards/about), subject to its [terms](https://hsbg.cards/terms).
 
 HSReplay Tier7 与 Firestone 的全局表现数据属于各自的私有遥测；本项目没有获得可再发布的授权 API。工具会明确返回全局数据不可用，不抓取网页，也不编造档位、胜率或样本。
 
