@@ -14,7 +14,6 @@ import {
   Input,
   KeyValue,
   Page,
-  RefreshButton,
   Slider,
   Stack,
   StatCard,
@@ -302,8 +301,48 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
   const [notice, setNotice] = useState("")
   const [failure, setFailure] = useState("")
   const [refreshWarning, setRefreshWarning] = useState("")
+  const [manualRefreshBusy, setManualRefreshBusy] = useState(false)
   const preserveDraftOnCleanRef = useRef(false)
   const preserveLogPathOnCleanRef = useRef(false)
+  const apiRef = useRef(props.api)
+  const refreshInFlightRef = useRef<Promise<void> | null>(null)
+  apiRef.current = props.api
+
+  function trackRefresh(request: Promise<void>): Promise<void> {
+    refreshInFlightRef.current = request
+    const clear = () => {
+      if (refreshInFlightRef.current === request) refreshInFlightRef.current = null
+    }
+    void request.then(clear, clear)
+    return request
+  }
+
+  function refreshContext(forceFresh = false): Promise<void> {
+    const active = refreshInFlightRef.current
+    if (active && !forceFresh) return active
+    const request = active
+      ? active.catch(() => undefined).then(() => apiRef.current.refresh()).then(() => undefined)
+      : Promise.resolve().then(() => apiRef.current.refresh()).then(() => undefined)
+    return trackRefresh(request)
+  }
+
+  useEffect(() => {
+    let cancelled = false
+    let timerId: number | undefined
+    const refreshLater = async () => {
+      try {
+        await refreshContext(false)
+      } catch {
+        // Background refresh is best-effort and must not create recurring alerts.
+      }
+      if (!cancelled) timerId = window.setTimeout(refreshLater, 2500)
+    }
+    timerId = window.setTimeout(refreshLater, 2500)
+    return () => {
+      cancelled = true
+      if (timerId !== undefined) window.clearTimeout(timerId)
+    }
+  }, [])
 
   useEffect(() => {
     if (draftDirty) return
@@ -420,7 +459,7 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
       const result = unwrapActionResult(await props.api.call(actionId, args))
       let refreshed = true
       try {
-        await props.api.refresh()
+        await refreshContext(true)
       } catch {
         refreshed = false
         const refreshMessage = t("warnings.refreshAfterAction")
@@ -435,7 +474,7 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
       return { ok: true, refreshed, result }
     } catch (error) {
       try {
-        await props.api.refresh()
+        await refreshContext(true)
       } catch {
         // Preserve the action error; refresh is best-effort on failure.
       }
@@ -464,6 +503,18 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
         {},
         (result) => result.changed ? "messages.logPreparedChanged" : "messages.logPreparedReady",
       )
+    }
+  }
+
+  async function manualRefresh() {
+    setManualRefreshBusy(true)
+    setFailure("")
+    try {
+      await refreshContext(true)
+    } catch (error) {
+      setFailure(errorText(error, t("errors.refreshFailed")))
+    } finally {
+      setManualRefreshBusy(false)
     }
   }
 
@@ -561,10 +612,9 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
             <StatusBadge tone={stateTone(sourceState)} label={localized("status.source", sourceState)} />
             <StatusBadge tone={stateTone(phase)} label={localized("status.phase", phase)} />
           </Inline>
-          <RefreshButton
-            label={t("actions.refresh.label")}
-            onError={(error) => setFailure(errorText(error, t("errors.refreshFailed")))}
-          />
+          <Button disabled={manualRefreshBusy} onClick={manualRefresh}>
+            {t("actions.refresh.label")}
+          </Button>
         </Inline>
 
         {notice ? <Alert tone="success">{notice}</Alert> : null}

@@ -53,6 +53,7 @@ class CompanionMonitor:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._bootstrap_complete = False
+        self._state_ready_notified = False
 
     def _reset_reader_locked(self) -> None:
         self._parser = PowerLogParser()
@@ -62,6 +63,7 @@ class CompanionMonitor:
         )
         self._snapshot = self._parser.snapshot()
         self._bootstrap_complete = False
+        self._state_ready_notified = False
 
     def start(self) -> bool:
         with self._lifecycle_lock:
@@ -122,6 +124,7 @@ class CompanionMonitor:
         next_report = 0.0
         while not stop_event.is_set():
             batch = None
+            state_ready = False
             try:
                 now = time.time()
                 with self._lock:
@@ -130,6 +133,7 @@ class CompanionMonitor:
                     self._status.last_error_code = ""
                     if batch.source_reset:
                         self._parser.reset_source()
+                        self._state_ready_notified = False
                     if batch.bootstrap:
                         self._bootstrap_complete = batch.bootstrap_complete
                     emissions: list[tuple[GameEvent, GameSnapshot]] = []
@@ -160,6 +164,15 @@ class CompanionMonitor:
                     else:
                         snapshot = self._parser.snapshot()
                         self._snapshot = snapshot
+                        state_ready = bool(
+                            batch.bootstrap
+                            and self._bootstrap_complete
+                            and not self._state_ready_notified
+                            and snapshot.game_number > 0
+                            and snapshot.phase not in {"idle", "ended", "spectator"}
+                        )
+                        if state_ready:
+                            self._state_ready_notified = True
                         if self._parser.entity_capacity_exceeded:
                             self._status.last_error_code = "parser:entity_capacity_exceeded"
                     self._status.lines_seen += processed_lines
@@ -178,6 +191,21 @@ class CompanionMonitor:
                 if batch.source_reset:
                     self._notify_event(
                         GameEvent("source_reset", 0, "日志来源已重置", now, {}), snapshot
+                    )
+                if state_ready:
+                    self._notify_event(
+                        GameEvent(
+                            "state_ready",
+                            0,
+                            "当前局势已就绪",
+                            now,
+                            {
+                                "mode": snapshot.mode,
+                                "phase": snapshot.phase,
+                                "game_number": snapshot.game_number,
+                            },
+                        ),
+                        snapshot,
                     )
                 if not batch.bootstrap and self._bootstrap_complete:
                     self._handle_batch(emissions, now)

@@ -25,7 +25,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 def _decorator(*args: Any, **kwargs: Any):
     if len(args) == 1 and callable(args[0]) and not kwargs:
         return args[0]
-    return lambda target: target
+
+    def decorate(target: Any) -> Any:
+        target.__neko_test_decorator_kwargs__ = dict(kwargs)
+        return target
+
+    return decorate
 
 
 def _load_sdk_entry(monkeypatch: pytest.MonkeyPatch):
@@ -289,6 +294,7 @@ def test_llm_state_tool_returns_public_state_with_consent_even_when_proactive_is
     entry = _load_sdk_entry(monkeypatch)
     public_state = {"phase": "playing", "turn": 7}
     snapshot = types.SimpleNamespace(
+        mode="constructed",
         phase="playing",
         game_number=3,
         battlegrounds=None,
@@ -316,6 +322,74 @@ def test_llm_state_tool_returns_public_state_with_consent_even_when_proactive_is
     assert result["freshness"]["source"] == "live"
     assert result["reason"] == ""
     assert result["privacy_scope"] == "public_game_state_only"
+
+
+def test_llm_tool_descriptions_route_battlegrounds_strategy_exclusively(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    current_metadata = entry.HearthstoneCompanionPlugin.hearthstone_current_state.__neko_test_decorator_kwargs__
+    advice_metadata = entry.HearthstoneCompanionPlugin.hearthstone_battlegrounds_advice.__neko_test_decorator_kwargs__
+
+    current_description = current_metadata["description"]
+    advice_description = advice_metadata["description"]
+    assert "hearthstone_battlegrounds_advice instead" in current_description
+    assert "never answer those questions as constructed" in current_description
+    for keyword in ("酒馆", "流派", "阵容", "升本", "稳血", "买什么"):
+        assert keyword in advice_description
+    assert "Battlegrounds-only" in advice_description
+    assert "never answer with constructed decks" in advice_description
+    topic_description = advice_metadata["parameters"]["properties"]["topic"]["description"]
+    assert "现在酒馆玩什么流派" in topic_description
+    assert "current_strategy" in topic_description
+    assert "season_meta" in topic_description
+    assert "never composition win-rate rankings" in topic_description
+
+
+def test_current_state_redirects_battlegrounds_strategy_to_advice_tool(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    now = time.time()
+    snapshot = GameSnapshot(
+        mode="battlegrounds",
+        phase="recruit",
+        game_number=2,
+        battlegrounds=BattlegroundsSnapshot(round=3, phase="recruit"),
+    )
+    plugin = types.SimpleNamespace(
+        cfg=CompanionConfig(llm_data_consent=True),
+        _ensure_monitor=lambda: types.SimpleNamespace(
+            snapshot=lambda: snapshot,
+            status=lambda: types.SimpleNamespace(
+                source_state="watching",
+                monitor_running=True,
+                last_line_at=now,
+                last_event_at=now,
+            ),
+        ),
+    )
+
+    result = asyncio.run(entry.HearthstoneCompanionPlugin.hearthstone_current_state(plugin))
+
+    assert result["available"] is True
+    assert result["strategy_routing"] == {
+        "tool": "hearthstone_battlegrounds_advice",
+        "do_not_answer_strategy_from_this_tool": True,
+        "do_not_answer_as_constructed": True,
+    }
+
+
+def test_unauthorized_battlegrounds_advice_keeps_battlegrounds_only_contract(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    plugin = types.SimpleNamespace(cfg=CompanionConfig(llm_data_consent=False))
+
+    result = asyncio.run(
+        entry.HearthstoneCompanionPlugin.hearthstone_battlegrounds_advice(plugin)
+    )
+
+    assert result["available"] is False
+    assert result["reason"] == "llm_data_sharing_not_authorized"
+    assert result["game_mode"] == "battlegrounds"
+    assert result["scope"] == "hearthstone_battlegrounds_only"
+    assert result["answer_contract"]["if_unavailable_do_not_fallback_to_constructed"] is True
+    assert result["answer_contract"]["if_unavailable_do_not_recommend_from_cached_state"] is True
 
 
 def test_game_context_is_read_silently_and_visible_words_use_respond(monkeypatch) -> None:
@@ -360,6 +434,52 @@ def test_game_context_is_read_silently_and_visible_words_use_respond(monkeypatch
     assert submitted[-1]["ai_behavior"] == "read"
     assert "场景结束" in submitted[-1]["parts"][0]["text"]
     assert submitted[-1]["metadata"]["context_expired"] is True
+    assert plugin._context_target is None
+
+
+def test_bootstrap_state_ready_enters_authorized_game_context(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    submitted: list[dict[str, Any]] = []
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(llm_data_consent=True, target_lanlan="兰兰A")
+    plugin._context_target = None
+    plugin._ownership_lock = threading.RLock()
+    plugin._started = True
+    plugin._monitor_dispatch_enabled = True
+    plugin._settings_transition = False
+    plugin.ctx = types.SimpleNamespace(_current_lanlan="兰兰A")
+    plugin.push_message = lambda **kwargs: submitted.append(kwargs) or {"submitted": True}
+
+    plugin._observe_game_event(
+        GameEvent("state_ready", 0, "ready", 100.0, {"mode": "battlegrounds"}),
+        GameSnapshot(mode="battlegrounds", phase="recruit", game_number=3),
+    )
+
+    assert len(submitted) == 1
+    assert submitted[0]["ai_behavior"] == "read"
+    assert submitted[0]["visibility"] == []
+    assert plugin._context_target == "兰兰A"
+
+
+def test_bootstrap_state_ready_respects_data_consent(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    submitted: list[dict[str, Any]] = []
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(llm_data_consent=False, target_lanlan="兰兰A")
+    plugin._context_target = None
+    plugin._ownership_lock = threading.RLock()
+    plugin._started = True
+    plugin._monitor_dispatch_enabled = True
+    plugin._settings_transition = False
+    plugin.ctx = types.SimpleNamespace(_current_lanlan="兰兰A")
+    plugin.push_message = lambda **kwargs: submitted.append(kwargs) or {"submitted": True}
+
+    plugin._observe_game_event(
+        GameEvent("state_ready", 0, "ready", 100.0, {"mode": "battlegrounds"}),
+        GameSnapshot(mode="battlegrounds", phase="recruit", game_number=3),
+    )
+
+    assert submitted == []
     assert plugin._context_target is None
 
 
@@ -719,6 +839,58 @@ def test_save_settings_patches_only_explicit_fields(monkeypatch) -> None:
     assert plugin.cfg.target_lanlan == "兰兰A"
     assert plugin.cfg.overlay_height_percent == 41
     assert plugin.cfg.overlay_font_size == 29
+
+
+def test_settings_transition_resyncs_active_game_context(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    submitted_messages: list[dict[str, Any]] = []
+    current = CompanionConfig(
+        log_path="old.log",
+        llm_data_consent=True,
+        target_lanlan="兰兰A",
+    ).to_dict()
+    snapshot = GameSnapshot(mode="battlegrounds", phase="recruit", game_number=5)
+
+    class Config:
+        async def update(self, patch: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+            current.update(patch[entry._CONFIG_SECTION])
+            return {entry._CONFIG_SECTION: dict(current)}
+
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig.from_mapping(current)
+    plugin._context_target = None
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._settings_transition = False
+    plugin._started = True
+    plugin._monitor_dispatch_enabled = True
+    plugin.ctx = types.SimpleNamespace(_current_lanlan="兰兰A")
+    plugin.config = Config()
+
+    def update_config(_config: CompanionConfig) -> None:
+        plugin._observe_game_event(
+            GameEvent("state_ready", 0, "ready", 100.0, {}), snapshot
+        )
+
+    plugin._monitor = types.SimpleNamespace(
+        update_config=update_config,
+        snapshot=lambda: snapshot,
+    )
+    plugin._catalog = types.SimpleNamespace(configure=lambda **_kwargs: None)
+    plugin._overlay = types.SimpleNamespace(
+        status=lambda: {"running": False},
+        configure=lambda _config: None,
+    )
+    plugin._ensure_monitor = lambda: plugin._monitor
+    plugin.push_message = lambda **kwargs: submitted_messages.append(kwargs) or {"submitted": True}
+
+    result = asyncio.run(plugin.save_settings(log_path="new.log"))
+
+    assert result["summary"] == "炉石陪玩设置已保存。"
+    assert plugin._settings_transition is False
+    assert len(submitted_messages) == 1
+    assert submitted_messages[0]["ai_behavior"] == "read"
+    assert plugin._context_target == "兰兰A"
 
 
 def test_save_settings_reads_back_full_config_after_sparse_profile_result(monkeypatch) -> None:
@@ -1868,6 +2040,62 @@ def test_monitor_start_waits_for_in_flight_stop_and_restarts_cleanly(monkeypatch
     assert plugin._monitor_dispatch_enabled is True
 
 
+def test_start_monitoring_opens_dispatch_gate_before_state_ready(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    submitted: list[dict[str, Any]] = []
+    snapshot = GameSnapshot(mode="battlegrounds", phase="recruit", game_number=8)
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(llm_data_consent=True, target_lanlan="兰兰A")
+    plugin._ownership_lock = threading.RLock()
+    plugin._monitor_action_lock = asyncio.Lock()
+    plugin._monitor_dispatch_enabled = False
+    plugin._settings_transition = False
+    plugin._context_target = None
+    plugin._started = True
+    plugin.ctx = types.SimpleNamespace(_current_lanlan="兰兰A")
+    plugin.push_message = lambda **kwargs: submitted.append(kwargs) or {"submitted": True}
+
+    class Monitor:
+        def start(self) -> bool:
+            plugin._observe_game_event(
+                GameEvent("state_ready", 0, "ready", 100.0, {}), snapshot
+            )
+            return True
+
+        def snapshot(self) -> GameSnapshot:
+            return snapshot
+
+    monitor = Monitor()
+    plugin._monitor = monitor
+    plugin._ensure_monitor = lambda: monitor
+
+    result = asyncio.run(plugin.start_monitoring())
+
+    assert result["started"] is True
+    assert plugin._monitor_dispatch_enabled is True
+    assert len(submitted) == 1
+    assert submitted[0]["ai_behavior"] == "read"
+    assert plugin._context_target == "兰兰A"
+
+
+def test_start_monitoring_rolls_back_dispatch_gate_when_start_raises(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin._ownership_lock = threading.RLock()
+    plugin._monitor_action_lock = asyncio.Lock()
+    plugin._monitor_dispatch_enabled = False
+    plugin._started = True
+    monitor = types.SimpleNamespace(
+        start=lambda: (_ for _ in ()).throw(RuntimeError("start failed")),
+    )
+    plugin._ensure_monitor = lambda: monitor
+
+    with pytest.raises(RuntimeError, match="start failed"):
+        asyncio.run(plugin.start_monitoring())
+
+    assert plugin._monitor_dispatch_enabled is False
+
+
 def test_current_state_marks_stopped_monitor_snapshot_as_cached(monkeypatch) -> None:
     entry = _load_sdk_entry(monkeypatch)
     snapshot = GameSnapshot(mode="battlegrounds", phase="playing", game_number=9)
@@ -1928,6 +2156,42 @@ def test_battlegrounds_advice_separates_local_evidence_from_global_meta(monkeypa
     assert result["card_catalog"]["available"] is False
     assert result["global_meta"]["available"] is False
     assert result["global_meta"]["do_not_invent"] is True
+    assert result["game_mode"] == "battlegrounds"
+    assert result["scope"] == "hearthstone_battlegrounds_only"
+    assert result["answer_contract"]["answer_as_battlegrounds_not_constructed"] is True
+    assert result["answer_contract"]["do_not_answer_with_constructed_deck_archetypes"] is True
+
+
+def test_battlegrounds_advice_never_falls_back_to_constructed_state(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    snapshot = GameSnapshot(mode="constructed", phase="playing", game_number=4)
+    now = time.time()
+    plugin = types.SimpleNamespace(
+        cfg=CompanionConfig(llm_data_consent=True),
+        _season={"key": "season-14-36.2", "status": "bundled_static"},
+        _stats=BattlegroundsStats(),
+        _ensure_monitor=lambda: types.SimpleNamespace(
+            snapshot=lambda: snapshot,
+            status=lambda: types.SimpleNamespace(
+                source_state="watching",
+                monitor_running=True,
+                last_line_at=now,
+                last_event_at=now,
+            ),
+        ),
+    )
+
+    result = asyncio.run(
+        entry.HearthstoneCompanionPlugin.hearthstone_battlegrounds_advice(
+            plugin, topic="current_strategy"
+        )
+    )
+
+    assert result["available"] is False
+    assert result["reason"] == "no_live_battlegrounds_state"
+    assert result["game_mode"] == "battlegrounds"
+    assert result["current_public_state"] is None
+    assert result["answer_contract"]["if_unavailable_do_not_fallback_to_constructed"] is True
 
 
 def test_battlegrounds_advice_includes_attributed_observed_card_facts(monkeypatch) -> None:

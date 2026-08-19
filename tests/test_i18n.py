@@ -97,6 +97,20 @@ def test_successful_action_is_not_reclassified_when_followup_refresh_fails() -> 
     assert "preserveDraftOnCleanRef.current = !outcome.refreshed" in panel_source
 
 
+def test_panel_auto_refresh_is_serial_silent_and_preserves_dirty_drafts() -> None:
+    panel_source = (ROOT / "ui" / "panel.tsx").read_text(encoding="utf-8")
+
+    assert "window.setTimeout(refreshLater, 2500)" in panel_source
+    assert "window.clearTimeout(timerId)" in panel_source
+    assert "setInterval" not in panel_source
+    assert "refreshInFlightRef" in panel_source
+    assert "await refreshContext(false)" in panel_source
+    assert "await refreshContext(true)" in panel_source
+    assert "Background refresh is best-effort" in panel_source
+    assert "if (draftDirty) return" in panel_source
+    assert "if (logPathDirty) return" in panel_source
+
+
 def test_custom_log_path_has_an_independent_save_action_in_diagnostics() -> None:
     panel_source = (ROOT / "ui" / "panel.tsx").read_text(encoding="utf-8")
 

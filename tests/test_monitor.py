@@ -25,6 +25,45 @@ def _logger() -> SimpleNamespace:
     return SimpleNamespace(warning=lambda *args, **kwargs: None)
 
 
+class _BatchSequence:
+    def __init__(self, monitor: CompanionMonitor, batches: list[TailBatch]) -> None:
+        self.monitor = monitor
+        self.batches = list(batches)
+
+    def poll(self) -> TailBatch:
+        if self.batches:
+            return self.batches.pop(0)
+        self.monitor._stop.set()
+        return TailBatch((), Path("Power.log"), bootstrap_complete=True)
+
+
+def _run_bootstrap_batches(
+    batches: list[TailBatch],
+) -> tuple[CompanionMonitor, list[tuple[str, GameSnapshot]], list[str], list[str]]:
+    observed: list[tuple[str, GameSnapshot]] = []
+    llm_events: list[str] = []
+    results: list[str] = []
+    monitor = CompanionMonitor(
+        CompanionConfig(
+            poll_interval_seconds=0.1,
+            llm_commentary_enabled=True,
+            llm_data_consent=True,
+        ),
+        _logger(),
+        on_llm=lambda _prompt, event, _snapshot: not llm_events.append(event.kind),
+        on_result=lambda event, _snapshot: results.append(event.kind),
+        on_event=lambda event, snapshot: observed.append((event.kind, snapshot)),
+    )
+    monitor._tailer = _BatchSequence(monitor, batches)
+    assert monitor.start()
+    deadline = time.monotonic() + 2.0
+    while not monitor._stop.is_set() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert monitor._stop.is_set()
+    assert monitor.stop(timeout=2.0)
+    return monitor, observed, llm_events, results
+
+
 def test_monitor_never_generates_local_visible_commentary() -> None:
     llm_prompts: list[str] = []
     observed: list[str] = []
@@ -44,6 +83,161 @@ def test_monitor_never_generates_local_visible_commentary() -> None:
     assert llm_prompts == []
     assert observed == ["battlegrounds_triple"]
     assert monitor.status().llm_submissions == 0
+
+
+def test_active_constructed_bootstrap_notifies_state_ready_without_replaying_events() -> None:
+    path = Path("constructed/Power.log")
+    lines = (
+        _line("CREATE_GAME"),
+        _line("GameEntity EntityID=1"),
+        _line("TAG_CHANGE Entity=GameEntity tag=STEP value=MAIN_READY"),
+    )
+
+    monitor, observed, llm_events, results = _run_bootstrap_batches(
+        [TailBatch(lines, path, bootstrap=True, source_reset=True, bootstrap_complete=True)]
+    )
+
+    assert [kind for kind, _snapshot in observed] == ["source_reset", "state_ready"]
+    assert observed[-1][1].phase == "playing"
+    assert llm_events == []
+    assert results == []
+    assert monitor.status().events_seen == 0
+    assert monitor.status().llm_submissions == 0
+
+
+def test_active_battlegrounds_bootstrap_notifies_state_ready_before_first_turn() -> None:
+    path = Path("battlegrounds/Power.log")
+    lines = (
+        _line("CREATE_GAME"),
+        _line("GameEntity EntityID=1"),
+        "D 12:00:00.0000000 GameState.DebugPrintGame() - GameType=GT_BATTLEGROUNDS",
+    )
+
+    monitor, observed, llm_events, results = _run_bootstrap_batches(
+        [TailBatch(lines, path, bootstrap=True, source_reset=True, bootstrap_complete=True)]
+    )
+
+    assert [kind for kind, _snapshot in observed] == ["source_reset", "state_ready"]
+    assert observed[-1][1].mode == "battlegrounds"
+    assert observed[-1][1].phase == "hero_select"
+    assert observed[-1][1].turn == 0
+    assert llm_events == []
+    assert results == []
+    assert monitor.status().events_seen == 0
+
+
+def test_ended_bootstrap_does_not_replay_terminal_events_or_statistics() -> None:
+    path = Path("ended/Power.log")
+    lines = (
+        _line("CREATE_GAME"),
+        _line("GameEntity EntityID=1"),
+        _line("TAG_CHANGE Entity=GameEntity tag=STATE value=COMPLETE"),
+    )
+
+    monitor, observed, llm_events, results = _run_bootstrap_batches(
+        [TailBatch(lines, path, bootstrap=True, source_reset=True, bootstrap_complete=True)]
+    )
+
+    assert [kind for kind, _snapshot in observed] == ["source_reset"]
+    assert monitor.snapshot().phase == "ended"
+    assert llm_events == []
+    assert results == []
+    assert monitor.status().events_seen == 0
+
+
+def test_battlegrounds_terminal_bootstrap_does_not_replay_result_callback() -> None:
+    results: list[str] = []
+    observed: list[str] = []
+    monitor = CompanionMonitor(
+        CompanionConfig(poll_interval_seconds=0.1),
+        _logger(),
+        on_llm=lambda *_args: False,
+        on_result=lambda event, _snapshot: results.append(event.kind),
+        on_event=lambda event, _snapshot: observed.append(event.kind),
+    )
+    ended = GameSnapshot(
+        mode="battlegrounds",
+        phase="ended",
+        game_number=7,
+        battlegrounds=BattlegroundsSnapshot(round=9, phase="ended", placement=3),
+    )
+    terminal = GameEvent(
+        "battlegrounds_game_ended", 10, "placed", 100.0, {"placement": 3}
+    )
+    monitor._parser = SimpleNamespace(
+        feed_line=lambda _line_value, *, now: [terminal],
+        snapshot=lambda: ended,
+        entity_capacity_exceeded=False,
+    )
+    monitor._tailer = _BatchSequence(
+        monitor,
+        [
+            TailBatch(
+                ("terminal",),
+                Path("battlegrounds-ended/Power.log"),
+                bootstrap=True,
+                source_reset=False,
+                bootstrap_complete=True,
+            )
+        ],
+    )
+
+    assert monitor.start()
+    deadline = time.monotonic() + 2.0
+    while not monitor._stop.is_set() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert monitor.stop(timeout=2.0)
+
+    assert results == []
+    assert observed == []
+    assert monitor.status().events_seen == 0
+
+
+def test_spectator_bootstrap_does_not_notify_state_ready() -> None:
+    path = Path("spectator/Power.log")
+    lines = (
+        "D 12:00:00.0000000 SpectatorMode - Start Spectator Game",
+        _line("CREATE_GAME"),
+        _line("GameEntity EntityID=1"),
+        _line("TAG_CHANGE Entity=GameEntity tag=STEP value=MAIN_READY"),
+    )
+
+    monitor, observed, llm_events, results = _run_bootstrap_batches(
+        [TailBatch(lines, path, bootstrap=True, source_reset=True, bootstrap_complete=True)]
+    )
+
+    assert [kind for kind, _snapshot in observed] == ["source_reset"]
+    assert monitor.snapshot().phase == "spectator"
+    assert llm_events == []
+    assert results == []
+
+
+def test_state_ready_is_once_per_log_source_generation() -> None:
+    lines = (
+        _line("CREATE_GAME"),
+        _line("GameEntity EntityID=1"),
+        _line("TAG_CHANGE Entity=GameEntity tag=STEP value=MAIN_READY"),
+    )
+    first = Path("session-1/Power.log")
+    second = Path("session-2/Power.log")
+
+    _monitor, observed, llm_events, results = _run_bootstrap_batches(
+        [
+            TailBatch(lines, first, bootstrap=True, source_reset=True, bootstrap_complete=True),
+            TailBatch((), first, bootstrap_complete=True),
+            TailBatch(lines, second, bootstrap=True, source_reset=True, bootstrap_complete=True),
+            TailBatch((), second, bootstrap_complete=True),
+        ]
+    )
+
+    assert [kind for kind, _snapshot in observed] == [
+        "source_reset",
+        "state_ready",
+        "source_reset",
+        "state_ready",
+    ]
+    assert llm_events == []
+    assert results == []
 
 
 def test_monitor_delegates_authorized_commentary_to_llm_callback() -> None:
@@ -290,7 +484,7 @@ def test_interrupted_bootstrap_rebuilds_reader_before_restart(tmp_path: Path) ->
 
     assert monitor.snapshot().game_number == 1
     assert monitor.snapshot().turn == 2
-    assert observed == ["source_reset"]
+    assert observed == ["source_reset", "state_ready"]
     assert monitor.status().events_seen == 0
 
 
