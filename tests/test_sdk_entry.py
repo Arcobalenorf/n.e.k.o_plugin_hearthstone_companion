@@ -574,6 +574,220 @@ def test_save_settings_patches_only_explicit_fields(monkeypatch) -> None:
     assert plugin.cfg.overlay_font_size == 29
 
 
+def test_save_settings_creates_default_profile_for_stable_sdk(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    patches: list[dict[str, Any]] = []
+    profiles: list[tuple[str, dict[str, Any]]] = []
+    update_attempts = 0
+    current = CompanionConfig(log_path="custom.log").to_dict()
+    MissingProfileValidationError = type("ValidationError", (Exception,), {})
+
+    class Config:
+        async def update(self, patch: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+            nonlocal update_attempts
+            update_attempts += 1
+            if update_attempts == 1:
+                raise MissingProfileValidationError("no active profile")
+            patches.append(patch)
+            current.update(patch[entry._CONFIG_SECTION])
+            return {entry._CONFIG_SECTION: dict(current)}
+
+        async def profile_ensure_active(
+            self,
+            name: str,
+            initial: dict[str, Any],
+            **_kwargs: Any,
+        ) -> str:
+            profiles.append((name, initial))
+            return name
+
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig.from_mapping(current)
+    plugin._context_target = None
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._settings_transition = False
+    plugin.ctx = types.SimpleNamespace(_current_lanlan="兰兰A")
+    plugin.config = Config()
+    plugin.logger = types.SimpleNamespace(
+        info=lambda *_args: None,
+        warning=lambda *_args: None,
+    )
+    plugin._monitor = types.SimpleNamespace(update_config=lambda _config: None)
+    plugin._catalog = types.SimpleNamespace(configure=lambda **_kwargs: None)
+    plugin._overlay = types.SimpleNamespace(
+        status=lambda: {"running": False},
+        configure=lambda _config: None,
+    )
+    plugin._ensure_monitor = lambda: plugin._monitor
+
+    result = asyncio.run(plugin.save_settings(llm_data_consent=True))
+
+    assert result["llm_enabled"] is False
+    assert update_attempts == 2
+    assert patches == [{entry._CONFIG_SECTION: {"llm_data_consent": True}}]
+    assert profiles == [
+        ("default", {entry._CONFIG_SECTION: CompanionConfig(log_path="custom.log").to_dict()})
+    ]
+    assert plugin.cfg.llm_data_consent is True
+
+
+def test_save_settings_uses_runtime_config_when_stable_sdk_has_no_profile(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    current = CompanionConfig(log_path="custom.log").to_dict()
+    updates: list[dict[str, Any]] = []
+    MissingProfileValidationError = type("ValidationError", (Exception,), {})
+
+    class Config:
+        async def update(self, _patch: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+            raise MissingProfileValidationError("no active profile")
+
+        async def profile_ensure_active(self, *_args: Any, **_kwargs: Any) -> str:
+            raise RuntimeError("ctx.upsert_own_profile_config is not available")
+
+        async def dump(self, **_kwargs: Any) -> dict[str, Any]:
+            return {entry._CONFIG_SECTION: dict(current)}
+
+    class Context:
+        _current_lanlan = "兰兰A"
+
+        async def update_own_config(
+            self,
+            patch: dict[str, Any],
+            **_kwargs: Any,
+        ) -> dict[str, Any]:
+            updates.append(patch)
+            current.update(patch[entry._CONFIG_SECTION])
+            return {
+                "success": True,
+                "persisted": True,
+                "data": {"config": {entry._CONFIG_SECTION: dict(patch[entry._CONFIG_SECTION])}},
+            }
+
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig.from_mapping(current)
+    plugin._context_target = None
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._settings_transition = False
+    plugin.ctx = Context()
+    plugin.config = Config()
+    plugin.logger = types.SimpleNamespace(info=lambda *_args: None, warning=lambda *_args: None)
+    plugin._monitor = types.SimpleNamespace(update_config=lambda _config: None)
+    plugin._catalog = types.SimpleNamespace(configure=lambda **_kwargs: None)
+    plugin._overlay = types.SimpleNamespace(
+        status=lambda: {"running": False},
+        configure=lambda _config: None,
+    )
+    plugin._ensure_monitor = lambda: plugin._monitor
+
+    result = asyncio.run(plugin.save_settings(llm_data_consent=True))
+
+    assert result["llm_enabled"] is False
+    assert updates == [{entry._CONFIG_SECTION: {"llm_data_consent": True}}]
+    assert plugin.cfg.log_path == "custom.log"
+    assert plugin.cfg.llm_data_consent is True
+
+
+def test_stable_sdk_runtime_config_fallback_rejects_unpersisted_write(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    MissingProfileValidationError = type("ValidationError", (Exception,), {})
+
+    class Config:
+        async def update(self, _patch: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+            raise MissingProfileValidationError("no active profile")
+
+        async def profile_ensure_active(self, *_args: Any, **_kwargs: Any) -> str:
+            raise RuntimeError("ctx.upsert_own_profile_config is not available")
+
+    class Context:
+        async def update_own_config(
+            self,
+            _patch: dict[str, Any],
+            **_kwargs: Any,
+        ) -> dict[str, Any]:
+            return {
+                "success": False,
+                "persisted": False,
+                "config": {entry._CONFIG_SECTION: CompanionConfig().to_dict()},
+                "message": "disk write timed out",
+            }
+
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig()
+    plugin.ctx = Context()
+    plugin.config = Config()
+    plugin.logger = types.SimpleNamespace(info=lambda *_args: None)
+
+    with pytest.raises(RuntimeError, match="disk write timed out"):
+        asyncio.run(plugin._persist_settings_config({"llm_data_consent": True}))
+
+
+def test_stable_sdk_profile_timeout_does_not_retry_through_runtime_config(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    direct_calls = 0
+    MissingProfileValidationError = type("ValidationError", (Exception,), {})
+
+    class Config:
+        async def update(self, _patch: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+            raise MissingProfileValidationError("no active profile")
+
+        async def profile_ensure_active(self, *_args: Any, **_kwargs: Any) -> str:
+            raise TimeoutError("profile persistence timed out")
+
+    class Context:
+        async def update_own_config(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            nonlocal direct_calls
+            direct_calls += 1
+            return {}
+
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig()
+    plugin.ctx = Context()
+    plugin.config = Config()
+
+    with pytest.raises(TimeoutError, match="profile persistence timed out"):
+        asyncio.run(plugin._persist_settings_config({"llm_data_consent": True}))
+    assert direct_calls == 0
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"success": False, "config": {}, "message": "rejected"},
+        {"persisted": False, "config": {}},
+        {"persisted": None, "config": {}},
+    ],
+)
+def test_persisted_config_unwrap_rejects_nonpersistent_responses(
+    monkeypatch,
+    response: dict[str, Any],
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="persistence failed"):
+        entry._unwrap_persisted_config(response)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"hearthstone_companion": {"llm_data_consent": True}},
+        {"config": {"hearthstone_companion": {"llm_data_consent": True}}},
+        {"data": {"config": {"hearthstone_companion": {"llm_data_consent": True}}}},
+    ],
+)
+def test_persisted_config_unwrap_accepts_supported_success_shapes(
+    monkeypatch,
+    response: dict[str, Any],
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+
+    assert entry._unwrap_persisted_config(response) == {
+        entry._CONFIG_SECTION: {"llm_data_consent": True}
+    }
+
+
 def test_consent_revocation_blocks_dispatch_before_config_write_finishes(monkeypatch) -> None:
     entry = _load_sdk_entry(monkeypatch)
 

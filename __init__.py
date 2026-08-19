@@ -41,6 +41,53 @@ _LLM_DELIVERY_MAX_CHARS = 1800
 _STATS_CLEAR_WRITE_TIMEOUT_SECONDS = 3.0
 _SHUTDOWN_THREAD_BUDGET_SECONDS = 0.4
 _SHUTDOWN_WRITER_BUDGET_SECONDS = 0.3
+
+
+def _is_missing_active_profile_error(exc: Exception) -> bool:
+    return (
+        type(exc).__name__ == "ValidationError"
+        and "no active profile" in str(exc).strip().lower()
+    )
+
+
+def _is_unavailable_context_method_error(exc: Exception, method_name: str) -> bool:
+    current: BaseException | None = exc
+    expected = method_name.lower()
+    while current is not None:
+        message = str(current).lower()
+        if expected in message and (
+            isinstance(current, AttributeError) or "not available" in message or "no attribute" in message
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _unwrap_persisted_config(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"config update returned {type(value).__name__}, expected mapping")
+
+    payload = value
+    data = payload.get("data")
+    if isinstance(data, Mapping):
+        payload = data
+
+    for candidate in (value, payload):
+        if candidate.get("success") is False or (
+            "persisted" in candidate and candidate.get("persisted") is not True
+        ):
+            message = candidate.get("message")
+            detail = message if isinstance(message, str) and message else "persistence did not complete"
+            raise RuntimeError(f"settings config persistence failed: {detail}")
+
+    config = payload.get("config")
+    if config is None:
+        config = payload
+    if not isinstance(config, Mapping):
+        raise TypeError(f"config update returned {type(config).__name__}, expected mapping")
+    return dict(config)
+
+
 def _submitted(result: Any) -> bool:
     if isinstance(result, Mapping):
         return bool(result.get("submitted"))
@@ -715,6 +762,55 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         result["summary"] = "炉石日志配置已更新，请重启炉石。" if result["changed"] else "炉石日志配置已经正确。"
         return Ok(result)
 
+    async def _persist_settings_config(self, submitted: Mapping[str, Any]) -> Mapping[str, Any]:
+        patch = {_CONFIG_SECTION: dict(submitted)}
+        try:
+            return await self.config.update(patch, timeout=5.0)
+        except Exception as exc:
+            if not _is_missing_active_profile_error(exc):
+                raise
+
+        # SDK v0.8.x writes through profiles. Some shipped hosts expose that
+        # facade but only implement the public persistent-runtime writer.
+        profile_error: Exception | None = None
+        try:
+            await self.config.profile_ensure_active(
+                "default",
+                {_CONFIG_SECTION: self.cfg.to_dict()},
+                timeout=5.0,
+            )
+            return await self.config.update(patch, timeout=5.0)
+        except Exception as profile_exc:
+            profile_methods = (
+                "upsert_own_profile_config",
+                "set_own_active_profile",
+                "get_own_profile_config",
+            )
+            if not any(
+                _is_unavailable_context_method_error(profile_exc, method)
+                for method in profile_methods
+            ):
+                raise
+            profile_error = profile_exc
+
+        self.logger.info("Profile config API unavailable; using persistent runtime config API")
+        updater = getattr(self.ctx, "update_own_config", None)
+        if not callable(updater):
+            if profile_error is None:
+                raise RuntimeError("profile config API is unavailable")
+            raise profile_error
+        raw = await updater(patch, timeout=5.0)
+        _unwrap_persisted_config(raw)
+
+        confirmed = await self.config.dump(timeout=5.0)
+        section = confirmed.get(_CONFIG_SECTION) if isinstance(confirmed, Mapping) else None
+        if not isinstance(section, Mapping):
+            raise RuntimeError("settings config read-back returned no Hearthstone section")
+        mismatched = [key for key, value in submitted.items() if section.get(key) != value]
+        if mismatched:
+            raise RuntimeError(f"settings config read-back mismatch: {', '.join(sorted(mismatched))}")
+        return confirmed
+
     @ui.action(
         id="save_settings",
         label=tr("actions.save_settings.label", default="保存设置"),
@@ -785,6 +881,8 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                             "enabling LLM commentary requires explicit public-state sharing consent"
                         )
                     )
+                normalized = requested.to_dict()
+                submitted = {key: normalized[key] for key in submitted}
                 resolved_target = self._stable_target(requested)
                 revoking_consent = previous.llm_data_consent and not requested.llm_data_consent
                 restore_needed = self._context_target is not None and (
@@ -808,11 +906,13 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
 
             try:
                 try:
-                    persisted = await self.config.update(
-                        {_CONFIG_SECTION: submitted},
-                        timeout=5.0,
-                    )
+                    persisted = await self._persist_settings_config(submitted)
                 except Exception as exc:
+                    self.logger.warning(
+                        "Settings config update failed: %s: %s",
+                        type(exc).__name__,
+                        str(exc),
+                    )
                     return Err(SdkError(f"settings config update failed: {type(exc).__name__}"))
                 section = persisted.get(_CONFIG_SECTION) if isinstance(persisted, Mapping) else None
                 if not isinstance(section, Mapping):

@@ -4,13 +4,35 @@
 
 从 N.E.K.O 插件市场安装，或使用 GitHub Release 中的 `.neko-plugin` 文件。源码 ZIP 不能代替插件包。
 
-启用并启动“炉石猫娘陪玩”后，日志监听默认启动；数据共享、主动解说和独立诊断浮层默认关闭或不自动启动。
+启用并启动“炉石猫娘陪玩”后，日志监听默认启动；数据共享、主动解说和独立诊断浮层默认关闭或不自动启动。首次使用还需要在插件的“主面板”完成下面两项操作；“使用指南”页面本身不包含开关。
 
 ## 2. 启用 Power.log
 
-在插件面板点击“配置日志”。插件会读取 `%LOCALAPPDATA%\Blizzard\Hearthstone\log.config`，首次修改前创建 `log.config.neko.bak`，并补全 Power 日志输出配置。若发生修改，请完全退出并重启 Hearthstone。
+返回“炉石猫娘陪玩”的主面板，在顶部“三步开启陪玩”区域点击蓝色“配置日志”，然后在确认框中选择“配置日志”。这个按钮就是启用 `Power.log` 的入口，不需要在炉石游戏内寻找日志开关。
+
+插件会读取 `%LOCALAPPDATA%\Blizzard\Hearthstone\log.config`，首次修改前创建 `log.config.neko.bak`，并补全 Power 日志输出配置。看到“Power.log 配置已检查”后，如果提示有修改，请完全退出并重新启动 Hearthstone；只返回登录界面不够。
 
 默认日志位置是 `%LOCALAPPDATA%\Blizzard\Hearthstone\Logs\Power.log`。日志位于日期/会话子目录时，插件会自动选择最近更新的文件；也可在设置中填写文件或目录绝对路径。
+
+如果主面板的“配置日志”按钮不可用，可在炉石完全退出时手动创建或编辑上述 `log.config`，至少包含：
+
+```ini
+[Power]
+LogLevel=1
+FilePrinting=true
+ConsolePrinting=false
+ScreenPrinting=false
+Verbose=true
+
+[LoadingScreen]
+LogLevel=1
+FilePrinting=true
+ConsolePrinting=false
+ScreenPrinting=false
+Verbose=false
+```
+
+保存后重新启动炉石。不要修改或上传 `Power.log` 本身。
 
 ## 3. 确认状态
 
@@ -23,7 +45,9 @@
 
 ## 4. 启用问答
 
-打开“我明确同意向当前 NEKO LLM 分享经过过滤的公开局势”。这允许当前角色在你主动提问时调用只读工具；`target_lanlan` 为空时插件不保存活动角色 ID，由 N.E.K.O 宿主逐消息选择角色。例如：
+回到主面板顶部“三步开启陪玩”区域，打开“我明确同意向当前 NEKO LLM 分享经过过滤的公开局势”，再点击“保存陪玩设置”。开关只有保存成功后才生效；状态卡会从“未开启”变为“已开启”。
+
+这项授权是猫娘读取当前局势和回答酒馆建议的必要条件，但不是本地日志监听的必要条件。它允许当前角色在你主动提问时调用只读工具；`target_lanlan` 为空时插件不保存活动角色 ID，由 N.E.K.O 宿主逐消息选择角色。例如：
 
 - “帮我看看现在酒馆玩什么流派比较好？”
 - “我现在该稳血还是升本？”

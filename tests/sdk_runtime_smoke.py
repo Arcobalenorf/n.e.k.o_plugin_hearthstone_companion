@@ -50,17 +50,68 @@ class _HostContext:
             "plugin": {"store": {"enabled": False}},
             "plugin_state": {"persist_mode": "off"},
         }
+        self._base_config: dict[str, Any] = {
+            "hearthstone_companion": {
+                "monitor_on_start": False,
+                "card_catalog_network_enabled": False,
+                "overlay_auto_start": False,
+            }
+        }
+        self._profiles: dict[str, dict[str, Any]] = {}
+        self._active_profile: str | None = None
 
     async def get_own_config(self, timeout: float = 5.0) -> dict[str, Any]:
         del timeout
+        config = {key: dict(value) for key, value in self._base_config.items()}
+        if self._active_profile is not None:
+            for key, value in self._profiles[self._active_profile].items():
+                if isinstance(config.get(key), dict) and isinstance(value, dict):
+                    config[key].update(value)
+                else:
+                    config[key] = value
+        return {"config": config}
+
+    async def get_own_profiles_state(self, timeout: float = 5.0) -> dict[str, Any]:
+        del timeout
         return {
-            "config": {
-                "hearthstone_companion": {
-                    "monitor_on_start": False,
-                    "card_catalog_network_enabled": False,
-                    "overlay_auto_start": False,
-                }
+            "config_profiles": {
+                "active": self._active_profile,
+                "files": {name: f"profiles/{name}.toml" for name in self._profiles},
             }
+        }
+
+    async def get_own_profile_config(
+        self,
+        profile_name: str,
+        timeout: float = 5.0,
+    ) -> dict[str, Any]:
+        del timeout
+        return {"config": dict(self._profiles[profile_name])}
+
+    async def get_own_effective_config(
+        self,
+        profile_name: str | None = None,
+        timeout: float = 5.0,
+    ) -> dict[str, Any]:
+        del profile_name
+        return await self.get_own_config(timeout=timeout)
+
+    async def update_own_config(
+        self,
+        updates: dict[str, Any],
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        del timeout
+        for key, value in updates.items():
+            if isinstance(self._base_config.get(key), dict) and isinstance(value, dict):
+                self._base_config[key].update(value)
+            else:
+                self._base_config[key] = value
+        effective = await self.get_own_config()
+        return {
+            "success": True,
+            "persisted": True,
+            "config": effective["config"],
         }
 
     def push_message(self, **_kwargs: Any) -> dict[str, bool]:
@@ -125,6 +176,11 @@ async def _exercise_lifecycle(plugin: Any, unwrap_or: Any) -> None:
             raise RuntimeError("stable SDK smoke unexpectedly started the log monitor")
         if startup.get("card_catalog_started") is not False:
             raise RuntimeError("stable SDK smoke unexpectedly started the network catalog")
+        saved = unwrap_or(await plugin.save_settings(llm_data_consent=True), {})
+        if saved.get("llm_enabled") is not False:
+            raise RuntimeError(f"unexpected settings save result: {saved!r}")
+        if plugin.cfg.llm_data_consent is not True:
+            raise RuntimeError("stable SDK smoke did not persist LLM data consent")
     finally:
         shutdown = unwrap_or(await plugin.shutdown(), {})
     if shutdown.get("status") != "stopped":
@@ -164,7 +220,7 @@ def main() -> int:
             else:
                 os.environ["NEKO_STORAGE_SELECTED_ROOT"] = previous_storage_root
 
-    print("N.E.K.O v0.8.3 SDK constructor and lifecycle smoke passed")
+    print("N.E.K.O v0.8.3 SDK constructor, settings, and lifecycle smoke passed")
     return 0
 
 
