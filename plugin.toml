@@ -1,0 +1,68 @@
+[plugin]
+id = "hearthstone_companion"
+name = "炉石猫娘陪玩"
+description = "只读理解炉石与酒馆战棋局势，以结构化事实和情绪信号驱动当前 N.E.K.O 角色自然陪伴，并支持可追问的酒馆建议。"
+short_description = "Data-aware Hearthstone and Battlegrounds companionship through the active NEKO character."
+keywords = ["炉石", "炉石传说", "酒馆战棋", "hearthstone", "battlegrounds", "陪玩", "猫娘", "对局"]
+version = "0.1.0"
+type = "plugin"
+entry = "plugin.plugins.hearthstone_companion:HearthstoneCompanionPlugin"
+passive = true
+
+[plugin.author]
+name = "NEKOLU Contributors"
+
+[plugin.sdk]
+recommended = ">=0.1.0,<0.2.0"
+supported = ">=0.1.0,<0.3.0"
+
+[plugin.i18n]
+default_locale = "zh-CN"
+locales_dir = "i18n"
+
+[plugin.store]
+enabled = true
+
+[plugin.ui]
+enabled = true
+
+[[plugin.ui.panel]]
+id = "main"
+title = "炉石猫娘陪玩"
+entry = "ui/panel.tsx"
+context = "dashboard"
+permissions = ["state:read", "action:call"]
+
+[[plugin.ui.guide]]
+id = "quickstart"
+title = "使用指南"
+entry = "docs/quickstart.md"
+permissions = ["state:read"]
+
+[plugin_runtime]
+enabled = true
+auto_start = true
+startup_failure = "warn"
+timeout = 15
+
+[hearthstone_companion]
+monitor_on_start = true
+log_path = ""
+poll_interval_seconds = 0.4
+initial_read_max_bytes = 67108864
+llm_commentary_enabled = false
+llm_data_consent = false
+llm_min_priority = 5
+llm_cooldown_seconds = 25
+llm_critical_cooldown_seconds = 8
+llm_max_reply_chars = 28
+user_chat_quiet_window_seconds = 30
+target_lanlan = ""
+card_catalog_network_enabled = true
+card_catalog_refresh_hours = 24
+overlay_enabled = true
+overlay_auto_start = false
+overlay_window_titles = "Hearthstone|炉石传说|爐石戰記|하스스톤"
+overlay_height_percent = 32
+overlay_font_size = 24
+overlay_speed_px_per_second = 150

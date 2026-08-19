@@ -1,0 +1,71 @@
+# 故障排查
+
+## 找不到 Power.log
+
+1. 在面板点击“配置日志”；
+2. 有改动时完全退出并重启 Hearthstone；
+3. 进入一局游戏；
+4. 查看 `source_state` 是否为 `watching`、`lines_seen` 是否增长；
+5. 仍失败时把 `Power.log` 文件或所在目录的绝对路径填入 `log_path`。
+
+默认可用以下命令定位：
+
+```powershell
+Get-ChildItem "$env:LOCALAPPDATA\Blizzard\Hearthstone" -Filter Power.log -Recurse -ErrorAction SilentlyContinue |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 10 FullName, Length, LastWriteTime
+```
+
+不要填写游戏安装目录、可执行文件或 Deck Tracker 数据目录。
+
+## 有日志但没有角色主动说话
+
+依次检查：
+
+1. `llm_data_consent` 与 `llm_commentary_enabled` 是否都开启；
+2. N.E.K.O 当前角色是否配置了可用模型；
+3. 当前是否在旁观模式；
+4. 最近是否有用户聊天，普通事件会安静 30 秒；
+5. 是否仍在 25 秒普通冷却或 8 秒关键冷却内；
+6. 事件优先级是否达到默认阈值 5；
+7. 点击“测试解说”检查 SDK 是否接受提交。
+
+插件不会为每个回合或商店变化都发言。稀疏、情绪相关的主动回应是设计行为。
+
+## 主动解说关闭后还能问酒馆问题吗
+
+可以。保持 `llm_data_consent=true`，当前角色仍可调用 `hearthstone_battlegrounds_advice`。主动解说开关只控制插件是否主动发起角色回复。
+
+若工具返回 `llm_data_sharing_not_authorized`，说明数据同意未开启。若 `current_public_state` 为空，确认已经进入酒馆且日志正在增长。
+
+## 为什么没有全服胜率
+
+插件没有 HSReplay Tier7 或 Firestone 私有遥测的授权 API，不会抓取其网页。随包赛季资料只描述官方玩法规则，本机统计只代表用户自己的有效结算样本。角色应明确说明此限制；若它给出没有来源的全服胜率，请附上对话和插件状态报告问题，但不要上传完整日志。
+
+## 卡牌目录不可用或已陈旧
+
+查看 `card_catalog.degraded_reason`、`dataset.patch`、`checked_at` 和 `stale`。首次安装需要短暂下载公共当前卡池；超时、HTTP 429/5xx 或离线时，插件会保留旧缓存，不会中断日志监听。确认网络允许访问 `https://hsbg.cards`，并检查 `card_catalog_network_enabled=true`。不希望插件直连该服务时可关闭此项，角色仍能读取实时局势，但卡牌规则依据会减少。少量旧式或不规则金卡 CardID 可能出现在 `missing_ids`；这表示没有可靠规则补全，不影响 Power.log 中的实时身材。
+
+## 对手阵容看起来过时
+
+这是正常边界。Power.log 只能在公开观察到对手战团时记录，UI 和工具会显示 `last_seen_round` 并标记非当前。插件不会推测对手之后的购买、出售或强化。
+
+## 独立诊断浮层问题
+
+常见错误包括 `windows_required`、`tkinter_unavailable`、`python_probe_failed`、`overlay_script_missing` 和 `overlay_exited_early`。诊断浮层不是自动陪玩输出，失败不会影响角色回复。
+
+浮层运行但不可见时，确认炉石窗口未最小化，标题包含 `Hearthstone`、`炉石传说`、`爐石戰記` 或 `하스스톤`，然后点击“测试解说”。只有这类显式诊断消息会进入浮层；真实陪玩由当前 N.E.K.O 角色界面与语音输出。
+
+## 本地统计存储处于降级状态
+
+面板出现 `stats:load_store_err`、`stats:load:<异常类型>` 或 `stats:load_invalid` 时，表示启动时未能可靠加载已有统计。核心陪伴仍可工作，但本次运行会禁止统计记录和清空，避免用空基线覆盖未知历史。`stats:writer_unavailable`、`stats:store_err`、其他 `stats:<异常类型>` 或 `stats:clear_compensation_unconfirmed` 则表示最近一次聚合统计写入未能确认；当前内存统计可能尚未持久化，清空补偿无法确认时会先恢复清空前的内存统计。
+
+不要连续重复清空。先记录错误码，停止并重新启动插件，再刷新面板核对场次；若问题持续，提交插件/N.E.K.O 版本和错误码，不要附带完整 `Power.log`。插件只停止自己拥有的统计 writer，SDK Store client 的生命周期由 N.E.K.O 宿主管理。
+
+## 状态或卡牌不准确
+
+游戏更新可能改变日志格式。记录插件/N.E.K.O 版本、模式、阶段、`source_state`、`lines_seen`、`last_event_kind`、`last_error_code` 和是否发生日志轮换。不要直接上传完整 `Power.log`；按[隐私说明](privacy-security.md#问题报告与合规)裁剪并脱敏。
+
+## 恢复 log.config
+
+首次修改已有配置时会创建 `%LOCALAPPDATA%\Blizzard\Hearthstone\log.config.neko.bak`。插件不会覆盖已有备份或卸载时自动恢复。退出 Hearthstone 后比较当前文件与备份，确认没有其他工具新增配置，再手动处理。

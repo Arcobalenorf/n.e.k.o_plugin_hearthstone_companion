@@ -1,0 +1,36 @@
+{
+  "key": "S14-36.2",
+  "season": 14,
+  "patch": "36.2.2",
+  "name": "Dark Gifts of Dalaran",
+  "starts_at": "2026-08-04",
+  "verified_at": "2026-08-19",
+  "source_url": "https://hearthstone.blizzard.com/en-us/news/24290432/36-2-patch-notes",
+  "patch_source_url": "https://hearthstone.blizzard.com/en-us/news/24293284/3622-patch-notes",
+  "source_urls": [
+    "https://hearthstone.blizzard.com/en-us/news/24290432/36-2-patch-notes",
+    "https://hearthstone.blizzard.com/en-us/news/24293284/3622-patch-notes"
+  ],
+  "mechanics": [
+    {
+      "id": "dark_gifts",
+      "title": "Dark Gifts",
+      "summary": "From turn 3, spend 3 Gold to Discover a minion and Dark Gift bundle, at most once per turn and three times per game."
+    },
+    {
+      "id": "activate",
+      "title": "Activate",
+      "summary": "Pay Gold during the Recruit phase to trigger an ability once per turn."
+    },
+    {
+      "id": "lockbox_fishbait",
+      "title": "Lockbox and Fishbait",
+      "summary": "Season 14 adds the Pirate Lockbox and Beast Fishbait mechanics."
+    },
+    {
+      "id": "trinkets",
+      "title": "Trinkets",
+      "summary": "Trinkets remain active with an expanded pool in patch 36.2."
+    }
+  ]
+}

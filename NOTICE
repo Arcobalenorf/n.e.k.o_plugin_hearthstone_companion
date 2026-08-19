@@ -1,0 +1,13 @@
+Hearthstone Catgirl Companion
+Copyright (c) 2026 NEKOLU Contributors
+
+The plugin source code is distributed under the MIT License in LICENSE.
+
+Battlegrounds card metadata is retrieved at runtime from hsbg.cards:
+https://hsbg.cards/about
+https://hsbg.cards/terms
+
+Hearthstone and its card names, rules text, artwork, and other game data are
+copyright Blizzard Entertainment. This project is an unofficial community
+plugin and is not affiliated with or endorsed by Blizzard Entertainment,
+NetEase, hsbg.cards, or Project N.E.K.O.

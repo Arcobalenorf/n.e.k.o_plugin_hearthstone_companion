@@ -1,0 +1,36 @@
+[project]
+name = "hearthstone-companion"
+version = "0.1.0"
+description = "Data-aware Hearthstone and Battlegrounds companion for the active N.E.K.O character."
+requires-python = ">=3.11,<3.12"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0,<9.0",
+    "ruff>=0.12,<1.0",
+]
+
+[tool.neko.build]
+exclude_dirs = [
+    ".git",
+    ".github",
+    ".vscode",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "tests",
+]
+exclude_files = [
+    ".gitattributes",
+    ".gitignore",
+    "README.md",
+    "uv.lock",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

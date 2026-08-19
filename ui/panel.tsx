@@ -1,0 +1,952 @@
+import {
+  Alert,
+  Button,
+  ButtonGroup,
+  Card,
+  DataTable,
+  Divider,
+  EmptyState,
+  Field,
+  Grid,
+  Heading,
+  Inline,
+  InlineError,
+  Input,
+  KeyValue,
+  Page,
+  RefreshButton,
+  Slider,
+  Stack,
+  StatCard,
+  StatusBadge,
+  Switch,
+  Text,
+  Warning,
+  useConfirm,
+  useEffect,
+  useMemo,
+  useState,
+  useToast,
+} from "@neko/plugin-ui"
+import type { PluginSurfaceProps, Tone } from "@neko/plugin-ui"
+
+type BoardState = {
+  count?: number
+  attack?: number
+  health?: number
+  cards?: string[]
+}
+
+type SideState = {
+  health?: number | null
+  armor?: number
+  effective_health?: number | null
+  mana_available?: number | null
+  mana_max?: number | null
+  hand_count?: number
+  deck_count?: number
+  secret_count?: number
+  board?: BoardState
+}
+
+type RecentCard = {
+  side?: string
+  card?: string
+  card_id?: string
+  turn?: number
+}
+
+type RecentCardRow = RecentCard & {
+  _key: string
+}
+
+type RuntimeState = {
+  monitor_running?: boolean
+  source_state?: string
+  resolved_log_path?: string
+  lines_seen?: number
+  events_seen?: number
+  llm_submissions?: number
+  last_line_at?: number
+  last_event_at?: number
+  last_event_kind?: string
+  last_error_code?: string
+}
+
+type GameState = {
+  mode?: string
+  phase?: string
+  game_number?: number
+  turn?: number
+  active_side?: string
+  player?: SideState
+  opponent?: SideState
+  recent_cards?: RecentCard[]
+  result?: string
+  battlegrounds?: BattlegroundsState | null
+}
+
+type BattlegroundsCard = {
+  card_id?: string
+  name?: string
+  attack?: number
+  health?: number | null
+  tier?: number
+  frozen?: boolean
+}
+
+type BattlegroundsLobbyPlayer = {
+  player_id?: number
+  is_local?: boolean
+  hero_card_id?: string
+  hero_name?: string
+  health?: number | null
+  armor?: number
+  effective_health?: number | null
+  tavern_tier?: number
+  triples?: number
+  placement?: number
+  eliminated?: boolean
+  next_opponent?: boolean
+  last_seen_round?: number
+  board?: BoardState & { is_last_observed?: boolean }
+}
+
+type BattlegroundsState = {
+  variant?: string
+  round?: number
+  phase?: string
+  gold?: number | null
+  max_gold?: number | null
+  tavern_tier?: number
+  frozen?: boolean
+  next_opponent_player_id?: number
+  placement?: number
+  shop?: BattlegroundsCard[]
+  hand?: BattlegroundsCard[]
+  warband?: BattlegroundsCard[]
+  lobby?: BattlegroundsLobbyPlayer[]
+  mechanics?: Record<string, unknown>
+  source?: string
+}
+
+type BattlegroundsModeStats = {
+  games?: number
+  top4?: number
+  top4_rate?: number | null
+  top2?: number
+  top2_rate?: number | null
+  first?: number
+  first_rate?: number | null
+  average_placement?: number | null
+  heroes?: Record<string, BattlegroundsModeStats>
+}
+
+type BattlegroundsStatsState = {
+  schema_version?: number
+  seasons?: Record<string, { solo?: BattlegroundsModeStats; duos?: BattlegroundsModeStats }>
+}
+
+type BattlegroundsSeasonState = {
+  key?: string
+  season?: number | null
+  patch?: string
+  name?: string
+  verified_at?: string
+  source_url?: string
+  status?: string
+  mechanics?: { id?: string; title?: string; summary?: string }[]
+}
+
+type OverlayState = {
+  available?: boolean
+  reason?: string
+  running?: boolean
+  pid?: number
+}
+
+type SettingsState = {
+  log_path?: string
+  llm_commentary_enabled?: boolean
+  llm_data_consent?: boolean
+  target_lanlan?: string
+  card_catalog_network_enabled?: boolean
+  overlay_enabled?: boolean
+  overlay_height_percent?: number
+  overlay_font_size?: number
+  overlay_speed_px_per_second?: number
+}
+
+type PrivacyState = {
+  raw_log_uploaded?: boolean
+  player_names_retained?: boolean
+  hidden_opponent_cards_exposed?: boolean
+  llm_public_state_sharing_enabled?: boolean
+  card_catalog_network_enabled?: boolean
+  card_catalog_sends_game_state?: boolean
+}
+
+type DashboardState = {
+  runtime?: RuntimeState
+  game?: GameState
+  overlay?: OverlayState
+  settings?: SettingsState
+  privacy?: PrivacyState
+  battlegrounds_stats?: BattlegroundsStatsState
+  battlegrounds_stats_storage?: { degraded?: boolean; error_code?: string }
+  battlegrounds_season?: BattlegroundsSeasonState
+  card_catalog?: {
+    available?: boolean
+    card_count?: number
+    degraded_reason?: string
+    dataset?: { provider?: string; patch?: string; checked_at?: number; stale?: boolean }
+  }
+}
+
+type SettingsDraft = {
+  log_path: string
+  llm_commentary_enabled: boolean
+  llm_data_consent: boolean
+  target_lanlan: string
+  card_catalog_network_enabled: boolean
+  overlay_enabled: boolean
+  overlay_height_percent: number
+  overlay_font_size: number
+  overlay_speed_px_per_second: number
+}
+
+const DEFAULT_SETTINGS: SettingsDraft = {
+  log_path: "",
+  llm_commentary_enabled: false,
+  llm_data_consent: false,
+  target_lanlan: "",
+  card_catalog_network_enabled: true,
+  overlay_enabled: true,
+  overlay_height_percent: 32,
+  overlay_font_size: 24,
+  overlay_speed_px_per_second: 150,
+}
+
+function asSettingsDraft(value?: SettingsState): SettingsDraft {
+  return {
+    log_path: String(value?.log_path || ""),
+    llm_commentary_enabled: Boolean(value?.llm_commentary_enabled && value?.llm_data_consent),
+    llm_data_consent: Boolean(value?.llm_data_consent),
+    target_lanlan: String(value?.target_lanlan || ""),
+    card_catalog_network_enabled: value?.card_catalog_network_enabled !== false,
+    overlay_enabled: value?.overlay_enabled !== false,
+    overlay_height_percent: Number(value?.overlay_height_percent ?? DEFAULT_SETTINGS.overlay_height_percent),
+    overlay_font_size: Number(value?.overlay_font_size ?? DEFAULT_SETTINGS.overlay_font_size),
+    overlay_speed_px_per_second: Number(
+      value?.overlay_speed_px_per_second ?? DEFAULT_SETTINGS.overlay_speed_px_per_second,
+    ),
+  }
+}
+
+function stateTone(value: string): Tone {
+  if (["watching", "playing", "running"].includes(value)) return "success"
+  if (["degraded", "unavailable", "error"].includes(value)) return "danger"
+  if (["waiting", "waiting_for_log", "starting", "mulligan"].includes(value)) return "warning"
+  if (["spectator", "ended"].includes(value)) return "info"
+  return "default"
+}
+
+function errorText(error: unknown, fallback: string): string {
+  if (error instanceof Error && error.message) return error.message
+  if (typeof error === "string" && error) return error
+  return fallback
+}
+
+export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<DashboardState>) {
+  const { actions, state, t } = props
+  const safeState = state || {}
+  const runtime = safeState.runtime || {}
+  const game = safeState.game || {}
+  const battlegrounds = game.battlegrounds || {}
+  const season = safeState.battlegrounds_season || {}
+  const seasonStats = safeState.battlegrounds_stats?.seasons?.[String(season.key || "")] || {}
+  const statsStorage = safeState.battlegrounds_stats_storage || {}
+  const soloStats = seasonStats.solo || {}
+  const duosStats = seasonStats.duos || {}
+  const overlay = safeState.overlay || {}
+  const catalog = safeState.card_catalog || {}
+  const catalogDataset = catalog.dataset || {}
+  const privacy = safeState.privacy || {}
+  const player = game.player || {}
+  const opponent = game.opponent || {}
+  const playerBoard = player.board || {}
+  const opponentBoard = opponent.board || {}
+  const toast = useToast()
+  const confirm = useConfirm()
+  const [draft, setDraft] = useState<SettingsDraft>(() => asSettingsDraft(safeState.settings))
+  const [draftDirty, setDraftDirty] = useState(false)
+  const [busyAction, setBusyAction] = useState("")
+  const [notice, setNotice] = useState("")
+  const [failure, setFailure] = useState("")
+
+  useEffect(() => {
+    if (!draftDirty) setDraft(asSettingsDraft(safeState.settings))
+  }, [safeState.settings, draftDirty])
+
+  const recentCards = useMemo<RecentCardRow[]>(
+    () => [...(game.recent_cards || [])].reverse().map((card, index) => ({
+      ...card,
+      _key: `${card.turn ?? 0}:${card.side || "unknown"}:${card.card_id || card.card || "card"}:${index}`,
+    })),
+    [game.recent_cards],
+  )
+  const lobbyRows = useMemo(
+    () => (battlegrounds.lobby || []).map((player) => ({
+      ...player,
+      _key: String(player.player_id || 0),
+    })),
+    [battlegrounds.lobby],
+  )
+  const shopRows = useMemo(
+    () => (battlegrounds.shop || []).map((card, index) => ({
+      ...card,
+      _key: `${card.card_id || card.name || "shop"}:${index}`,
+    })),
+    [battlegrounds.shop],
+  )
+  const seasonMechanics = useMemo(
+    () => (season.mechanics || []).map((mechanic, index) => ({
+      ...mechanic,
+      _key: mechanic.id || String(index),
+    })),
+    [season.mechanics],
+  )
+
+  function actionAvailable(actionId: string): boolean {
+    return actions.some((action) => action.id === actionId)
+  }
+
+  function localized(prefix: string, value?: string): string {
+    const normalized = String(value || "unknown").toLowerCase()
+    const known: Record<string, string[]> = {
+      "status.source": ["watching", "waiting", "waiting_for_log", "bootstrap_incomplete", "degraded", "stopped", "unknown"],
+      "status.phase": ["idle", "starting", "mulligan", "playing", "hero_select", "recruit", "combat", "spectator", "ended", "unknown"],
+      "status.side": ["player", "opponent", "unknown"],
+      "status.result": ["won", "placed", "lost", "tied", "conceded", "unknown"],
+      "status.overlayReason": ["overlay_disabled", "windows_required", "tkinter_unavailable", "python_probe_failed", "unknown"],
+    }
+    return known[prefix]?.includes(normalized) ? t(`${prefix}.${normalized}`) : String(value || t("common.unknown"))
+  }
+
+  function timestamp(value?: number): string {
+    if (!value || value <= 0) return t("common.never")
+    return new Date(value * 1000).toLocaleString(props.locale)
+  }
+
+  function yesNo(value?: boolean): string {
+    if (value == null) return t("common.unknown")
+    return value ? t("common.yes") : t("common.no")
+  }
+
+  function boardCards(value?: string[]): string {
+    return value && value.length > 0 ? value.join(", ") : t("common.none")
+  }
+
+  function mana(side: SideState): string {
+    if (side.mana_available == null && side.mana_max == null) return t("common.notAvailable")
+    return `${side.mana_available ?? 0}/${side.mana_max ?? 0}`
+  }
+
+  function percentage(value?: number | null, games?: number): string {
+    return games && value != null ? `${value}%` : t("common.insufficientData")
+  }
+
+  function updateDraft(patch: Partial<SettingsDraft>) {
+    setDraft((current) => ({ ...current, ...patch }))
+    setDraftDirty(true)
+  }
+
+  async function runAction(
+    actionId: string,
+    args: Record<string, unknown>,
+    successKey: string,
+  ): Promise<boolean> {
+    if (!actionAvailable(actionId)) {
+      const message = t("errors.actionUnavailable", { action: actionId })
+      setFailure(message)
+      toast.error(message)
+      return false
+    }
+    setBusyAction(actionId)
+    setFailure("")
+    setNotice("")
+    try {
+      await props.api.call(actionId, args)
+      await props.api.refresh()
+      const message = t(successKey)
+      setNotice(message)
+      toast.success(message)
+      return true
+    } catch (error) {
+      try {
+        await props.api.refresh()
+      } catch {
+        // Preserve the action error; refresh is best-effort on failure.
+      }
+      const message = errorText(error, t("errors.actionFailed"))
+      setFailure(message)
+      toast.error(message)
+      return false
+    } finally {
+      setBusyAction("")
+    }
+  }
+
+  async function preparePowerLog() {
+    const accepted = await confirm({
+      title: t("confirm.prepareLog.title"),
+      message: t("confirm.prepareLog.message"),
+      tone: "warning",
+      confirmLabel: t("confirm.prepareLog.confirm"),
+      cancelLabel: t("common.cancel"),
+    })
+    if (accepted) await runAction("prepare_power_log", {}, "messages.logPrepared")
+  }
+
+  async function resetBattlegroundsStats() {
+    const accepted = await confirm({
+      title: t("confirm.resetStats.title"),
+      message: t("confirm.resetStats.message"),
+      tone: "danger",
+      confirmLabel: t("confirm.resetStats.confirm"),
+      cancelLabel: t("common.cancel"),
+    })
+    if (accepted) await runAction("reset_battlegrounds_stats", { confirm: true }, "messages.statsReset")
+  }
+
+  async function saveSettings() {
+    if (draft.llm_commentary_enabled && !draft.llm_data_consent) {
+      const message = t("errors.consentRequired")
+      setFailure(message)
+      toast.warning(message)
+      return
+    }
+    if (await runAction("save_settings", draft, "messages.settingsSaved")) {
+      setDraftDirty(false)
+    }
+  }
+
+  function setConsent(enabled: boolean) {
+    setDraft((current) => ({
+      ...current,
+      llm_data_consent: enabled,
+      llm_commentary_enabled: enabled ? current.llm_commentary_enabled : false,
+    }))
+    setDraftDirty(true)
+    setFailure("")
+  }
+
+  function setCommentary(enabled: boolean) {
+    if (enabled && !draft.llm_data_consent) {
+      const message = t("errors.consentRequired")
+      setFailure(message)
+      toast.warning(message)
+      return
+    }
+    updateDraft({ llm_commentary_enabled: enabled })
+    setFailure("")
+  }
+
+  const sourceState = String(runtime.source_state || "unknown")
+  const phase = String(game.phase || "unknown")
+  const overlayStatus = overlay.running ? "running" : overlay.available === false ? "unavailable" : "stopped"
+  const overlaySettingEnabled = draft.overlay_enabled && safeState.settings?.overlay_enabled !== false
+  const monitorReady = Boolean(runtime.monitor_running) && sourceState === "watching"
+  const consentReady = Boolean(safeState.settings?.llm_data_consent)
+  const commentaryReady = Boolean(
+    safeState.settings?.llm_data_consent && safeState.settings?.llm_commentary_enabled,
+  )
+
+  return (
+    <Page title={t("panel.title")} subtitle={t("panel.subtitle")}>
+      <Stack>
+        <Inline justify="space-between" align="center" wrap>
+          <Inline align="center" wrap>
+            <StatusBadge tone={stateTone(sourceState)} label={localized("status.source", sourceState)} />
+            <StatusBadge tone={stateTone(phase)} label={localized("status.phase", phase)} />
+          </Inline>
+          <RefreshButton
+            label={t("actions.refresh.label")}
+            onError={(error) => setFailure(errorText(error, t("errors.refreshFailed")))}
+          />
+        </Inline>
+
+        {notice ? <Alert tone="success">{notice}</Alert> : null}
+        {failure ? <InlineError title={t("errors.title")} error={failure} /> : null}
+        {props.warnings?.length ? (
+          <Warning>{t("warnings.hosted", { count: props.warnings.length })}</Warning>
+        ) : null}
+
+        <Card title={t("sections.setup.title")}>
+          <Stack>
+            <Text>{t("setup.subtitle")}</Text>
+            <Grid cols={3}>
+              <Stack>
+                <Heading as="h3">{t("setup.monitor.title")}</Heading>
+                <StatusBadge
+                  tone={monitorReady ? "success" : runtime.monitor_running ? "warning" : "default"}
+                  label={t(monitorReady ? "setup.monitor.ready" : runtime.monitor_running ? "setup.monitor.waiting" : "setup.monitor.stopped")}
+                />
+                <Text>{t(monitorReady ? "setup.monitor.readyHelp" : "setup.monitor.actionHelp")}</Text>
+              </Stack>
+              <Stack>
+                <Heading as="h3">{t("setup.consent.title")}</Heading>
+                <StatusBadge
+                  tone={consentReady ? "success" : "warning"}
+                  label={t(consentReady ? "setup.enabled" : "setup.disabled")}
+                />
+                <Text>{t(consentReady ? "setup.consent.enabledHelp" : "setup.consent.disabledHelp")}</Text>
+              </Stack>
+              <Stack>
+                <Heading as="h3">{t("setup.commentary.title")}</Heading>
+                <StatusBadge
+                  tone={commentaryReady ? "success" : "default"}
+                  label={t(commentaryReady ? "setup.enabled" : "setup.disabled")}
+                />
+                <Text>{t(commentaryReady ? "setup.commentary.enabledHelp" : "setup.commentary.disabledHelp")}</Text>
+              </Stack>
+            </Grid>
+            <Divider />
+            <Switch
+              checked={draft.llm_data_consent}
+              label={t("settings.llmConsent")}
+              onChange={setConsent}
+            />
+            <Text>{t("settings.llmConsentHelp")}</Text>
+            <Switch
+              checked={draft.llm_commentary_enabled}
+              disabled={!draft.llm_data_consent}
+              label={t("settings.llmCommentary")}
+              onChange={setCommentary}
+            />
+            {!draft.llm_data_consent ? <Text>{t("settings.llmDisabledHelp")}</Text> : null}
+            <ButtonGroup>
+              <Button
+                tone="primary"
+                disabled={Boolean(busyAction) || !actionAvailable("prepare_power_log")}
+                onClick={preparePowerLog}
+              >
+                {t("actions.prepare_power_log.label")}
+              </Button>
+              <Button
+                tone="success"
+                disabled={Boolean(busyAction) || !actionAvailable("save_settings")}
+                onClick={saveSettings}
+              >
+                {t("actions.enable_companion.label")}
+              </Button>
+            </ButtonGroup>
+          </Stack>
+        </Card>
+
+        {game.mode === "battlegrounds" ? (
+          <Stack>
+            <Card title={t("sections.battlegrounds.title")}>
+              <Stack>
+                <Inline align="center" wrap>
+                  <StatusBadge tone={stateTone(String(battlegrounds.phase || phase))} label={localized("status.phase", battlegrounds.phase || phase)} />
+                  <StatusBadge tone="info" label={t(`battlegrounds.variant.${battlegrounds.variant || "solo"}`)} />
+                  <Text>{t("battlegrounds.round", { value: battlegrounds.round ?? 0 })}</Text>
+                  {battlegrounds.placement ? <StatusBadge tone="info" label={t("battlegrounds.placement", { value: battlegrounds.placement })} /> : null}
+                </Inline>
+                <Grid cols={4}>
+                  <StatCard label={t("battlegrounds.gold")} value={battlegrounds.gold == null ? t("common.notAvailable") : `${battlegrounds.gold}/${battlegrounds.max_gold ?? "?"}`} />
+                  <StatCard label={t("battlegrounds.tavernTier")} value={battlegrounds.tavern_tier ?? 0} />
+                  <StatCard label={t("battlegrounds.warbandSize")} value={battlegrounds.warband?.length ?? 0} />
+                  <StatCard label={t("battlegrounds.nextOpponent")} value={battlegrounds.next_opponent_player_id || t("common.unknown")} />
+                </Grid>
+                <KeyValue
+                  items={[
+                    { key: "frozen", label: t("battlegrounds.shopFrozen"), value: yesNo(battlegrounds.frozen) },
+                    { key: "hand", label: t("battlegrounds.hand"), value: boardCards((battlegrounds.hand || []).map((card) => card.name || card.card_id || t("common.unknown"))) },
+                    { key: "warband", label: t("battlegrounds.warband"), value: boardCards((battlegrounds.warband || []).map((card) => card.name || card.card_id || t("common.unknown"))) },
+                    { key: "source", label: t("battlegrounds.source"), value: t("battlegrounds.powerLogSource") },
+                  ]}
+                />
+              </Stack>
+            </Card>
+
+            <Card title={t("sections.battlegroundsLobby.title")}>
+              {lobbyRows.length ? (
+                <DataTable
+                  data={lobbyRows}
+                  rowKey="_key"
+                  maxRows={8}
+                  emptyText={t("battlegroundsLobby.empty")}
+                  columns={[
+                    { key: "player_id", label: t("battlegroundsLobby.player") },
+                    { key: "hero_name", label: t("battlegroundsLobby.hero"), render: (row) => row.hero_name || row.hero_card_id || t("common.unknown") },
+                    { key: "health", label: t("battlegroundsLobby.health"), render: (row) => row.health == null ? t("common.unknown") : `${row.health}+${row.armor ?? 0}` },
+                    { key: "tavern_tier", label: t("battlegroundsLobby.tier") },
+                    { key: "placement", label: t("battlegroundsLobby.place"), render: (row) => row.placement || t("common.unknown") },
+                    { key: "next_opponent", label: t("battlegroundsLobby.status"), render: (row) => row.is_local ? t("battlegroundsLobby.local") : row.next_opponent ? t("battlegroundsLobby.next") : row.eliminated ? t("battlegroundsLobby.eliminated") : t("battlegroundsLobby.alive") },
+                    { key: "last_seen_round", label: t("battlegroundsLobby.observed"), render: (row) => row.last_seen_round ? t("battlegroundsLobby.observedRound", { value: row.last_seen_round }) : t("common.none") },
+                  ]}
+                />
+              ) : (
+                <EmptyState title={t("battlegroundsLobby.empty")} description={t("battlegroundsLobby.emptyHelp")} />
+              )}
+            </Card>
+
+            <Card title={t("sections.battlegroundsShop.title")}>
+              {shopRows.length ? (
+                <DataTable
+                  data={shopRows}
+                  rowKey="_key"
+                  maxRows={10}
+                  emptyText={t("battlegroundsShop.empty")}
+                  columns={[
+                    { key: "name", label: t("battlegroundsShop.card"), render: (row) => row.name || row.card_id || t("common.unknown") },
+                    { key: "tier", label: t("battlegroundsShop.tier"), render: (row) => row.tier || t("common.unknown") },
+                    { key: "attack", label: t("battlegroundsShop.stats"), render: (row) => `${row.attack ?? 0}/${row.health ?? 0}` },
+                    { key: "frozen", label: t("battlegroundsShop.frozen"), render: (row) => yesNo(row.frozen) },
+                  ]}
+                />
+              ) : (
+                <EmptyState title={t("battlegroundsShop.empty")} description={t("battlegroundsShop.emptyHelp")} />
+              )}
+            </Card>
+
+            <Card title={t("sections.battlegroundsStats.title")}>
+              <Stack>
+                <Alert tone="info">{t("battlegroundsStats.localOnly", { patch: season.patch || t("common.unknown") })}</Alert>
+                {statsStorage.degraded ? (
+                  <InlineError
+                    title={t("battlegroundsStats.storageError")}
+                    message={t("battlegroundsStats.storageErrorHelp")}
+                    details={statsStorage.error_code || t("common.unknown")}
+                  />
+                ) : null}
+                <Heading as="h3">{t("battlegroundsStats.solo")}</Heading>
+                <Grid cols={4}>
+                  <StatCard label={t("battlegroundsStats.games")} value={soloStats.games ?? 0} />
+                  <StatCard label={t("battlegroundsStats.top4Rate")} value={percentage(soloStats.top4_rate, soloStats.games)} />
+                  <StatCard label={t("battlegroundsStats.firstRate")} value={percentage(soloStats.first_rate, soloStats.games)} />
+                  <StatCard label={t("battlegroundsStats.averagePlace")} value={soloStats.average_placement ?? t("common.insufficientData")} />
+                </Grid>
+                <Divider />
+                <Heading as="h3">{t("battlegroundsStats.duos")}</Heading>
+                <Grid cols={4}>
+                  <StatCard label={t("battlegroundsStats.games")} value={duosStats.games ?? 0} />
+                  <StatCard label={t("battlegroundsStats.top2Rate")} value={percentage(duosStats.top2_rate, duosStats.games)} />
+                  <StatCard label={t("battlegroundsStats.firstRate")} value={percentage(duosStats.first_rate, duosStats.games)} />
+                  <StatCard label={t("battlegroundsStats.averagePlace")} value={duosStats.average_placement ?? t("common.insufficientData")} />
+                </Grid>
+                <Button
+                  tone="danger"
+                  disabled={Boolean(busyAction) || !actionAvailable("reset_battlegrounds_stats")}
+                  onClick={resetBattlegroundsStats}
+                >
+                  {t("actions.reset_battlegrounds_stats.label")}
+                </Button>
+              </Stack>
+            </Card>
+
+            <Card title={t("sections.battlegroundsSeason.title")}>
+              <Stack>
+                <KeyValue
+                  items={[
+                    { key: "season", label: t("battlegroundsSeason.season"), value: season.season ?? t("common.unknown") },
+                    { key: "name", label: t("battlegroundsSeason.name"), value: season.name || t("common.unknown") },
+                    { key: "patch", label: t("battlegroundsSeason.patch"), value: season.patch || t("common.unknown") },
+                    { key: "verified", label: t("battlegroundsSeason.verified"), value: season.verified_at || t("common.unknown") },
+                  ]}
+                />
+                <Warning>{t("battlegroundsSeason.staticNotice")}</Warning>
+                <DataTable
+                  data={seasonMechanics}
+                  rowKey="_key"
+                  maxRows={8}
+                  emptyText={t("common.none")}
+                  columns={[
+                    { key: "title", label: t("battlegroundsSeason.mechanic") },
+                    { key: "summary", label: t("battlegroundsSeason.summary") },
+                  ]}
+                />
+                <Text>{season.source_url || t("common.none")}</Text>
+              </Stack>
+            </Card>
+          </Stack>
+        ) : null}
+
+        {game.mode !== "battlegrounds" ? (
+          <>
+        <Card title={t("sections.game.title")}>
+          <Stack>
+            <Inline align="center" wrap>
+              <StatusBadge tone={stateTone(phase)} label={localized("status.phase", phase)} />
+              <Text>{t("game.number", { value: game.game_number ?? 0 })}</Text>
+              <Text>{t("game.turn", { value: game.turn ?? 0 })}</Text>
+              <Text>{t("game.activeSide", { side: localized("status.side", game.active_side) })}</Text>
+              {game.result ? <StatusBadge tone="info" label={localized("status.result", game.result)} /> : null}
+            </Inline>
+            <Grid cols={2}>
+              <Stack>
+                <Heading as="h3">{t("game.player")}</Heading>
+                <KeyValue
+                  items={[
+                    { key: "health", label: t("game.health"), value: player.health ?? t("common.notAvailable") },
+                    { key: "armor", label: t("game.armor"), value: player.armor ?? 0 },
+                    { key: "effectiveHealth", label: t("game.effectiveHealth"), value: player.effective_health ?? t("common.notAvailable") },
+                    { key: "mana", label: t("game.mana"), value: mana(player) },
+                    { key: "hand", label: t("game.hand"), value: player.hand_count ?? 0 },
+                    { key: "deck", label: t("game.deck"), value: player.deck_count ?? 0 },
+                    { key: "secrets", label: t("game.secrets"), value: player.secret_count ?? 0 },
+                    { key: "boardCount", label: t("game.boardCount"), value: playerBoard.count ?? 0 },
+                    { key: "boardStats", label: t("game.boardStats"), value: `${playerBoard.attack ?? 0}/${playerBoard.health ?? 0}` },
+                    { key: "boardCards", label: t("game.boardCards"), value: boardCards(playerBoard.cards) },
+                  ]}
+                />
+              </Stack>
+              <Stack>
+                <Heading as="h3">{t("game.opponent")}</Heading>
+                <KeyValue
+                  items={[
+                    { key: "health", label: t("game.health"), value: opponent.health ?? t("common.notAvailable") },
+                    { key: "armor", label: t("game.armor"), value: opponent.armor ?? 0 },
+                    { key: "effectiveHealth", label: t("game.effectiveHealth"), value: opponent.effective_health ?? t("common.notAvailable") },
+                    { key: "mana", label: t("game.mana"), value: mana(opponent) },
+                    { key: "hand", label: t("game.hand"), value: opponent.hand_count ?? 0 },
+                    { key: "deck", label: t("game.deck"), value: opponent.deck_count ?? 0 },
+                    { key: "secrets", label: t("game.secrets"), value: opponent.secret_count ?? 0 },
+                    { key: "boardCount", label: t("game.boardCount"), value: opponentBoard.count ?? 0 },
+                    { key: "boardStats", label: t("game.boardStats"), value: `${opponentBoard.attack ?? 0}/${opponentBoard.health ?? 0}` },
+                    { key: "boardCards", label: t("game.boardCards"), value: boardCards(opponentBoard.cards) },
+                  ]}
+                />
+              </Stack>
+            </Grid>
+          </Stack>
+        </Card>
+
+        <Card title={t("sections.recentCards.title")}>
+          {recentCards.length > 0 ? (
+            <DataTable
+              data={recentCards}
+              rowKey="_key"
+              emptyText={t("recentCards.empty")}
+              columns={[
+                { key: "turn", label: t("recentCards.turn") },
+                {
+                  key: "side",
+                  label: t("recentCards.side"),
+                  render: (row) => localized("status.side", row.side),
+                },
+                { key: "card", label: t("recentCards.card") },
+                { key: "card_id", label: t("recentCards.cardId"), render: (row) => row.card_id || t("common.none") },
+              ]}
+            />
+          ) : (
+            <EmptyState title={t("recentCards.empty")} description={t("recentCards.emptyHelp")} />
+          )}
+        </Card>
+          </>
+        ) : null}
+
+        <Card title={t("sections.settings.title")}>
+          <Stack>
+            <Field label={t("settings.logPath")} help={t("settings.logPathHelp")}>
+              <Input
+                value={draft.log_path}
+                placeholder={t("settings.logPathPlaceholder")}
+                onChange={(value) => updateDraft({ log_path: value })}
+              />
+            </Field>
+
+            <Switch
+              checked={draft.card_catalog_network_enabled}
+              label={t("settings.cardCatalogNetwork")}
+              onChange={(value) => updateDraft({ card_catalog_network_enabled: value })}
+            />
+            <Text>{t("settings.cardCatalogNetworkHelp")}</Text>
+            <Divider />
+            <Switch
+              checked={draft.overlay_enabled}
+              label={t("settings.overlayEnabled")}
+              onChange={(value) => updateDraft({ overlay_enabled: value })}
+            />
+            <Grid cols={3}>
+              <Field label={t("settings.overlayHeight")} help={t("settings.overlayHeightHelp")}>
+                <Slider
+                  value={draft.overlay_height_percent}
+                  min={15}
+                  max={80}
+                  step={1}
+                  showValue
+                  onChange={(value) => updateDraft({ overlay_height_percent: value })}
+                />
+              </Field>
+              <Field label={t("settings.overlayFontSize")} help={t("settings.overlayFontSizeHelp")}>
+                <Slider
+                  value={draft.overlay_font_size}
+                  min={14}
+                  max={48}
+                  step={1}
+                  showValue
+                  onChange={(value) => updateDraft({ overlay_font_size: value })}
+                />
+              </Field>
+              <Field label={t("settings.overlaySpeed")} help={t("settings.overlaySpeedHelp")}>
+                <Slider
+                  value={draft.overlay_speed_px_per_second}
+                  min={60}
+                  max={360}
+                  step={10}
+                  showValue
+                  onChange={(value) => updateDraft({ overlay_speed_px_per_second: value })}
+                />
+              </Field>
+            </Grid>
+            <Divider />
+            <Field label={t("settings.targetLanlan")} help={t("settings.targetLanlanHelp")}>
+              <Input
+                value={draft.target_lanlan}
+                placeholder={t("settings.targetLanlanPlaceholder")}
+                onChange={(value) => updateDraft({ target_lanlan: value })}
+              />
+            </Field>
+            <Button
+              tone="primary"
+              disabled={Boolean(busyAction) || !actionAvailable("save_settings")}
+              onClick={saveSettings}
+            >
+              {t("actions.save_settings.label")}
+            </Button>
+          </Stack>
+        </Card>
+
+        <Card title={t("sections.privacy.title")}>
+          <Stack>
+            <Alert tone={privacy.llm_public_state_sharing_enabled ? "warning" : "success"}>
+              {privacy.llm_public_state_sharing_enabled ? t("privacy.sharingEnabled") : t("privacy.sharingDisabled")}
+            </Alert>
+            <KeyValue
+              items={[
+                { key: "rawLog", label: t("privacy.rawLogUploaded"), value: yesNo(privacy.raw_log_uploaded) },
+                { key: "names", label: t("privacy.playerNamesRetained"), value: yesNo(privacy.player_names_retained) },
+                { key: "hidden", label: t("privacy.hiddenCardsExposed"), value: yesNo(privacy.hidden_opponent_cards_exposed) },
+                { key: "sharing", label: t("privacy.publicStateSharing"), value: yesNo(privacy.llm_public_state_sharing_enabled) },
+                { key: "catalogNetwork", label: t("privacy.cardCatalogNetwork"), value: yesNo(privacy.card_catalog_network_enabled) },
+                { key: "catalogState", label: t("privacy.cardCatalogGameState"), value: yesNo(privacy.card_catalog_sends_game_state) },
+              ]}
+            />
+            <Text>{t("privacy.disclosure")}</Text>
+          </Stack>
+        </Card>
+
+        <Divider />
+        <Heading as="h2">{t("sections.diagnostics.title")}</Heading>
+        <Text>{t("sections.diagnostics.subtitle")}</Text>
+        <Grid cols={3}>
+          <StatCard label={t("metrics.turn")} value={game.turn ?? 0} />
+          <StatCard label={t("metrics.events")} value={runtime.events_seen ?? 0} />
+          <StatCard label={t("metrics.llmSubmissions")} value={runtime.llm_submissions ?? 0} />
+        </Grid>
+        <Grid cols={2}>
+          <Card title={t("sections.runtime.title")}>
+            <Stack>
+              <KeyValue
+                items={[
+                  { key: "monitor", label: t("runtime.monitor"), value: runtime.monitor_running ? t("common.running") : t("common.stopped") },
+                  { key: "source", label: t("runtime.source"), value: localized("status.source", sourceState) },
+                  { key: "path", label: t("runtime.path"), value: runtime.resolved_log_path || t("common.notDetected") },
+                  { key: "lines", label: t("runtime.lines"), value: runtime.lines_seen ?? 0 },
+                  { key: "lastLine", label: t("runtime.lastLine"), value: timestamp(runtime.last_line_at) },
+                  { key: "lastEvent", label: t("runtime.lastEvent"), value: timestamp(runtime.last_event_at) },
+                  { key: "eventKind", label: t("runtime.lastEventKind"), value: runtime.last_event_kind || t("common.none") },
+                  { key: "catalogAvailable", label: t("catalog.available"), value: yesNo(catalog.available) },
+                  { key: "catalogProvider", label: t("catalog.provider"), value: catalogDataset.provider || t("common.none") },
+                  { key: "catalogPatch", label: t("catalog.patch"), value: catalogDataset.patch || t("common.unknown") },
+                  { key: "catalogCards", label: t("catalog.cards"), value: catalog.card_count ?? 0 },
+                  { key: "catalogChecked", label: t("catalog.checked"), value: timestamp(catalogDataset.checked_at) },
+                  { key: "catalogStale", label: t("catalog.stale"), value: yesNo(catalogDataset.stale) },
+                ]}
+              />
+              {catalogDataset.stale ? <Warning>{t("catalog.staleWarning")}</Warning> : null}
+              {catalog.degraded_reason ? (
+                <Warning>{t("catalog.degraded", { reason: catalog.degraded_reason })}</Warning>
+              ) : null}
+              {runtime.last_error_code ? (
+                <InlineError
+                  title={t("runtime.lastError")}
+                  message={t("runtime.lastErrorHelp")}
+                  details={runtime.last_error_code}
+                />
+              ) : null}
+              <ButtonGroup>
+                <Button
+                  tone="success"
+                  disabled={Boolean(busyAction) || Boolean(runtime.monitor_running) || !actionAvailable("start_monitoring")}
+                  onClick={async () => { await runAction("start_monitoring", {}, "messages.monitorStarted") }}
+                >
+                  {t("actions.start_monitoring.label")}
+                </Button>
+                <Button
+                  tone="danger"
+                  disabled={Boolean(busyAction) || !runtime.monitor_running || !actionAvailable("stop_monitoring")}
+                  onClick={async () => { await runAction("stop_monitoring", {}, "messages.monitorStopped") }}
+                >
+                  {t("actions.stop_monitoring.label")}
+                </Button>
+                <Button
+                  tone="primary"
+                  disabled={Boolean(busyAction) || !actionAvailable("prepare_power_log")}
+                  onClick={preparePowerLog}
+                >
+                  {t("actions.prepare_power_log.label")}
+                </Button>
+              </ButtonGroup>
+            </Stack>
+          </Card>
+
+          <Card title={t("sections.overlay.title")}>
+            <Stack>
+              <StatusBadge tone={stateTone(overlayStatus)} label={t(`status.overlay.${overlayStatus}`)} />
+              <KeyValue
+                items={[
+                  { key: "available", label: t("overlay.available"), value: yesNo(overlay.available) },
+                  { key: "running", label: t("overlay.running"), value: overlay.running ? t("common.running") : t("common.stopped") },
+                  { key: "pid", label: t("overlay.pid"), value: overlay.pid ?? t("common.none") },
+                  {
+                    key: "reason",
+                    label: t("overlay.reason"),
+                    value: overlay.reason ? localized("status.overlayReason", overlay.reason) : t("common.none"),
+                  },
+                ]}
+              />
+              {overlay.available === false ? <Warning>{t("overlay.unavailableHelp")}</Warning> : null}
+              <ButtonGroup>
+                <Button
+                  tone="success"
+                  disabled={Boolean(busyAction) || !overlaySettingEnabled || overlay.available === false || Boolean(overlay.running) || !actionAvailable("start_overlay")}
+                  onClick={async () => { await runAction("start_overlay", {}, "messages.overlayStarted") }}
+                >
+                  {t("actions.start_overlay.label")}
+                </Button>
+                <Button
+                  tone="danger"
+                  disabled={Boolean(busyAction) || !overlay.running || !actionAvailable("stop_overlay")}
+                  onClick={async () => { await runAction("stop_overlay", {}, "messages.overlayStopped") }}
+                >
+                  {t("actions.stop_overlay.label")}
+                </Button>
+                <Button
+                  tone="info"
+                  disabled={Boolean(busyAction) || !actionAvailable("test_commentary")}
+                  onClick={async () => { await runAction("test_commentary", {}, "messages.testSubmitted") }}
+                >
+                  {t("actions.test_commentary.label")}
+                </Button>
+              </ButtonGroup>
+            </Stack>
+          </Card>
+        </Grid>
+      </Stack>
+    </Page>
+  )
+}

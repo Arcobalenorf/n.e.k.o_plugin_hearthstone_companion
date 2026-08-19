@@ -1,0 +1,41 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "N.E.K.O: check hearthstone_companion",
+      "type": "shell",
+      "command": "uv run python -m plugin.neko_plugin_cli.cli check hearthstone_companion",
+      "options": {
+        "cwd": "${config:nekoPlugin.repoRoot}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "N.E.K.O: sync hearthstone_companion",
+      "type": "shell",
+      "command": "uv run --with pip python -m plugin.neko_plugin_cli.cli sync hearthstone_companion --clean",
+      "options": {
+        "cwd": "${config:nekoPlugin.repoRoot}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "N.E.K.O: check -r hearthstone_companion",
+      "type": "shell",
+      "command": "uv run python -m plugin.neko_plugin_cli.cli check -r hearthstone_companion",
+      "options": {
+        "cwd": "${config:nekoPlugin.repoRoot}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "N.E.K.O: build hearthstone_companion",
+      "type": "shell",
+      "command": "uv run python -m plugin.neko_plugin_cli.cli build hearthstone_companion",
+      "options": {
+        "cwd": "${config:nekoPlugin.repoRoot}"
+      },
+      "problemMatcher": []
+    }
+  ]
+}

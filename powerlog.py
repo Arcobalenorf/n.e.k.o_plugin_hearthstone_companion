@@ -1,0 +1,1421 @@
+from __future__ import annotations
+
+import re
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any, Iterable
+
+from .models import (
+    BattlegroundsCardSnapshot,
+    BattlegroundsPlayerSnapshot,
+    BattlegroundsSnapshot,
+    Entity,
+    GameEvent,
+    GameSnapshot,
+    SideSnapshot,
+)
+
+_FULL_ENTITY_RE = re.compile(r"\bFULL_ENTITY - (?:Creating|Updating) ID=(\d+)\s+CardID=([^\s]*)")
+_FULL_ENTITY_REF_RE = re.compile(r"\bFULL_ENTITY - Updating Entity=(.+?)\s+CardID=([^\s]*)")
+_SHOW_ENTITY_RE = re.compile(r"\b(SHOW_ENTITY|CHANGE_ENTITY) - Updating Entity=(.+?)\s+CardID=([^\s]*)")
+_HIDE_ENTITY_RE = re.compile(r"\bHIDE_ENTITY - Entity=(.+?)(?:\s+tag=|$)")
+_TAG_CHANGE_RE = re.compile(r"\bTAG_CHANGE Entity=(.+?)\s+tag=([^\s]+)\s+value=(.*?)\s*$")
+_INLINE_TAG_RE = re.compile(r"(?:^|\s)tag=([^\s]+)\s+value=(.*?)\s*$")
+_BLOCK_START_RE = re.compile(r"\bBLOCK_START BlockType=([^\s]+)\s+Entity=(.+?)(?:\s+EffectCardId=|\s*$)")
+_PLAYER_RE = re.compile(r"\bPlayer EntityID=(\d+) PlayerID=(\d+)\b")
+_GAME_ENTITY_RE = re.compile(r"\bGameEntity EntityID=(\d+)\b")
+_ENTITY_ID_RE = re.compile(r"(?:^|\s)id=(\d+)(?:\s|\]|$)")
+_CARD_ID_RE = re.compile(r"(?:^|\s)cardId=([^\s\]]*)")
+_CONTROLLER_RE = re.compile(r"(?:^|\s)player=(\d+)(?:\s|\]|$)")
+_ZONE_RE = re.compile(r"(?:^|\s)zone=([^\s\]]+)")
+_NAME_RE = re.compile(r"(?:entityName|name)=(.*?)\s+id=\d+")
+_GAME_TYPE_RE = re.compile(r"\bGameType=(GT_[A-Z0-9_]+)")
+_LOG_SOURCE_RE = re.compile(r"\b(GameState|PowerTaskList)\.DebugPrint(Power|Game)\(\)\s+-\s")
+
+_CARD_TYPES = {
+    "1": "GAME",
+    "2": "PLAYER",
+    "3": "HERO",
+    "4": "MINION",
+    "5": "SPELL",
+    "6": "ENCHANTMENT",
+    "7": "WEAPON",
+    "10": "HERO_POWER",
+    "11": "LOCATION",  # legacy logs
+    "39": "LOCATION",
+    "42": "BATTLEGROUND_SPELL",
+}
+_ZONES = {
+    "0": "INVALID",
+    "1": "PLAY",
+    "2": "DECK",
+    "3": "HAND",
+    "4": "GRAVEYARD",
+    "5": "REMOVEDFROMGAME",
+    "6": "SETASIDE",
+    "7": "SECRET",
+}
+_PUBLIC_ZONES = frozenset({"PLAY", "GRAVEYARD", "REMOVEDFROMGAME"})
+_END_RESULTS = frozenset({"WON", "LOST", "TIED", "CONCEDED"})
+_SPECTATOR_START_MARKERS = ("Start Spectator Game", "Begin Spectating 1st player", "Begin Spectating 2nd player")
+_SPECTATOR_END_MARKERS = ("End Spectator Mode", "End Spectator Game")
+_BATTLEGROUNDS_GAME_TYPES = frozenset(
+    {
+        "GT_BATTLEGROUNDS",
+        "GT_BATTLEGROUNDS_FRIENDLY",
+        "GT_BATTLEGROUNDS_AI_VS_AI",
+        "GT_BATTLEGROUNDS_PLAYER_VS_AI",
+        "GT_BATTLEGROUNDS_DUO",
+        "GT_BATTLEGROUNDS_DUO_VS_AI",
+        "GT_BATTLEGROUNDS_DUO_FRIENDLY",
+        "GT_BATTLEGROUNDS_DUO_AI_VS_AI",
+        "GT_BATTLEGROUNDS_DUO_1_PLAYER_VS_AI",
+    }
+)
+_BATTLEGROUNDS_DUO_GAME_TYPES = frozenset(value for value in _BATTLEGROUNDS_GAME_TYPES if "DUO" in value)
+_BATTLEGROUNDS_HINT_TAGS = frozenset(
+    {
+        "BACON_DUMMY_PLAYER",
+        "BACON_HERO_CAN_BE_DRAFTED",
+        "PLAYER_TECH_LEVEL",
+        "PLAYER_LEADERBOARD_PLACE",
+        "NEXT_OPPONENT_PLAYER_ID",
+        "BACON_DUO_TEAM_ID",
+        "BACON_TRINKETS_ACTIVE",
+        "BACON_QUESTS_ACTIVE",
+        "BACON_GLOBAL_ANOMALY_DBID",
+        "BACON_BUDDY_ENABLED",
+        "2022",
+        "3533",
+    }
+)
+_BATTLEGROUNDS_CARD_TYPES = frozenset({"MINION", "BATTLEGROUND_SPELL"})
+_BATTLEGROUNDS_CONTROL_EVENTS = frozenset(
+    {
+        "battlegrounds_detected",
+        "battlegrounds_round",
+        "battlegrounds_recruit_started",
+        "battlegrounds_combat_started",
+        "battlegrounds_combat_result",
+        "battlegrounds_hero_selected",
+        "battlegrounds_tavern_upgraded",
+        "battlegrounds_triple",
+        "battlegrounds_game_ended",
+        "game_ended",
+    }
+)
+_BATTLEGROUNDS_UI_LABELS = frozenset({"drag to buy", "drag to sell", "drag to freeze"})
+_BATTLEGROUNDS_UI_CARD_IDS = frozenset(
+    {"tb_baconshop_dragbuy", "tb_baconshop_dragsell", "tb_baconshop_dragfreeze"}
+)
+
+
+def _int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _clean(value: Any, *, limit: int = 100) -> str:
+    text = " ".join(str(value or "").replace("\x00", " ").split())
+    return text[:limit]
+
+
+def _normalize_zone(value: Any) -> str:
+    normalized = _clean(value, limit=40).upper()
+    return _ZONES.get(normalized, normalized)
+
+
+def _normalize_card_type(value: Any) -> str:
+    normalized = _clean(value, limit=40).upper()
+    return _CARD_TYPES.get(normalized, normalized)
+
+
+@dataclass(slots=True)
+class _EntityRef:
+    entity_id: int | None = None
+    card_id: str = ""
+    controller: int | None = None
+    zone: str = ""
+    name: str = ""
+
+
+@dataclass(slots=True)
+class _BlockFrame:
+    block_type: str
+    entity_id: int | None
+    controller: int | None
+    started_at: float
+    events: list[GameEvent] = field(default_factory=list)
+
+
+class PowerLogParser:
+    """Incremental, privacy-minimizing parser for Hearthstone Power.log.
+
+    The parser never retains raw lines, account identifiers, player names, or
+    hidden opponent card names. Unknown packets and tags are tolerated.
+    """
+
+    def __init__(self, *, max_entities: int = 16384) -> None:
+        self.max_entities = max(256, int(max_entities))
+        self.game_number = 0
+        self.entities: dict[int, Entity] = {}
+        self.player_entities: dict[int, int] = {}
+        self.game_entity_id: int | None = None
+        self.local_controller: int | None = None
+        self.current_controller: int | None = None
+        self.current_entity_id: int | None = None
+        self.turn = 0
+        self.phase = "idle"
+        self.mode = "unknown"
+        self.battlegrounds_variant = "solo"
+        self.battlegrounds_round = 0
+        self.bob_controller: int | None = None
+        self.next_opponent_player_id = 0
+        self.result = ""
+        self.spectating = False
+        self._mulligan_announced = False
+        self._block_stack: list[_BlockFrame] = []
+        self._recent_cards: deque[dict[str, Any]] = deque(maxlen=8)
+        self._observed_boards: dict[int, tuple[int, tuple[str, ...], int, int]] = {}
+        self._battlegrounds_result_emitted = False
+        self._power_source: str | None = None
+        self._combat_active_round = 0
+        self._combat_result_emitted_round = 0
+        self._combat_damage_taken = 0
+        self._combat_damage_dealt = 0
+        self._last_recruit_warband: tuple[BattlegroundsCardSnapshot, ...] = ()
+        self._explicit_battlegrounds_phase_signal_seen = False
+        self._battlegrounds_counter_highs: dict[tuple[int, str], int] = {}
+        self.entity_capacity_exceeded = False
+        self.entities_evicted = 0
+
+    def reset_source(self) -> None:
+        self.entities.clear()
+        self.player_entities.clear()
+        self.game_entity_id = None
+        self.local_controller = None
+        self.current_controller = None
+        self.current_entity_id = None
+        self.turn = 0
+        self.phase = "idle"
+        self.mode = "unknown"
+        self.battlegrounds_variant = "solo"
+        self.battlegrounds_round = 0
+        self.bob_controller = None
+        self.next_opponent_player_id = 0
+        self.result = ""
+        self.spectating = False
+        self._mulligan_announced = False
+        self._block_stack.clear()
+        self._recent_cards.clear()
+        self._observed_boards.clear()
+        self._battlegrounds_result_emitted = False
+        self._power_source = None
+        self._combat_active_round = 0
+        self._combat_result_emitted_round = 0
+        self._combat_damage_taken = 0
+        self._combat_damage_dealt = 0
+        self._last_recruit_warband = ()
+        self._explicit_battlegrounds_phase_signal_seen = False
+        self._battlegrounds_counter_highs.clear()
+        self.entity_capacity_exceeded = False
+        self.entities_evicted = 0
+
+    def feed_lines(self, lines: Iterable[str], *, now: float | None = None) -> list[GameEvent]:
+        events: list[GameEvent] = []
+        timestamp = time.time() if now is None else float(now)
+        for line in lines:
+            events.extend(self.feed_line(line, now=timestamp))
+        return events
+
+    def feed_line(self, line: str, *, now: float | None = None) -> list[GameEvent]:
+        if not isinstance(line, str) or not line or len(line) > 256 * 1024:
+            return []
+        timestamp = time.time() if now is None else float(now)
+        source_match = _LOG_SOURCE_RE.search(line)
+        source = source_match.group(1) if source_match else None
+        source_kind = source_match.group(2) if source_match else None
+        if source_kind == "Power" and source is not None:
+            if self._power_source is None:
+                self._power_source = source
+            elif source != self._power_source:
+                return []
+
+        game_type_match = _GAME_TYPE_RE.search(line)
+        if game_type_match:
+            game_type = game_type_match.group(1)
+            if game_type in _BATTLEGROUNDS_GAME_TYPES:
+                first_detection = self.mode != "battlegrounds"
+                self.mode = "battlegrounds"
+                self.battlegrounds_variant = "duos" if game_type in _BATTLEGROUNDS_DUO_GAME_TYPES else "solo"
+                if first_detection:
+                    self.phase = "hero_select" if not self.spectating else "spectator"
+                    return [
+                        GameEvent(
+                            "battlegrounds_detected",
+                            7,
+                            "已进入酒馆战棋",
+                            timestamp,
+                            {"variant": self.battlegrounds_variant},
+                        )
+                    ]
+
+        if any(marker in line for marker in _SPECTATOR_START_MARKERS):
+            self.spectating = True
+            self.phase = "spectator"
+        elif any(marker in line for marker in _SPECTATOR_END_MARKERS):
+            self.spectating = False
+            if self.phase == "spectator":
+                self.phase = "idle"
+
+        if "CREATE_GAME" in line:
+            self._start_game(source)
+            return [GameEvent("game_started", 7, "新对局开始", timestamp, {"game_number": self.game_number})]
+
+        match = _GAME_ENTITY_RE.search(line)
+        if match:
+            entity_id = int(match.group(1))
+            self.game_entity_id = entity_id
+            entity = self._entity(entity_id)
+            if entity:
+                entity.card_type = "GAME"
+            self.current_entity_id = entity_id
+            return []
+
+        match = _PLAYER_RE.search(line)
+        if match:
+            entity_id, player_id = int(match.group(1)), int(match.group(2))
+            entity = self._entity(entity_id)
+            if entity:
+                entity.card_type = "PLAYER"
+                entity.controller = player_id
+                entity.tags["PLAYER_ID"] = str(player_id)
+                self.player_entities[player_id] = entity_id
+            self.current_entity_id = entity_id
+            return []
+
+        match = _FULL_ENTITY_RE.search(line)
+        if match:
+            entity_id, card_id = int(match.group(1)), _clean(match.group(2), limit=80)
+            entity = self._entity(entity_id)
+            if entity:
+                entity.card_id = card_id
+                entity.hidden = not bool(card_id)
+            self.current_entity_id = entity_id
+            return []
+
+        match = _FULL_ENTITY_REF_RE.search(line)
+        if match:
+            ref = self._parse_entity_ref(match.group(1))
+            card_id = _clean(match.group(2), limit=80)
+            entity = self._merge_ref(ref)
+            if entity:
+                entity.card_id = card_id or entity.card_id
+                entity.hidden = not bool(card_id)
+                if ref.name and card_id:
+                    entity.name = ref.name
+                self.current_entity_id = entity.entity_id
+            return []
+
+        match = _SHOW_ENTITY_RE.search(line)
+        if match:
+            opcode = match.group(1)
+            ref = self._parse_entity_ref(match.group(2))
+            card_id = _clean(match.group(3), limit=80)
+            entity = self._merge_ref(ref)
+            if entity:
+                entity.card_id = card_id or entity.card_id
+                entity.revealed = True
+                entity.hidden = False
+                if ref.name and entity.card_id:
+                    entity.name = ref.name
+                if opcode == "SHOW_ENTITY":
+                    self._infer_local_controller_from_show(entity)
+                self.current_entity_id = entity.entity_id
+            return []
+
+        match = _HIDE_ENTITY_RE.search(line)
+        if match:
+            ref = self._parse_entity_ref(match.group(1))
+            entity = self._merge_ref(ref)
+            if entity:
+                entity.revealed = False
+                entity.hidden = True
+                entity.name = ""
+            return []
+
+        match = _BLOCK_START_RE.search(line)
+        if match:
+            if len(self._block_stack) >= 64:
+                self._block_stack.clear()
+            ref = self._parse_entity_ref(match.group(2))
+            entity = self._merge_ref(ref)
+            self._block_stack.append(
+                _BlockFrame(
+                    block_type=_clean(match.group(1), limit=32).upper(),
+                    entity_id=entity.entity_id if entity else ref.entity_id,
+                    controller=self._controller(entity, ref.controller),
+                    started_at=timestamp,
+                )
+            )
+            return []
+
+        if "BLOCK_END" in line:
+            return self._end_block(timestamp)
+
+        match = _TAG_CHANGE_RE.search(line)
+        if match:
+            ref = self._parse_entity_ref(match.group(1))
+            entity = self._merge_ref(ref)
+            if entity is None:
+                entity = self._unresolved_tag_entity(match.group(1), match.group(2), match.group(3))
+            if entity is None:
+                return []
+            return self._apply_tag(entity, match.group(2), match.group(3), timestamp)
+
+        match = _INLINE_TAG_RE.search(line)
+        if match and self.current_entity_id is not None:
+            entity = self.entities.get(self.current_entity_id)
+            if entity:
+                return self._apply_tag(entity, match.group(1), match.group(2), timestamp)
+        return []
+
+    def snapshot(self) -> GameSnapshot:
+        active_side = "unknown"
+        if self.current_controller is not None:
+            active_side = self._side_name(self.current_controller)
+        phase = "spectator" if self.spectating else self.phase
+        return GameSnapshot(
+            mode=self.mode,
+            phase=phase,
+            game_number=self.game_number,
+            turn=self.turn,
+            active_side=active_side,
+            player=self._side_snapshot(self.local_controller),
+            opponent=(
+                SideSnapshot()
+                if self.mode == "battlegrounds"
+                else self._side_snapshot(self._opponent_controller())
+            ),
+            recent_cards=tuple(dict(item) for item in self._recent_cards),
+            result=self.result,
+            battlegrounds=self._battlegrounds_snapshot() if self.mode == "battlegrounds" else None,
+        )
+
+    def _start_game(self, source: str | None) -> None:
+        next_game_number = self.game_number + 1
+        spectating = self.spectating
+        self.reset_source()
+        self.game_number = next_game_number
+        self.spectating = spectating
+        self._power_source = source
+        self.phase = "spectator" if spectating else "starting"
+
+    def _entity(self, entity_id: int | None) -> Entity | None:
+        if entity_id is None or entity_id <= 0:
+            return None
+        entity = self.entities.get(entity_id)
+        if entity is not None:
+            return entity
+        if len(self.entities) >= self.max_entities and not self._evict_stale_entity():
+            self.entity_capacity_exceeded = True
+            return None
+        entity = Entity(entity_id=entity_id)
+        self.entities[entity_id] = entity
+        return entity
+
+    def _evict_stale_entity(self) -> bool:
+        protected = {
+            self.game_entity_id,
+            self.current_entity_id,
+            *self.player_entities.values(),
+            *(frame.entity_id for frame in self._block_stack),
+        }
+        victim: int | None = None
+        victim_rank = 99
+        for candidate_id, candidate in self.entities.items():
+            if candidate_id in protected or self._is_hero(candidate):
+                continue
+            if candidate.zone in {"GRAVEYARD", "REMOVEDFROMGAME", "INVALID"}:
+                rank = 0
+            elif candidate.card_type == "ENCHANTMENT":
+                rank = 1
+            elif candidate.hidden and candidate.zone not in {"PLAY", "HAND", "SECRET"}:
+                rank = 2
+            else:
+                continue
+            if rank < victim_rank:
+                victim = candidate_id
+                victim_rank = rank
+                if rank == 0:
+                    break
+        if victim is None:
+            return False
+        self.entities.pop(victim, None)
+        self.entities_evicted += 1
+        return True
+
+    def _parse_entity_ref(self, text: str) -> _EntityRef:
+        raw = str(text or "").strip()
+        if raw.isdigit():
+            return _EntityRef(entity_id=int(raw))
+        if raw.casefold() == "gameentity" and self.game_entity_id is not None:
+            return _EntityRef(entity_id=self.game_entity_id)
+        entity_id_match = _ENTITY_ID_RE.search(raw)
+        card_id_match = _CARD_ID_RE.search(raw)
+        controller_match = _CONTROLLER_RE.search(raw)
+        zone_match = _ZONE_RE.search(raw)
+        name_match = _NAME_RE.search(raw)
+        return _EntityRef(
+            entity_id=int(entity_id_match.group(1)) if entity_id_match else None,
+            card_id=_clean(card_id_match.group(1), limit=80) if card_id_match else "",
+            controller=int(controller_match.group(1)) if controller_match else None,
+            zone=_normalize_zone(zone_match.group(1)) if zone_match else "",
+            name=_clean(name_match.group(1), limit=80) if name_match else "",
+        )
+
+    def _merge_ref(self, ref: _EntityRef) -> Entity | None:
+        entity = self._entity(ref.entity_id)
+        if entity is None:
+            return None
+        if ref.card_id:
+            entity.card_id = ref.card_id
+        if ref.controller is not None and "CONTROLLER" not in entity.tags:
+            entity.controller = ref.controller
+        if ref.zone and "ZONE" not in entity.tags:
+            entity.zone = ref.zone
+        if ref.name and ref.card_id:
+            entity.name = ref.name
+        return entity
+
+    def _apply_tag(self, entity: Entity, raw_tag: str, raw_value: str, timestamp: float) -> list[GameEvent]:
+        tag = _clean(raw_tag, limit=60).upper()
+        value = _clean(raw_value, limit=160)
+        old_value = entity.tags.get(tag)
+
+        if tag == "CONTROLLER":
+            controller = _int(value)
+            if controller is not None:
+                entity.controller = controller
+        elif tag == "CARDTYPE":
+            entity.card_type = _normalize_card_type(value)
+            value = entity.card_type
+        elif tag == "ZONE":
+            value = _normalize_zone(value)
+
+        entity.tags[tag] = value
+        events: list[GameEvent] = []
+
+        if tag in _BATTLEGROUNDS_HINT_TAGS or tag.startswith("BACON_"):
+            if self.mode != "battlegrounds":
+                self.mode = "battlegrounds"
+                self.phase = "hero_select" if not self.spectating else "spectator"
+                events.append(
+                    GameEvent(
+                        "battlegrounds_detected",
+                        7,
+                        "已识别酒馆战棋对局",
+                        timestamp,
+                        {"variant": self.battlegrounds_variant},
+                    )
+                )
+            if tag == "BACON_DUO_TEAM_ID" and (_int(value) or 0) > 0:
+                self.battlegrounds_variant = "duos"
+
+        if tag == "BACON_DUMMY_PLAYER" and str(value).upper() in {"1", "TRUE"}:
+            self.bob_controller = self._controller(entity)
+            if not self.spectating and self.local_controller is None:
+                candidates = [player_id for player_id in self.player_entities if player_id != self.bob_controller]
+                if len(candidates) == 1:
+                    self.local_controller = candidates[0]
+
+        if (
+            tag == "MULLIGAN_STATE"
+            and value.upper() == "INPUT"
+            and not self.spectating
+            and self.local_controller is None
+        ):
+            self.local_controller = self._controller(entity)
+
+        if tag == "ZONE":
+            old_zone = _normalize_zone(old_value)
+            entity.zone = value
+            if value in _PUBLIC_ZONES:
+                entity.hidden = False
+                entity.revealed = True
+            if old_zone == "PLAY" and value == "GRAVEYARD" and self._is_minion(entity):
+                side = self._side_name(entity.controller)
+                card = self._visible_card_label(entity) or "随从"
+                events.append(
+                    GameEvent(
+                        "minion_left_play",
+                        2,
+                        f"{self._side_label(side)}的{card}离场",
+                        timestamp,
+                        {"side": side, "card": card, "entity_id": entity.entity_id},
+                    )
+                )
+            if value == "SECRET" and old_zone != "SECRET":
+                side = self._side_name(entity.controller)
+                events.append(
+                    GameEvent(
+                        "secret_entered_play",
+                        4,
+                        f"{self._side_label(side)}挂上了一个奥秘",
+                        timestamp,
+                        {"side": side, "secret_count": self._zone_count(entity.controller, "SECRET")},
+                    )
+                )
+
+        elif tag == "DAMAGE":
+            previous, current = _int(old_value), _int(value)
+            if previous is not None and current is not None and previous != current and self._is_hero(entity):
+                side = self._side_name(entity.controller)
+                amount = abs(current - previous)
+                health = entity.health
+                if current > previous:
+                    if self.mode == "battlegrounds":
+                        player_id = self._battlegrounds_player_id(entity)
+                        if self._is_local_battlegrounds_entity(entity):
+                            self._combat_damage_taken += amount
+                        elif player_id == self.next_opponent_player_id:
+                            self._combat_damage_dealt += amount
+                    priority = 8 if side == "player" and health is not None and health <= 10 else 5
+                    if self.mode != "battlegrounds" or self._is_local_battlegrounds_entity(entity):
+                        events.append(
+                            GameEvent(
+                                "hero_damaged",
+                                priority,
+                                f"{self._side_label(side)}英雄受到{amount}点伤害",
+                                timestamp,
+                                {"side": side, "amount": amount, "health": health, "armor": entity.armor},
+                            )
+                        )
+                else:
+                    if self.mode != "battlegrounds" or self._is_local_battlegrounds_entity(entity):
+                        events.append(
+                            GameEvent(
+                                "hero_healed",
+                                3,
+                                f"{self._side_label(side)}英雄恢复了{amount}点生命",
+                                timestamp,
+                                {"side": side, "amount": amount, "health": health},
+                            )
+                        )
+
+        elif tag == "ARMOR":
+            previous, current = _int(old_value), _int(value)
+            if (
+                previous is not None
+                and current is not None
+                and current < previous
+                and self._is_hero(entity)
+            ):
+                side = self._side_name(entity.controller)
+                amount = previous - current
+                if self.mode == "battlegrounds":
+                    player_id = self._battlegrounds_player_id(entity)
+                    if self._is_local_battlegrounds_entity(entity):
+                        self._combat_damage_taken += amount
+                    elif player_id == self.next_opponent_player_id:
+                        self._combat_damage_dealt += amount
+                if self.mode != "battlegrounds" or self._is_local_battlegrounds_entity(entity):
+                    health = entity.health
+                    effective_health = None if health is None else health + current
+                    priority = (
+                        8
+                        if side == "player"
+                        and effective_health is not None
+                        and effective_health <= 10
+                        else 5
+                    )
+                    events.append(
+                        GameEvent(
+                            "hero_damaged",
+                            priority,
+                            f"{self._side_label(side)}英雄护甲承受{amount}点伤害",
+                            timestamp,
+                            {
+                                "side": side,
+                                "amount": amount,
+                                "health": entity.health,
+                                "armor": current,
+                            },
+                        )
+                    )
+        elif tag == "TURN":
+            turn = _int(value)
+            if turn is not None and turn > self.turn:
+                self.turn = turn
+                if self.mode == "battlegrounds":
+                    next_round = (turn + 1) // 2
+                    if next_round <= self.battlegrounds_round:
+                        return self._defer(events)
+                    if self.phase == "combat":
+                        events.extend(self._finish_battlegrounds_combat(timestamp))
+                    self.battlegrounds_round = next_round
+                elif self.phase not in {"spectator", "ended"}:
+                    self.phase = "playing"
+                events.append(
+                    GameEvent(
+                        "battlegrounds_round" if self.mode == "battlegrounds" else "turn_started",
+                        3,
+                        f"酒馆第{self.battlegrounds_round}回合" if self.mode == "battlegrounds" else f"第{turn}回合开始",
+                        timestamp,
+                        (
+                            {"turn": turn, "round": self.battlegrounds_round}
+                            if self.mode == "battlegrounds"
+                            else {"turn": turn}
+                        ),
+                    )
+                )
+
+        elif tag == "CURRENT_PLAYER":
+            if str(value).upper() in {"1", "TRUE"}:
+                self.current_controller = self._controller(entity)
+                if (
+                    self.mode == "battlegrounds"
+                    and not self.spectating
+                    and not self._explicit_battlegrounds_phase_signal_seen
+                ):
+                    if (
+                        self.current_controller == self.local_controller
+                        and (
+                            self.phase == "hero_select"
+                            or (self.turn > 0 and self.turn % 2 == 0)
+                        )
+                    ):
+                        previous = self.phase
+                        self.phase = "recruit"
+                        if previous == "combat":
+                            events.extend(self._finish_battlegrounds_combat(timestamp))
+                            events.append(
+                                GameEvent(
+                                    "battlegrounds_recruit_started",
+                                    5,
+                                    f"第{self.battlegrounds_round}回合开始招募",
+                                    timestamp,
+                                    {"round": self.battlegrounds_round},
+                                )
+                            )
+                    elif (
+                        self.current_controller == self.bob_controller
+                        and self.phase == "recruit"
+                        and self.battlegrounds_round > 0
+                        and self.turn % 2 == 1
+                    ):
+                        self._cache_recruit_warband()
+                        self.phase = "combat"
+                        if self._begin_battlegrounds_combat():
+                            events.append(
+                                GameEvent(
+                                    "battlegrounds_combat_started",
+                                    6,
+                                    f"第{self.battlegrounds_round}回合战斗开始",
+                                    timestamp,
+                                    {
+                                        "round": self.battlegrounds_round,
+                                        "opponent_player_id": self.next_opponent_player_id,
+                                    },
+                                )
+                            )
+
+        elif tag == "MULLIGAN_STATE":
+            if self.mode == "battlegrounds":
+                self.phase = "hero_select" if value.upper() != "DONE" else "recruit"
+                if value.upper() == "DONE":
+                    events.append(GameEvent("battlegrounds_hero_selected", 6, "英雄已选定", timestamp, {}))
+            elif value.upper() in {"INPUT", "DEALING", "DONE"}:
+                self.phase = "mulligan" if value.upper() != "DONE" else "playing"
+            if self.mode != "battlegrounds" and value.upper() == "INPUT" and not self._mulligan_announced:
+                self._mulligan_announced = True
+                events.append(GameEvent("mulligan", 4, "起手换牌阶段", timestamp, {}))
+
+        elif tag == "STEP":
+            normalized = value.upper()
+            if normalized == "BEGIN_MULLIGAN":
+                self.phase = "mulligan"
+            elif normalized == "MAIN_READY" and self.mode != "battlegrounds":
+                self.phase = "playing"
+
+        elif tag == "STATE":
+            normalized = value.upper()
+            if normalized == "RUNNING" and not self.spectating and self.mode != "battlegrounds":
+                self.phase = "playing"
+            elif normalized == "COMPLETE":
+                self.phase = "ended"
+                if self.mode == "battlegrounds":
+                    events.extend(self._finalize_battlegrounds(timestamp))
+
+        elif tag == "PLAYSTATE":
+            normalized = value.upper()
+            controller = self._controller(entity)
+            if normalized in _END_RESULTS and controller == self.local_controller and not self.result:
+                if self.mode == "battlegrounds":
+                    self.phase = "ended"
+                    events.extend(self._finalize_battlegrounds(timestamp))
+                else:
+                    self.result = normalized.lower()
+                    self.phase = "ended"
+                    label = {"WON": "胜利", "LOST": "失败", "TIED": "平局", "CONCEDED": "已投降"}[normalized]
+                    events.append(
+                        GameEvent("game_ended", 10, f"本局{label}", timestamp, {"result": self.result})
+                    )
+
+        elif tag in {"2022", "3533"} and self.mode == "battlegrounds":
+            expected = "3533" if self.battlegrounds_variant == "duos" else "2022"
+            previous, current = _int(old_value), _int(value)
+            if tag == expected:
+                self._explicit_battlegrounds_phase_signal_seen = True
+            if tag == expected and previous == 1 and current == 0 and self.phase != "combat":
+                self._cache_recruit_warband()
+                self.phase = "combat"
+                if self._begin_battlegrounds_combat():
+                    events.append(
+                        GameEvent(
+                            "battlegrounds_combat_started",
+                            6,
+                            f"第{self.battlegrounds_round}回合战斗开始",
+                            timestamp,
+                            {
+                                "round": self.battlegrounds_round,
+                                "opponent_player_id": self.next_opponent_player_id,
+                            },
+                        )
+                    )
+            elif tag == expected and previous == 0 and current == 1:
+                was_combat = self.phase == "combat"
+                events.extend(self._finish_battlegrounds_combat(timestamp))
+                self.phase = "recruit"
+                if was_combat:
+                    events.append(
+                        GameEvent(
+                            "battlegrounds_recruit_started",
+                            5,
+                            f"第{self.battlegrounds_round}回合战斗结束，返回招募",
+                            timestamp,
+                            {"round": self.battlegrounds_round},
+                        )
+                    )
+
+        elif tag == "NEXT_OPPONENT_PLAYER_ID" and self.mode == "battlegrounds":
+            if self._controller(entity) == self.local_controller:
+                self.next_opponent_player_id = max(0, _int(value) or 0)
+
+        elif tag == "PLAYER_TECH_LEVEL" and self.mode == "battlegrounds":
+            previous, current = _int(old_value), _int(value)
+            if (
+                current is not None
+                and self._is_local_battlegrounds_entity(entity)
+                and self._observe_battlegrounds_counter(entity, tag, current)
+                and previous is not None
+                and current > previous
+            ):
+                events.append(
+                    GameEvent(
+                        "battlegrounds_tavern_upgraded",
+                        5,
+                        f"酒馆升到{current}级",
+                        timestamp,
+                        {"tier": current, "round": self.battlegrounds_round},
+                    )
+                )
+
+        elif tag == "PLAYER_TRIPLES" and self.mode == "battlegrounds":
+            previous, current = _int(old_value), _int(value)
+            if (
+                current is not None
+                and self._is_local_battlegrounds_entity(entity)
+                and self._observe_battlegrounds_counter(entity, tag, current)
+                and previous is not None
+                and current > previous
+            ):
+                events.append(
+                    GameEvent(
+                        "battlegrounds_triple",
+                        7,
+                        "三连合成成功",
+                        timestamp,
+                        {"triples": current, "round": self.battlegrounds_round},
+                    )
+                )
+
+        if any(event.kind in _BATTLEGROUNDS_CONTROL_EVENTS for event in events):
+            self._block_stack.clear()
+            return events
+        return self._defer(events)
+
+    def _end_block(self, timestamp: float) -> list[GameEvent]:
+        if not self._block_stack:
+            return []
+        frame = self._block_stack.pop()
+        if frame.block_type == "PLAY":
+            play_event = self._build_play_event(frame, timestamp)
+            if play_event:
+                frame.events.insert(0, play_event)
+        events = self._coalesce(frame.events, timestamp)
+        if self._block_stack:
+            self._block_stack[-1].events.extend(events)
+            return []
+        return events
+
+    def _build_play_event(self, frame: _BlockFrame, timestamp: float) -> GameEvent | None:
+        entity = self.entities.get(frame.entity_id or -1)
+        if (
+            self.mode == "battlegrounds"
+            and entity is not None
+            and not self._is_battlegrounds_gameplay_entity(entity)
+        ):
+            return None
+        controller = self._controller(entity, frame.controller)
+        side = self._side_name(controller)
+        if entity and entity.zone == "SECRET" and side == "opponent":
+            card = "奥秘"
+        else:
+            if entity and entity.zone in _PUBLIC_ZONES:
+                entity.revealed = True
+                entity.hidden = False
+            card = self._visible_card_label(entity) if entity else ""
+            card = card or "一张牌"
+        summary = f"{self._side_label(side)}打出{card}"
+        recent = {"side": side, "card": card, "turn": self.turn}
+        if entity and entity.card_id and card not in {"一张牌", "奥秘"}:
+            recent["card_id"] = entity.card_id
+        self._recent_cards.append(recent)
+        return GameEvent(
+            "card_played",
+            3,
+            summary,
+            timestamp,
+            {"side": side, "card": card, "turn": self.turn},
+        )
+
+    def _coalesce(self, events: list[GameEvent], timestamp: float) -> list[GameEvent]:
+        combined: list[GameEvent] = []
+        damage: dict[tuple[str, str], dict[str, Any]] = {}
+        for event in events:
+            if event.kind not in {"hero_damaged", "hero_healed"}:
+                combined.append(event)
+                continue
+            key = (event.kind, str(event.details.get("side") or "unknown"))
+            current = damage.setdefault(
+                key,
+                {
+                    "amount": 0,
+                    "priority": event.priority,
+                    "health": event.details.get("health"),
+                    "armor": event.details.get("armor", 0),
+                },
+            )
+            current["amount"] += int(event.details.get("amount") or 0)
+            current["priority"] = max(int(current["priority"]), event.priority)
+            current["health"] = event.details.get("health")
+            current["armor"] = event.details.get("armor", current.get("armor", 0))
+        for (kind, side), data in damage.items():
+            verb = "受到" if kind == "hero_damaged" else "恢复"
+            suffix = "点伤害" if kind == "hero_damaged" else "点生命"
+            combined.append(
+                GameEvent(
+                    kind,
+                    int(data["priority"]),
+                    f"{self._side_label(side)}英雄{verb}{data['amount']}{suffix}",
+                    timestamp,
+                    {"side": side, **data},
+                )
+            )
+        return combined
+
+    def _defer(self, events: list[GameEvent]) -> list[GameEvent]:
+        if not events:
+            return []
+        if self._block_stack:
+            self._block_stack[-1].events.extend(events)
+            return []
+        return events
+
+    def _side_snapshot(self, controller: int | None) -> SideSnapshot:
+        if controller is None:
+            return SideSnapshot()
+        entities = [entity for entity in self.entities.values() if self._controller(entity) == controller]
+        hero = next((entity for entity in entities if self._is_hero(entity)), None)
+        player_entity_id = self.player_entities.get(controller)
+        player_entity = self.entities.get(player_entity_id or -1)
+        board = [entity for entity in entities if entity.zone == "PLAY" and self._is_minion(entity)]
+        board_cards = tuple(
+            name for entity in board if (name := self._visible_card_label(entity))
+        )[:7]
+        resources = _int(player_entity.tags.get("RESOURCES")) if player_entity else None
+        used = player_entity.tag_int("RESOURCES_USED") if player_entity else 0
+        temporary = player_entity.tag_int("TEMP_RESOURCES") if player_entity else 0
+        mana_available = None if resources is None else max(0, resources - used + temporary)
+        return SideSnapshot(
+            health=hero.health if hero else None,
+            armor=hero.armor if hero else 0,
+            mana_available=mana_available,
+            mana_max=resources,
+            hand_count=sum(entity.zone == "HAND" for entity in entities),
+            deck_count=sum(entity.zone == "DECK" for entity in entities),
+            secret_count=sum(entity.zone == "SECRET" for entity in entities),
+            board_count=len(board),
+            board_attack=sum(entity.attack for entity in board),
+            board_health=sum(entity.health or 0 for entity in board),
+            board_cards=board_cards,
+        )
+
+    def _battlegrounds_snapshot(self) -> BattlegroundsSnapshot:
+        if self.phase == "combat":
+            self._capture_observed_opponent_board()
+        local_player = self.entities.get(self.player_entities.get(self.local_controller or -1, -1))
+        local_hero = self._battlegrounds_local_hero()
+        resources = _int(local_player.tags.get("RESOURCES")) if local_player else None
+        used = local_player.tag_int("RESOURCES_USED") if local_player else 0
+        temporary = local_player.tag_int("TEMP_RESOURCES") if local_player else 0
+        gold = None if resources is None else max(0, resources + temporary - used)
+        max_gold = None
+        if local_player:
+            max_gold = _int(local_player.tags.get("3148"))
+            if max_gold is None:
+                max_gold = resources
+
+        shop_entities: list[Entity] = []
+        if self.phase == "recruit" and self.bob_controller is not None:
+            shop_entities = [
+                entity
+                for entity in self.entities.values()
+                if self._controller(entity) == self.bob_controller
+                and entity.zone == "PLAY"
+                and entity.card_type in _BATTLEGROUNDS_CARD_TYPES
+                and not entity.hidden
+            ]
+        hand_entities = [
+            entity
+            for entity in self.entities.values()
+            if self._controller(entity) == self.local_controller and entity.zone == "HAND"
+            and not entity.hidden
+        ]
+        warband_entities = self._battlegrounds_board_entities(self.local_controller)
+        current_warband = self._battlegrounds_cards(warband_entities, maximum=7)
+        if self.phase == "recruit" and current_warband:
+            self._last_recruit_warband = current_warband
+        visible_warband = current_warband
+        if not visible_warband and self.phase in {"combat", "ended"}:
+            visible_warband = self._last_recruit_warband
+
+        mechanics: dict[str, Any] = {}
+        game = self.entities.get(self.game_entity_id or -1)
+        if game:
+            for public_name, tag in (
+                ("quests_active", "BACON_QUESTS_ACTIVE"),
+                ("trinkets_active", "BACON_TRINKETS_ACTIVE"),
+                ("buddies_enabled", "BACON_BUDDY_ENABLED"),
+            ):
+                if tag in game.tags:
+                    mechanics[public_name] = game.tag_int(tag) > 0
+            anomaly = game.tag_int("BACON_GLOBAL_ANOMALY_DBID")
+            if anomaly > 0:
+                mechanics["anomaly_dbf_id"] = anomaly
+        quest_progress = self._local_tag_max("QUEST_PROGRESS")
+        quest_total = self._local_tag_max("QUEST_PROGRESS_TOTAL")
+        quest_reward = self._local_tag_max("QUEST_REWARD_DATABASE_ID")
+        if quest_progress or quest_total or quest_reward:
+            mechanics["quest"] = {
+                "progress": quest_progress,
+                "total": quest_total,
+                "reward_dbf_id": quest_reward,
+            }
+        first_trinket = self._local_tag_max("BACON_FIRST_TRINKET_DATABASE_ID")
+        second_trinket = self._local_tag_max("BACON_SECOND_TRINKET_DATABASE_ID")
+        if first_trinket or second_trinket:
+            mechanics["trinket_dbf_ids"] = [value for value in (first_trinket, second_trinket) if value]
+
+        return BattlegroundsSnapshot(
+            variant=self.battlegrounds_variant,
+            round=self.battlegrounds_round,
+            phase=self.phase,
+            gold=gold,
+            max_gold=max_gold,
+            tavern_tier=self._battlegrounds_tavern_tier(local_hero, local_player),
+            frozen=any(entity.tag_int("FROZEN") > 0 for entity in shop_entities),
+            next_opponent_player_id=(
+                self.next_opponent_player_id
+                or (local_player.tag_int("NEXT_OPPONENT_PLAYER_ID") if local_player else 0)
+            ),
+            placement=local_hero.tag_int("PLAYER_LEADERBOARD_PLACE") if local_hero else 0,
+            shop=self._battlegrounds_cards(shop_entities),
+            hand=self._battlegrounds_cards(hand_entities),
+            warband=visible_warband,
+            lobby=self._battlegrounds_lobby(),
+            mechanics=mechanics,
+        )
+
+    def _battlegrounds_cards(
+        self, entities: Iterable[Entity], *, maximum: int = 10
+    ) -> tuple[BattlegroundsCardSnapshot, ...]:
+        cards: list[BattlegroundsCardSnapshot] = []
+        ordered = sorted(entities, key=lambda item: (item.tag_int("ZONE_POSITION", 99), item.entity_id))
+        for entity in ordered:
+            if entity.hidden:
+                continue
+            label = self._visible_card_label(entity)
+            if not label and not entity.card_id:
+                continue
+            cards.append(
+                BattlegroundsCardSnapshot(
+                    card_id=entity.card_id[:80],
+                    name=label,
+                    attack=entity.attack,
+                    health=entity.health,
+                    tier=max(entity.tag_int("TECH_LEVEL"), entity.tag_int("BACON_CARD_TIER")),
+                    frozen=entity.tag_int("FROZEN") > 0,
+                )
+            )
+        return tuple(cards[: max(0, maximum)])
+
+    def _battlegrounds_board_entities(self, controller: int | None) -> list[Entity]:
+        if controller is None:
+            return []
+        candidates = [
+            entity
+            for entity in self.entities.values()
+            if self._controller(entity) == controller
+            and entity.zone == "PLAY"
+            and self._is_minion(entity)
+            and self._is_battlegrounds_gameplay_entity(entity)
+            and not entity.hidden
+        ]
+        positioned: dict[int, Entity] = {}
+        unpositioned: list[Entity] = []
+        for entity in candidates:
+            position = entity.tag_int("ZONE_POSITION")
+            if 1 <= position <= 7:
+                current = positioned.get(position)
+                if current is None or entity.entity_id < current.entity_id:
+                    positioned[position] = entity
+            else:
+                unpositioned.append(entity)
+        if positioned:
+            return [positioned[position] for position in sorted(positioned)][:7]
+        if any("ZONE_POSITION" in entity.tags for entity in candidates):
+            return []
+        return sorted(unpositioned, key=lambda item: item.entity_id)[:7]
+
+    def _cache_recruit_warband(self) -> None:
+        cards = self._battlegrounds_cards(
+            self._battlegrounds_board_entities(self.local_controller),
+            maximum=7,
+        )
+        self._last_recruit_warband = cards
+
+    @staticmethod
+    def _is_battlegrounds_gameplay_entity(entity: Entity) -> bool:
+        label = entity.public_name().strip().casefold()
+        card_id = entity.card_id.strip().casefold()
+        if (
+            label in _BATTLEGROUNDS_UI_LABELS
+            or card_id in _BATTLEGROUNDS_UI_CARD_IDS
+            or "drag_to_" in card_id
+            or "drag to " in label
+        ):
+            return False
+        return entity.health is not None or bool(entity.card_id)
+
+    def _battlegrounds_hero_entities(self) -> dict[int, Entity]:
+        heroes: dict[int, Entity] = {}
+        for entity in self.entities.values():
+            if not self._is_hero(entity):
+                continue
+            player_id = entity.tag_int("PLAYER_ID")
+            if player_id <= 0 or player_id == self.bob_controller:
+                continue
+            previous = heroes.get(player_id)
+            score = self._battlegrounds_hero_score(entity)
+            if previous is None or score > self._battlegrounds_hero_score(previous):
+                heroes[player_id] = entity
+        return heroes
+
+    def _battlegrounds_hero_score(self, entity: Entity) -> tuple[int, int, int, int]:
+        return (
+            int(self._controller(entity) == self.local_controller),
+            int("PLAYER_LEADERBOARD_PLACE" in entity.tags),
+            int(entity.zone in {"PLAY", "SETASIDE"}),
+            -entity.entity_id,
+        )
+
+    def _battlegrounds_local_hero(self) -> Entity | None:
+        heroes = self._battlegrounds_hero_entities()
+        for hero in heroes.values():
+            if self._controller(hero) == self.local_controller:
+                return hero
+        return heroes.get(self.local_controller or -1)
+
+    def _battlegrounds_lobby(self) -> tuple[BattlegroundsPlayerSnapshot, ...]:
+        result: list[BattlegroundsPlayerSnapshot] = []
+        for player_id, hero in self._battlegrounds_hero_entities().items():
+            is_local = self._is_local_battlegrounds_entity(hero)
+            observed = self._observed_boards.get(player_id)
+            if is_local:
+                board_entities = self._battlegrounds_board_entities(self.local_controller)
+                if board_entities:
+                    board_cards = tuple(
+                        label for entity in board_entities if (label := self._visible_card_label(entity))
+                    )[:7]
+                    board_count = min(7, len(board_entities))
+                    board_attack = sum(entity.attack for entity in board_entities)
+                    board_health = sum(entity.health or 0 for entity in board_entities)
+                else:
+                    board_cards = tuple(
+                        card.name or card.card_id for card in self._last_recruit_warband
+                    )
+                    board_count = len(self._last_recruit_warband)
+                    board_attack = sum(card.attack for card in self._last_recruit_warband)
+                    board_health = sum(card.health or 0 for card in self._last_recruit_warband)
+                last_seen_round = self.battlegrounds_round
+            elif observed:
+                last_seen_round, board_cards, board_attack, board_health = observed
+                board_count = len(board_cards)
+            else:
+                last_seen_round, board_cards, board_attack, board_health, board_count = 0, (), 0, 0, 0
+            placement = hero.tag_int("PLAYER_LEADERBOARD_PLACE")
+            eliminated = hero.health == 0 or hero.tag_int("BACON_DIED_LAST_COMBAT") > 0
+            if hero.tags.get("PLAYSTATE", "").upper() in {"LOST", "CONCEDED"}:
+                eliminated = True
+            result.append(
+                BattlegroundsPlayerSnapshot(
+                    player_id=player_id,
+                    is_local=is_local,
+                    hero_card_id=hero.card_id[:80],
+                    hero_name=hero.public_name(),
+                    health=hero.health,
+                    armor=hero.armor,
+                    tavern_tier=self._battlegrounds_tavern_tier(hero, None),
+                    triples=hero.tag_int("PLAYER_TRIPLES"),
+                    placement=placement,
+                    eliminated=eliminated,
+                    next_opponent=player_id == self.next_opponent_player_id,
+                    last_seen_round=last_seen_round,
+                    board_count=board_count,
+                    board_attack=board_attack,
+                    board_health=board_health,
+                    board_cards=board_cards,
+                )
+            )
+        return tuple(sorted(result, key=lambda item: (item.placement or 99, item.player_id))[:8])
+
+    def _capture_observed_opponent_board(self) -> None:
+        player_id = self.next_opponent_player_id
+        if player_id <= 0:
+            return
+        allowed_controllers = {player_id}
+        if self.bob_controller is not None:
+            allowed_controllers.add(self.bob_controller)
+        entities: list[Entity] = []
+        for controller in allowed_controllers:
+            entities.extend(self._battlegrounds_board_entities(controller))
+        entities = entities[:7]
+        cards = tuple(label for entity in entities if (label := self._visible_card_label(entity)))[:7]
+        if not cards:
+            return
+        self._observed_boards[player_id] = (
+            self.battlegrounds_round,
+            cards,
+            sum(entity.attack for entity in entities),
+            sum(entity.health or 0 for entity in entities),
+        )
+
+    def _begin_battlegrounds_combat(self) -> bool:
+        round_number = max(1, self.battlegrounds_round)
+        if (
+            self._combat_active_round == round_number
+            or self._combat_result_emitted_round == round_number
+        ):
+            return False
+        self._combat_active_round = round_number
+        self._combat_damage_taken = 0
+        self._combat_damage_dealt = 0
+        self._capture_observed_opponent_board()
+        return True
+
+    def _finish_battlegrounds_combat(self, timestamp: float) -> list[GameEvent]:
+        round_number = self._combat_active_round
+        if round_number <= 0 or self._combat_result_emitted_round == round_number:
+            return []
+        self._capture_observed_opponent_board()
+        self._combat_result_emitted_round = round_number
+        if self._combat_damage_taken > 0 and self._combat_damage_dealt == 0:
+            outcome, summary = "lost", f"第{round_number}回合战斗失利"
+        elif self._combat_damage_dealt > 0 and self._combat_damage_taken == 0:
+            outcome, summary = "won", f"第{round_number}回合战斗获胜"
+        elif self._combat_damage_dealt == 0 and self._combat_damage_taken == 0:
+            outcome, summary = "tied", f"第{round_number}回合战斗打平"
+        else:
+            outcome, summary = "mixed", f"第{round_number}回合战斗结束"
+        local_hero = self._battlegrounds_local_hero()
+        health = local_hero.health if local_hero else None
+        armor = local_hero.armor if local_hero else 0
+        priority = 8 if outcome == "lost" and health is not None and health + armor <= 10 else 7
+        if outcome == "tied":
+            priority = 5
+        elif outcome == "mixed":
+            priority = 4
+        self._combat_active_round = 0
+        return [
+            GameEvent(
+                "battlegrounds_combat_result",
+                priority,
+                summary,
+                timestamp,
+                {
+                    "round": round_number,
+                    "outcome": outcome,
+                    "damage_taken": self._combat_damage_taken,
+                    "damage_dealt": self._combat_damage_dealt,
+                    "health": health,
+                    "armor": armor,
+                    "variant": self.battlegrounds_variant,
+                },
+            )
+        ]
+
+    def _finalize_battlegrounds(self, timestamp: float) -> list[GameEvent]:
+        if self._battlegrounds_result_emitted:
+            return []
+        combat_events = self._finish_battlegrounds_combat(timestamp)
+        hero = self._battlegrounds_local_hero()
+        placement = hero.tag_int("PLAYER_LEADERBOARD_PLACE") if hero else 0
+        if placement <= 0:
+            return combat_events
+        self._battlegrounds_result_emitted = True
+        self.result = "won" if placement == 1 else "placed"
+        return combat_events + [
+            GameEvent(
+                "battlegrounds_game_ended",
+                10,
+                f"本局酒馆战棋第{placement}名",
+                timestamp,
+                {
+                    "placement": placement,
+                    "variant": self.battlegrounds_variant,
+                    "round": self.battlegrounds_round,
+                    "hero_card_id": hero.card_id[:80] if hero else "",
+                    "hero_name": hero.public_name() if hero else "",
+                },
+            )
+        ]
+
+    def _battlegrounds_tavern_tier(self, hero: Entity | None, player: Entity | None) -> int:
+        return max(
+            hero.tag_int("PLAYER_TECH_LEVEL") if hero else 0,
+            player.tag_int("PLAYER_TECH_LEVEL") if player else 0,
+        )
+
+    def _local_tag_max(self, tag: str) -> int:
+        return max(
+            (
+                entity.tag_int(tag)
+                for entity in self.entities.values()
+                if self._is_local_battlegrounds_entity(entity)
+            ),
+            default=0,
+        )
+
+    def _is_local_battlegrounds_entity(self, entity: Entity) -> bool:
+        if self.local_controller is None:
+            return False
+        return self._controller(entity) == self.local_controller or entity.tag_int("PLAYER_ID") == self.local_controller
+
+    def _battlegrounds_player_id(self, entity: Entity) -> int:
+        return entity.tag_int("PLAYER_ID") or self._controller(entity) or 0
+
+    def _observe_battlegrounds_counter(self, entity: Entity, tag: str, current: int) -> bool:
+        player_id = self._battlegrounds_player_id(entity)
+        if player_id <= 0:
+            return False
+        key = (player_id, tag)
+        highest = self._battlegrounds_counter_highs.get(key)
+        if highest is not None and current <= highest:
+            return False
+        self._battlegrounds_counter_highs[key] = current
+        return True
+
+    def _unresolved_tag_entity(self, raw_ref: str, raw_tag: str, raw_value: str) -> Entity | None:
+        if self.mode != "battlegrounds":
+            return None
+        tag = _clean(raw_tag, limit=60).upper()
+        value = _clean(raw_value, limit=160).upper()
+        local_player = self.entities.get(self.player_entities.get(self.local_controller or -1, -1))
+        bob_player = self.entities.get(self.player_entities.get(self.bob_controller or -1, -1))
+        if tag == "CURRENT_PLAYER" and value in {"1", "TRUE"}:
+            if "BOB'S TAVERN" in str(raw_ref).upper():
+                return bob_player
+            return local_player
+        if tag in {
+            "NEXT_OPPONENT_PLAYER_ID",
+            "RESOURCES",
+            "RESOURCES_USED",
+            "TEMP_RESOURCES",
+            "PLAYER_TECH_LEVEL",
+            "PLAYER_TRIPLES",
+            "PLAYSTATE",
+            "MULLIGAN_STATE",
+        }:
+            return local_player
+        return None
+
+    def _visible_card_label(self, entity: Entity | None) -> str:
+        if entity is None or entity.hidden:
+            return ""
+        controller = self._controller(entity)
+        if controller != self.local_controller and not entity.revealed and entity.zone not in _PUBLIC_ZONES:
+            return ""
+        if controller != self.local_controller and entity.zone == "SECRET":
+            return ""
+        return entity.public_name()
+
+    def _infer_local_controller_from_show(self, entity: Entity) -> None:
+        if self.local_controller is not None or self.spectating or entity.zone != "HAND":
+            return
+        self.local_controller = self._controller(entity)
+
+    def _controller(self, entity: Entity | None, fallback: int | None = None) -> int | None:
+        if entity is None:
+            return fallback
+        if entity.controller is not None:
+            return entity.controller
+        return _int(entity.tags.get("CONTROLLER")) or _int(entity.tags.get("PLAYER_ID")) or fallback
+
+    def _opponent_controller(self) -> int | None:
+        if self.local_controller is None:
+            return None
+        controllers = {self._controller(entity) for entity in self.entities.values()}
+        controllers.discard(None)
+        controllers.discard(self.local_controller)
+        controllers.discard(self.bob_controller)
+        return min(controllers) if controllers else 2
+
+    def _zone_count(self, controller: int | None, zone: str) -> int:
+        return sum(
+            entity.zone == zone and self._controller(entity) == controller for entity in self.entities.values()
+        )
+
+    @staticmethod
+    def _is_hero(entity: Entity) -> bool:
+        return entity.card_type == "HERO" or entity.card_id.startswith("HERO_")
+
+    @staticmethod
+    def _is_minion(entity: Entity) -> bool:
+        return entity.card_type == "MINION"
+
+    def _side_name(self, controller: int | None) -> str:
+        if controller is None or self.local_controller is None:
+            return "unknown"
+        return "player" if controller == self.local_controller else "opponent"
+
+    @staticmethod
+    def _side_label(side: str) -> str:
+        return {"player": "我方", "opponent": "对手"}.get(side, "场上")
+
+
+__all__ = ["PowerLogParser"]
