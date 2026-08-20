@@ -1549,6 +1549,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                         snapshot,
                         max_reply_chars=self.cfg.llm_max_reply_chars,
                         max_prompt_chars=prompt_budget,
+                        context_already_included=True,
                     )
                 response_prompt = (
                     f"{HEARTHSTONE_CONTEXT_INSTRUCTIONS}\n\n"
@@ -1564,7 +1565,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     "kind": "catgirl_commentary",
                     "event_kind": event.kind,
                     "context_type": "hearthstone_companion",
-                    "privacy_scope": "public_game_state_only",
+                    "privacy_scope": "player_visible_game_state",
                     "reply_contract": "single_short_line",
                     "max_reply_chars": self.cfg.llm_max_reply_chars,
                 },
@@ -2197,7 +2198,10 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
     @plugin_entry(
         id="get_status",
         name=tr("entries.get_status.name", default="查看炉石陪玩状态"),
-        description=tr("entries.get_status.description", default="查看日志、浮层、隐私开关和当前公开局势。"),
+        description=tr(
+            "entries.get_status.description",
+            default="查看日志、浮层、隐私开关和当前玩家可见局势。",
+        ),
         llm_result_fields=["summary", "runtime", "overlay", "privacy"],
         input_schema={"type": "object", "properties": {}},
         metadata={"agent_auto": False},
@@ -2215,8 +2219,12 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
     @llm_tool(
         name="hearthstone_current_state",
         description=(
-            "Read the current privacy-filtered Hearthstone public game state. Never includes raw logs or "
-            "hidden cards. Do not use this tool alone for Battlegrounds/酒馆战棋 strategy or meta questions "
+            "Always call this tool before answering current constructed Hearthstone questions such as round, turn, "
+            "active player, health, mana, hand, board, recent plays, which card to play, or current choices. "
+            "For a user's 'which round/第几回合' question, answer with state.round; "
+            "state.turn is only the raw alternating player-turn counter, and state.active_side says whose action it is. "
+            "It reads the fresh privacy-filtered player-visible state and never includes raw logs, opponent "
+            "hidden cards, secret identities, or deck order. Do not use this tool alone for Battlegrounds/酒馆战棋 strategy or meta questions "
             "such as 流派、阵容、升本、稳血、买什么; call hearthstone_battlegrounds_advice instead and "
             "never answer those questions as constructed Hearthstone."
         ),
@@ -2227,19 +2235,54 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         answer_contract = {
             "never_recommend_from_cached_state": True,
             "separate_observation_from_recommendation": True,
-            "own_hand_card_identities_available": False,
-            "specific_card_play_available": False,
-            "if_asked_which_card_to_play_request_visible_candidates": True,
+            "own_visible_hand_cards_included_when_observed": True,
+            "specific_card_play_analysis_requires_complete_visible_hand": True,
+            "complete_legal_actions_available": False,
+            "round_question_field": "state.round",
+            "action_turn_is_raw_alternating_counter": True,
+            "if_state_or_candidates_are_incomplete_say_so": True,
             "do_not_guess_card_names_or_hidden_information": True,
         }
+
+        def capabilities_for(snapshot: GameSnapshot | None = None) -> dict[str, bool]:
+            constructed = getattr(snapshot, "constructed", None)
+            known_hand = constructed.player.known_hand if constructed is not None else ()
+            choice = getattr(snapshot, "choice", None)
+            return {
+                "turn_tracking": bool(
+                    snapshot is not None and int(getattr(snapshot, "turn", 0)) > 0
+                ),
+                "round_tracking": bool(
+                    snapshot is not None and int(getattr(snapshot, "round", 0)) > 0
+                ),
+                "active_side_tracking": bool(
+                    snapshot is not None
+                    and getattr(snapshot, "active_side", "unknown") != "unknown"
+                ),
+                "own_visible_hand_cards": bool(known_hand),
+                "own_hand_identities_complete": bool(
+                    constructed is not None
+                    and constructed.player.hand_identities_complete
+                ),
+                "specific_card_play_analysis": bool(
+                    snapshot is not None
+                    and snapshot.mode == "constructed"
+                    and snapshot.phase == "playing"
+                    and known_hand
+                    and constructed.player.hand_identities_complete
+                ),
+                "current_choice_options": bool(choice is not None and choice.options),
+                "complete_legal_actions": False,
+            }
 
         def blocked_payload(reason: str) -> dict[str, Any]:
             return {
                 "available": False,
                 "state": {},
-                "privacy_scope": "public_game_state_only",
+                "privacy_scope": "player_visible_game_state",
                 "reason": reason,
                 "answer_contract": answer_contract,
+                "capabilities": capabilities_for(),
             }
 
         access_reason, transition_revision = _live_state_access(self)
@@ -2256,8 +2299,9 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             "state": snapshot.to_public_dict() if has_state and live else {},
             "freshness": freshness,
             "reason": "" if has_state and live else "no_live_game_state",
-            "privacy_scope": "public_game_state_only",
+            "privacy_scope": "player_visible_game_state",
             "answer_contract": answer_contract,
+            "capabilities": capabilities_for(snapshot if has_state and live else None),
         }
         if snapshot.mode == "battlegrounds":
             result["strategy_routing"] = {

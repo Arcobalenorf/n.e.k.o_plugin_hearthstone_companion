@@ -78,6 +78,7 @@ type GameState = {
   phase?: string
   game_number?: number
   turn?: number
+  round?: number
   active_side?: string
   player?: SideState
   opponent?: SideState
@@ -835,7 +836,8 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
             <Inline align="center" wrap>
               <StatusBadge tone={stateTone(phase)} label={localized("status.phase", phase)} />
               <Text>{t("game.number", { value: game.game_number ?? 0 })}</Text>
-              <Text>{t("game.turn", { value: game.turn ?? 0 })}</Text>
+              <Text>{t("game.round", { value: game.round ?? 0 })}</Text>
+              <Text>{t("game.actionTurn", { value: game.turn ?? 0 })}</Text>
               <Text>{t("game.activeSide", { side: localized("status.side", game.active_side) })}</Text>
               {game.result ? <StatusBadge tone="info" label={localized("status.result", game.result)} /> : null}
             </Inline>
@@ -990,7 +992,7 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
         <Heading as="h2">{t("sections.diagnostics.title")}</Heading>
         <Text>{t("sections.diagnostics.subtitle")}</Text>
         <Grid cols={3}>
-          <StatCard label={t("metrics.turn")} value={game.turn ?? 0} />
+          <StatCard label={t("metrics.round")} value={game.round ?? 0} />
           <StatCard label={t("metrics.events")} value={runtime.events_seen ?? 0} />
           <StatCard label={t("metrics.llmSubmissions")} value={runtime.llm_submissions ?? 0} />
         </Grid>

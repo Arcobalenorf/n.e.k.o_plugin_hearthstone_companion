@@ -14,6 +14,9 @@ from hearthstone_companion_under_test.models import (
     BattlegroundsHeroChoiceSnapshot,
     BattlegroundsPlayerSnapshot,
     BattlegroundsSnapshot,
+    ConstructedCardSnapshot,
+    ConstructedSideSnapshot,
+    ConstructedSnapshot,
     GameEvent,
     GameSnapshot,
     SideSnapshot,
@@ -92,6 +95,89 @@ def test_llm_prompt_delegates_visible_wording_to_current_neko_character() -> Non
     assert '"emotion_cue"' in prompt
     assert "公开局势 JSON" in prompt
     assert "这一击真疼" not in prompt
+
+
+def test_proactive_constructed_prompt_omits_specific_hand_identity() -> None:
+    snapshot = GameSnapshot(
+        mode="constructed",
+        phase="playing",
+        game_number=2,
+        turn=5,
+        round=3,
+        constructed=ConstructedSnapshot(
+            game_type="GT_RANKED",
+            variant="ranked",
+            player=ConstructedSideSnapshot(
+                mana_available=4,
+                mana_max=5,
+                hand_count=1,
+                known_hand=(
+                    ConstructedCardSnapshot(
+                        card_id="PRIVATE_VISIBLE_CARD",
+                        name="仅按需提供的手牌",
+                        card_type="SPELL",
+                        cost=4,
+                    ),
+                ),
+                hand_identities_complete=True,
+            ),
+        ),
+    )
+
+    prompt = build_llm_prompt(event(), snapshot, max_prompt_chars=10_000)
+
+    assert "PRIVATE_VISIBLE_CARD" not in prompt
+    assert "仅按需提供的手牌" not in prompt
+    assert '\"count\":1' in prompt
+    assert '\"turn\":5' in prompt
+    assert '\"round\":3' in prompt
+
+
+def test_full_constructed_board_still_fits_proactive_prompt_budget() -> None:
+    oversized = "公开但超长的随从名" * 30
+    cards = tuple(
+        ConstructedCardSnapshot(
+            card_id=f"PUBLIC_BOARD_{index}_{oversized}",
+            name=oversized,
+            card_type="MINION",
+            attack=99,
+            health=99,
+            max_health=99,
+            keywords=("taunt", "divine_shield", "lifesteal"),
+        )
+        for index in range(7)
+    )
+    side = ConstructedSideSnapshot(
+        mana_available=10,
+        mana_max=10,
+        hand_count=10,
+        deck_count=30,
+        secret_count=5,
+        board=cards,
+        weapon=cards[0],
+        hero_power=cards[1],
+        locations=(cards[2], cards[3]),
+    )
+    snapshot = GameSnapshot(
+        mode="constructed",
+        phase="playing",
+        turn=19,
+        round=10,
+        active_side="player",
+        constructed=ConstructedSnapshot(
+            game_type="GT_RANKED_STANDARD",
+            format="standard",
+            variant="ranked",
+            player=side,
+            opponent=side,
+        ),
+    )
+
+    prompt = build_llm_prompt(event(), snapshot, max_prompt_chars=1800)
+    encoded = prompt.split("公开局势 JSON：", 1)[1]
+
+    assert len(prompt) <= 1800
+    assert isinstance(json.loads(encoded), dict)
 
 
 def test_battlegrounds_prompt_includes_hero_choices_and_observed_opponent_board() -> None:

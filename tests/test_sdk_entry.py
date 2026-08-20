@@ -16,6 +16,10 @@ from hearthstone_companion_under_test.models import (
     BattlegroundsHeroChoiceSnapshot,
     BattlegroundsPlayerSnapshot,
     BattlegroundsSnapshot,
+    ChoiceSnapshot,
+    ConstructedCardSnapshot,
+    ConstructedSideSnapshot,
+    ConstructedSnapshot,
     GameEvent,
     GameSnapshot,
 )
@@ -1121,10 +1125,16 @@ def test_llm_state_tool_does_not_read_state_without_data_consent(monkeypatch) ->
 
     assert result["available"] is False
     assert result["state"] == {}
-    assert result["privacy_scope"] == "public_game_state_only"
+    assert result["privacy_scope"] == "player_visible_game_state"
     assert result["reason"] == "llm_data_sharing_not_authorized"
-    assert result["answer_contract"]["own_hand_card_identities_available"] is False
-    assert result["answer_contract"]["specific_card_play_available"] is False
+    assert result["answer_contract"]["own_visible_hand_cards_included_when_observed"] is True
+    assert (
+        result["answer_contract"][
+            "specific_card_play_analysis_requires_complete_visible_hand"
+        ]
+        is True
+    )
+    assert result["answer_contract"]["complete_legal_actions_available"] is False
 
 
 @pytest.mark.parametrize("tool_name", ["current_state", "battlegrounds_advice"])
@@ -1200,7 +1210,7 @@ def test_llm_state_tool_returns_public_state_with_consent_even_when_proactive_is
     assert result["state"] == public_state
     assert result["freshness"]["source"] == "live"
     assert result["reason"] == ""
-    assert result["privacy_scope"] == "public_game_state_only"
+    assert result["privacy_scope"] == "player_visible_game_state"
 
 
 def test_llm_tool_descriptions_route_battlegrounds_strategy_exclusively(monkeypatch) -> None:
@@ -1210,6 +1220,8 @@ def test_llm_tool_descriptions_route_battlegrounds_strategy_exclusively(monkeypa
 
     current_description = current_metadata["description"]
     advice_description = advice_metadata["description"]
+    for phrase in ("turn", "active player", "hand", "which card to play", "current choices"):
+        assert phrase in current_description
     assert "hearthstone_battlegrounds_advice instead" in current_description
     assert "never answer those questions as constructed" in current_description
     for keyword in ("酒馆", "流派", "阵容", "升本", "稳血", "买什么"):
@@ -1221,6 +1233,147 @@ def test_llm_tool_descriptions_route_battlegrounds_strategy_exclusively(monkeypa
     assert "current_strategy" in topic_description
     assert "season_meta" in topic_description
     assert "never composition win-rate rankings" in topic_description
+
+
+def test_constructed_current_state_exposes_fresh_analysis_capabilities(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    now = time.time()
+    snapshot = GameSnapshot(
+        mode="constructed",
+        phase="playing",
+        game_number=3,
+        turn=5,
+        round=3,
+        active_side="player",
+        constructed=ConstructedSnapshot(
+            game_type="GT_RANKED",
+            variant="ranked",
+            player=ConstructedSideSnapshot(
+                mana_available=4,
+                mana_max=5,
+                hand_count=1,
+                known_hand=(
+                    ConstructedCardSnapshot(
+                        card_id="CS2_029",
+                        name="火球术",
+                        card_type="SPELL",
+                        cost=4,
+                    ),
+                ),
+                hand_identities_complete=True,
+            ),
+        ),
+    )
+    plugin = types.SimpleNamespace(
+        cfg=CompanionConfig(llm_data_consent=True),
+        _ensure_monitor=lambda: types.SimpleNamespace(
+            snapshot=lambda: snapshot,
+            status=lambda: types.SimpleNamespace(
+                source_state="watching",
+                monitor_running=True,
+                last_line_at=now,
+                last_event_at=now,
+            ),
+        ),
+    )
+
+    result = asyncio.run(entry.HearthstoneCompanionPlugin.hearthstone_current_state(plugin))
+
+    assert result["available"] is True
+    assert result["state"]["turn"] == 5
+    assert result["state"]["round"] == 3
+    assert "timeline" not in result["state"]
+    assert result["answer_contract"]["round_question_field"] == "state.round"
+    assert result["answer_contract"]["action_turn_is_raw_alternating_counter"] is True
+    assert result["state"]["constructed"]["player"]["hand"]["known_cards"][0][
+        "card_id"
+    ] == "CS2_029"
+    assert result["capabilities"] == {
+        "turn_tracking": True,
+        "round_tracking": True,
+        "active_side_tracking": True,
+        "own_visible_hand_cards": True,
+        "own_hand_identities_complete": True,
+        "specific_card_play_analysis": True,
+        "current_choice_options": False,
+        "complete_legal_actions": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("phase", "known_cards", "identities_complete"),
+    [
+        ("mulligan", True, True),
+        ("playing", False, True),
+        ("playing", True, False),
+        ("ended", True, True),
+    ],
+)
+def test_constructed_current_state_disables_specific_card_analysis_when_incomplete(
+    monkeypatch,
+    phase: str,
+    known_cards: bool,
+    identities_complete: bool,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    now = time.time()
+    hand = (
+        (
+            ConstructedCardSnapshot(
+                card_id="CS2_029",
+                name="火球术",
+                card_type="SPELL",
+                cost=4,
+            ),
+        )
+        if known_cards
+        else ()
+    )
+    snapshot = GameSnapshot(
+        mode="constructed",
+        phase=phase,
+        game_number=3,
+        turn=5,
+        round=3,
+        active_side="player",
+        constructed=ConstructedSnapshot(
+            player=ConstructedSideSnapshot(
+                hand_count=1,
+                known_hand=hand,
+                hand_identities_complete=identities_complete,
+            )
+        ),
+    )
+    plugin = types.SimpleNamespace(
+        cfg=CompanionConfig(llm_data_consent=True),
+        _ensure_monitor=lambda: types.SimpleNamespace(
+            snapshot=lambda: snapshot,
+            status=lambda: types.SimpleNamespace(
+                source_state="watching",
+                monitor_running=True,
+                last_line_at=now,
+                last_event_at=now,
+            ),
+        ),
+    )
+
+    result = asyncio.run(entry.HearthstoneCompanionPlugin.hearthstone_current_state(plugin))
+
+    assert result["capabilities"]["specific_card_play_analysis"] is False
+
+
+def test_context_instructions_route_current_constructed_questions_to_state_tool(
+    monkeypatch,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    instructions = entry.HEARTHSTONE_CONTEXT_INSTRUCTIONS
+
+    assert "hearthstone_current_state" in instructions
+    for keyword in ("第几回合", "轮到谁", "应该出什么牌", "当前手牌", "当前场面"):
+        assert keyword in instructions
+    assert "state.round" in instructions
+    assert "state.timeline" not in instructions
+    assert "不得依赖之前的主动短评" in instructions
 
 
 def test_current_state_redirects_battlegrounds_strategy_to_advice_tool(monkeypatch) -> None:
@@ -1639,7 +1792,11 @@ def test_sdk_routes_context_and_commentary_when_no_private_role_is_available(mon
     entry = _load_sdk_entry(monkeypatch)
     submitted: list[dict[str, Any]] = []
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
-    plugin.cfg = CompanionConfig(llm_commentary_enabled=True, llm_data_consent=True)
+    plugin.cfg = CompanionConfig(
+        llm_commentary_enabled=True,
+        llm_data_consent=True,
+        llm_max_reply_chars=80,
+    )
     plugin._context_target = None
     plugin._ownership_lock = threading.RLock()
     plugin._last_user_chat_at = 0.0
@@ -1654,13 +1811,75 @@ def test_sdk_routes_context_and_commentary_when_no_private_role_is_available(mon
         GameEvent("battlegrounds_triple", 9, "triple", 100.0, {}),
         GameSnapshot(mode="battlegrounds", phase="playing"),
     )
+    private_hand = ConstructedCardSnapshot(
+        card_id="PRIVATE_HAND_SENTINEL",
+        name="只允许主动询问读取的手牌",
+        card_type="SPELL",
+        cost=4,
+    )
+    public_board = tuple(
+        ConstructedCardSnapshot(
+            card_id=f"PUBLIC_BOARD_{index}",
+            name="公开但很长的场面随从" * 20,
+            card_type="MINION",
+            attack=20,
+            health=20,
+            keywords=("taunt", "divine_shield", "lifesteal"),
+        )
+        for index in range(7)
+    )
+    side = ConstructedSideSnapshot(
+        mana_available=10,
+        mana_max=10,
+        hand_count=1,
+        known_hand=(private_hand,),
+        hand_identities_complete=True,
+        board=public_board,
+        weapon=public_board[0],
+        hero_power=public_board[1],
+        locations=(public_board[2], public_board[3]),
+    )
+    assert plugin._dispatch_llm(
+        "oversized constructed prompt " * 200,
+        GameEvent("hero_damaged", 9, "damage", 100.5, {"amount": 12}),
+        GameSnapshot(
+            mode="constructed",
+            phase="playing",
+            turn=19,
+            round=10,
+            active_side="player",
+            constructed=ConstructedSnapshot(
+                game_type="GT_RANKED_STANDARD",
+                format="standard",
+                variant="ranked",
+                player=side,
+                opponent=side,
+            ),
+            choice=ChoiceSnapshot(
+                choice_type="discover",
+                count_min=1,
+                count_max=1,
+                options=(
+                    ConstructedCardSnapshot(
+                        card_id="PRIVATE_CHOICE_SENTINEL",
+                        name="只允许主动询问读取的发现选项",
+                        card_type="SPELL",
+                    ),
+                ),
+            ),
+        ),
+    )
+    assert "PRIVATE_HAND_SENTINEL" not in submitted[-1]["parts"][0]["text"]
+    assert "只允许主动询问读取的手牌" not in submitted[-1]["parts"][0]["text"]
+    assert "PRIVATE_CHOICE_SENTINEL" not in submitted[-1]["parts"][0]["text"]
+    assert "只允许主动询问读取的发现选项" not in submitted[-1]["parts"][0]["text"]
     assert plugin._dispatch_llm(
         "terminal prompt",
         GameEvent("battlegrounds_game_ended", 10, "ended", 101.0, {"placement": 1}),
         GameSnapshot(mode="battlegrounds", phase="ended"),
     )
 
-    assert [item["ai_behavior"] for item in submitted] == ["respond", "respond"]
+    assert [item["ai_behavior"] for item in submitted] == ["respond", "respond", "respond"]
     assert all("target_lanlan" not in item for item in submitted)
     assert all("coalesce_key" not in item for item in submitted)
     assert all(entry.HEARTHSTONE_CONTEXT_INSTRUCTIONS in item["parts"][0]["text"] for item in submitted)

@@ -92,6 +92,12 @@ def test_active_constructed_bootstrap_notifies_state_ready_without_replaying_eve
     lines = (
         _line("CREATE_GAME"),
         _line("GameEntity EntityID=1"),
+        _line("Player EntityID=2 PlayerID=1 GameAccountId=[hi=0 lo=0]"),
+        _line("Player EntityID=3 PlayerID=2 GameAccountId=[hi=0 lo=0]"),
+        _line(
+            "SHOW_ENTITY - Updating Entity=[entityName=幸运币 id=4 zone=HAND zonePos=1 cardId= player=1] CardID=GAME_005"
+        ),
+        _line("TAG_CHANGE Entity=2 tag=CURRENT_PLAYER value=1"),
         _line("TAG_CHANGE Entity=GameEntity tag=STEP value=MAIN_READY"),
     )
 
@@ -105,6 +111,43 @@ def test_active_constructed_bootstrap_notifies_state_ready_without_replaying_eve
     assert results == []
     assert monitor.status().events_seen == 0
     assert monitor.status().llm_submissions == 0
+
+
+def test_constructed_bootstrap_publishes_first_turn_state_in_the_same_poll_batch() -> None:
+    path = Path("constructed-live/Power.log")
+    private_local = "PRIVATE_LOCAL#1234"
+    lines = (
+        "D 12:00:00.0000000 GameState.DebugPrintPower() - CREATE_GAME",
+        "D 12:00:00.0000000 GameState.DebugPrintGame() - GameType=GT_RANKED",
+        f"D 12:00:00.0000000 GameState.DebugPrintGame() - PlayerID=2, PlayerName={private_local}",
+        "D 12:00:00.0000000 GameState.DebugPrintPower() - GameEntity EntityID=1",
+        "D 12:00:00.0000000 GameState.DebugPrintPower() - Player EntityID=3 PlayerID=2 GameAccountId=[hi=0 lo=0]",
+        _line("CREATE_GAME"),
+        _line(
+            "SHOW_ENTITY - Updating Entity=[entityName=幸运币 id=40 zone=HAND zonePos=1 cardId= player=2] CardID=GAME_005"
+        ),
+        _line(f"TAG_CHANGE Entity={private_local} tag=RESOURCES value=1"),
+        _line(f"TAG_CHANGE Entity={private_local} tag=CURRENT_PLAYER value=1"),
+        _line("TAG_CHANGE Entity=GameEntity tag=TURN value=1"),
+        _line("TAG_CHANGE Entity=GameEntity tag=STEP value=MAIN_READY"),
+    )
+
+    monitor, observed, llm_events, results = _run_bootstrap_batches(
+        [TailBatch(lines, path, bootstrap=True, source_reset=True, bootstrap_complete=True)]
+    )
+
+    snapshot = observed[-1][1]
+    assert [kind for kind, _snapshot in observed] == ["source_reset", "state_ready"]
+    assert snapshot.mode == "constructed"
+    assert snapshot.turn == 1
+    assert snapshot.round == 1
+    assert snapshot.active_side == "player"
+    assert snapshot.constructed is not None
+    assert snapshot.constructed.player.mana_available == 1
+    assert [card.card_id for card in snapshot.constructed.player.known_hand] == ["GAME_005"]
+    assert private_local not in repr(snapshot)
+    assert llm_events == []
+    assert results == []
 
 
 def test_active_battlegrounds_bootstrap_notifies_state_ready_before_first_turn() -> None:
@@ -308,6 +351,12 @@ def test_source_reset_clears_previous_generation_activity_before_freshness_check
     lines = (
         _line("CREATE_GAME"),
         _line("GameEntity EntityID=1"),
+        _line("Player EntityID=2 PlayerID=1 GameAccountId=[hi=0 lo=0]"),
+        _line("Player EntityID=3 PlayerID=2 GameAccountId=[hi=0 lo=0]"),
+        _line(
+            "SHOW_ENTITY - Updating Entity=[entityName=幸运币 id=4 zone=HAND zonePos=1 cardId= player=1] CardID=GAME_005"
+        ),
+        _line("TAG_CHANGE Entity=2 tag=CURRENT_PLAYER value=1"),
         _line("TAG_CHANGE Entity=GameEntity tag=STEP value=MAIN_READY"),
     )
     first = Path("session-1/Power.log")
@@ -830,6 +879,28 @@ def test_stop_flushes_a_fully_parsed_live_batch() -> None:
     )
     monitor._parser.feed_line(_line("CREATE_GAME"), now=100.0)
     monitor._parser.feed_line(_line("GameEntity EntityID=1"), now=100.0)
+    monitor._parser.feed_line(
+        _line("Player EntityID=2 PlayerID=1 GameAccountId=[hi=0 lo=0]"),
+        now=100.0,
+    )
+    monitor._parser.feed_line(
+        _line("Player EntityID=3 PlayerID=2 GameAccountId=[hi=0 lo=0]"),
+        now=100.0,
+    )
+    monitor._parser.feed_line(
+        _line(
+            "SHOW_ENTITY - Updating Entity=[entityName=幸运币 id=4 zone=HAND zonePos=1 cardId= player=1] CardID=GAME_005"
+        ),
+        now=100.0,
+    )
+    monitor._parser.feed_line(
+        _line("TAG_CHANGE Entity=2 tag=CURRENT_PLAYER value=1"),
+        now=100.0,
+    )
+    monitor._parser.feed_line(
+        _line("TAG_CHANGE Entity=GameEntity tag=STEP value=MAIN_READY"),
+        now=100.0,
+    )
     monitor._snapshot = monitor._parser.snapshot()
     monitor._bootstrap_complete = True
     lines = (

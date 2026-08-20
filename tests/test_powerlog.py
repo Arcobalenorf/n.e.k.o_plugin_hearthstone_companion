@@ -286,18 +286,90 @@ def test_turn_and_local_win_update_snapshot_and_emit_events() -> None:
         parser,
         "SHOW_ENTITY - Updating Entity=[entityName=幸运币 id=40 zone=HAND zonePos=1 cardId= player=3] CardID=GAME_005",
     )
+    feed(
+        parser,
+        "TAG_CHANGE Entity=3 tag=CURRENT_PLAYER value=1",
+        "TAG_CHANGE Entity=GameEntity tag=STEP value=MAIN_READY",
+    )
 
     turn_events = feed(parser, "TAG_CHANGE Entity=GameEntity tag=TURN value=3")
     result_events = feed(parser, "TAG_CHANGE Entity=3 tag=PLAYSTATE value=WON")
     snapshot = parser.snapshot()
 
-    assert [(event.kind, event.details) for event in turn_events] == [("turn_started", {"turn": 3})]
+    assert [(event.kind, event.details) for event in turn_events] == [
+        (
+            "turn_started",
+            {
+                "turn": 3,
+                "action_turn": 3,
+                "round": 2,
+                "active_side": "player",
+            },
+        )
+    ]
     assert len(result_events) == 1
     assert result_events[0].kind == "game_ended"
     assert result_events[0].details["result"] == "won"
     assert snapshot.turn == 3
     assert snapshot.phase == "ended"
     assert snapshot.result == "won"
+
+
+def test_constructed_timeline_stays_in_mulligan_then_publishes_first_turn_edge() -> None:
+    parser = PowerLogParser()
+    feed(
+        parser,
+        "CREATE_GAME",
+        "GameEntity EntityID=1",
+        "Player EntityID=2 PlayerID=1 GameAccountId=[hi=0 lo=0]",
+        "Player EntityID=3 PlayerID=3 GameAccountId=[hi=0 lo=0]",
+        "TAG_CHANGE Entity=3 tag=MULLIGAN_STATE value=INPUT",
+        "TAG_CHANGE Entity=3 tag=CURRENT_PLAYER value=1",
+    )
+
+    early_events = feed(parser, "TAG_CHANGE Entity=GameEntity tag=TURN value=1")
+    early = parser.snapshot()
+
+    assert early_events == []
+    assert early.phase == "mulligan"
+    assert early.turn == 1
+    assert early.round == 0
+    assert early.active_side == "unknown"
+
+    feed(parser, "TAG_CHANGE Entity=3 tag=MULLIGAN_STATE value=DONE")
+    assert parser.snapshot().round == 0
+    first_turn = feed(parser, "TAG_CHANGE Entity=2 tag=MULLIGAN_STATE value=DONE")
+    ready = parser.snapshot()
+
+    assert [(event.kind, event.summary, event.details) for event in first_turn] == [
+        (
+            "turn_started",
+            "第1轮，轮到我方",
+            {
+                "turn": 1,
+                "action_turn": 1,
+                "round": 1,
+                "active_side": "player",
+            },
+        )
+    ]
+    assert ready.phase == "playing"
+    assert ready.round == 1
+    assert ready.active_side == "player"
+
+    assert feed(parser, "TAG_CHANGE Entity=3 tag=CURRENT_PLAYER value=0") == []
+    assert parser.snapshot().active_side == "unknown"
+    assert feed(parser, "TAG_CHANGE Entity=GameEntity tag=TURN value=2") == []
+    second_turn = feed(parser, "TAG_CHANGE Entity=2 tag=CURRENT_PLAYER value=1")
+
+    assert second_turn[0].details == {
+        "turn": 2,
+        "action_turn": 2,
+        "round": 1,
+        "active_side": "opponent",
+    }
+    assert parser.snapshot().round == 1
+    assert parser.snapshot().active_side == "opponent"
 
 
 def test_missing_resource_tag_is_reported_as_unknown_mana() -> None:
@@ -312,6 +384,416 @@ def test_missing_resource_tag_is_reported_as_unknown_mana() -> None:
 
     assert snapshot.player.mana_available is None
     assert snapshot.player.mana_max is None
+
+
+def test_constructed_metadata_and_private_player_refs_drive_live_turn_and_mana() -> None:
+    parser = PowerLogParser()
+    private_local = "PRIVATE_LOCAL_PLAYER#1234"
+    private_opponent = "PRIVATE_OPPONENT_PLAYER#5678"
+
+    parser.feed_line(source_line("GameState", "CREATE_GAME"), now=100.0)
+    parser.feed_line(
+        "D 12:00:00.0000000 GameState.DebugPrintGame() - GameType=GT_RANKED",
+        now=100.1,
+    )
+    parser.feed_line(
+        f"D 12:00:00.0000000 GameState.DebugPrintGame() - PlayerID=1, PlayerName={private_opponent}",
+        now=100.2,
+    )
+    parser.feed_line(
+        f"D 12:00:00.0000000 GameState.DebugPrintGame() - PlayerID=2, PlayerName={private_local}",
+        now=100.3,
+    )
+    parser.feed_line(
+        source_line("GameState", "GameEntity EntityID=1"),
+        now=100.4,
+    )
+    parser.feed_line(
+        source_line(
+            "GameState",
+            "Player EntityID=2 PlayerID=1 GameAccountId=[hi=0 lo=0]",
+        ),
+        now=100.5,
+    )
+    parser.feed_line(
+        source_line(
+            "GameState",
+            "Player EntityID=3 PlayerID=2 GameAccountId=[hi=0 lo=0]",
+        ),
+        now=100.6,
+    )
+    started = parser.feed_line(source_line("PowerTaskList", "CREATE_GAME"), now=101.0)
+    feed(
+        parser,
+        "SHOW_ENTITY - Updating Entity=[entityName=幸运币 id=40 zone=HAND zonePos=1 cardId= player=2] CardID=GAME_005",
+        f"TAG_CHANGE Entity={private_local} tag=RESOURCES value=5",
+        f"TAG_CHANGE Entity={private_local} tag=RESOURCES_USED value=2",
+        f"TAG_CHANGE Entity={private_local} tag=TEMP_RESOURCES value=1",
+        f"TAG_CHANGE Entity={private_local} tag=OVERLOAD_LOCKED value=1",
+        f"TAG_CHANGE Entity={private_local} tag=CURRENT_PLAYER value=1",
+        "TAG_CHANGE Entity=GameEntity tag=TURN value=9",
+        "TAG_CHANGE Entity=GameEntity tag=STEP value=MAIN_READY",
+    )
+
+    snapshot = parser.snapshot()
+    public_json = json.dumps(snapshot.to_public_dict(), ensure_ascii=False)
+
+    assert [event.kind for event in started] == ["game_started", "constructed_detected"]
+    assert snapshot.mode == "constructed"
+    assert snapshot.constructed is not None
+    assert snapshot.constructed.variant == "ranked"
+    assert snapshot.turn == 9
+    assert snapshot.round == 5
+    assert snapshot.active_side == "player"
+    assert snapshot.player.mana_max == 5
+    assert snapshot.player.mana_available == 4
+    assert snapshot.constructed.player.overload_locked == 1
+    assert private_local not in public_json
+    assert private_opponent not in public_json
+    assert all(private_local not in entity.name for entity in parser.entities.values())
+
+
+def test_constructed_snapshot_exposes_visible_local_cards_and_public_board_details() -> None:
+    parser = PowerLogParser()
+    feed(
+        parser,
+        "CREATE_GAME",
+        "Player EntityID=2 PlayerID=1 GameAccountId=[hi=0 lo=0]",
+        "Player EntityID=3 PlayerID=2 GameAccountId=[hi=0 lo=0]",
+        "SHOW_ENTITY - Updating Entity=[entityName=幸运币 id=40 zone=HAND zonePos=1 cardId= player=2] CardID=GAME_005",
+    )
+    parser.feed_line(
+        "D 12:00:00.0000000 GameState.DebugPrintGame() - GameType=GT_RANKED",
+        now=100.0,
+    )
+    add_entity(parser, 10, "HERO_08", controller=2, zone="PLAY", card_type="HERO")
+    feed(parser, "    tag=HEALTH value=30", "    tag=DAMAGE value=4", "    tag=ARMOR value=2")
+    add_entity(parser, 11, "CS2_034", controller=2, zone="PLAY", card_type="HERO_POWER")
+    feed(parser, "    tag=COST value=2", "    tag=EXHAUSTED value=0")
+    add_entity(parser, 12, "WEAPON_001", controller=2, zone="PLAY", card_type="WEAPON")
+    feed(parser, "    tag=ATK value=3", "    tag=HEALTH value=2", "    tag=DAMAGE value=1")
+    add_entity(parser, 20, "CS2_029", controller=2, zone="HAND", card_type="SPELL")
+    feed(parser, "    tag=ZONE_POSITION value=2", "    tag=COST value=3")
+    add_entity(parser, 21, "MINION_001", controller=2, zone="PLAY", card_type="MINION")
+    feed(
+        parser,
+        "    tag=ZONE_POSITION value=1",
+        "    tag=ATK value=4",
+        "    tag=HEALTH value=6",
+        "    tag=DAMAGE value=1",
+        "    tag=TAUNT value=1",
+    )
+    add_entity(parser, 22, "LOCATION_001", controller=2, zone="PLAY", card_type="LOCATION")
+    feed(
+        parser,
+        "    tag=ZONE_POSITION value=2",
+        "    tag=HEALTH value=3",
+        "    tag=DAMAGE value=1",
+        "    tag=EXHAUSTED value=1",
+    )
+    add_entity(parser, 30, "OPPONENT_PUBLIC", controller=1, zone="PLAY", card_type="MINION")
+    feed(parser, "    tag=ATK value=2", "    tag=HEALTH value=3")
+    add_entity(parser, 31, "OPPONENT_REVOKED", controller=1, zone="HAND", card_type="MINION")
+    feed(
+        parser,
+        "    tag=ATK value=99",
+        "    tag=HEALTH value=99",
+        "HIDE_ENTITY - Entity=[entityName=Secret id=31 zone=HAND zonePos=1 cardId=OPPONENT_REVOKED player=1] tag=1068 value=1",
+        "TAG_CHANGE Entity=31 tag=ZONE value=PLAY",
+    )
+
+    public = parser.snapshot().to_public_dict()
+    player = public["constructed"]["player"]
+    opponent = public["constructed"]["opponent"]
+
+    assert player["hero"]["card_id"] == "HERO_08"
+    assert player["hero"]["health"] == 26
+    assert player["hero_power"]["card_id"] == "CS2_034"
+    assert player["hero_power"]["cost"] == 2
+    assert player["weapon"]["attack"] == 3
+    assert player["weapon"]["durability"] == 1
+    hand = {card["card_id"]: card for card in player["hand"]["known_cards"]}
+    assert hand["CS2_029"]["cost"] == 3
+    assert [card["card_type"] for card in player["board"]["minions"]] == ["MINION"]
+    assert player["board"]["minions"][0]["keywords"] == ["taunt"]
+    assert player["locations"][0]["durability"] == 2
+    assert opponent["board"]["count"] == 1
+    assert opponent["board"]["attack"] == 2
+    assert [card["card_id"] for card in opponent["board"]["minions"]] == [
+        "OPPONENT_PUBLIC"
+    ]
+    assert opponent["hand"]["known_cards"] == []
+    assert "OPPONENT_REVOKED" not in json.dumps(public)
+
+
+def test_constructed_local_choice_is_exposed_then_cleared_without_player_name() -> None:
+    parser = PowerLogParser()
+    private_local = "PRIVATE_CHOICE_PLAYER#1234"
+    feed(
+        parser,
+        "CREATE_GAME",
+        "Player EntityID=2 PlayerID=1 GameAccountId=[hi=0 lo=0]",
+        "Player EntityID=3 PlayerID=2 GameAccountId=[hi=0 lo=0]",
+        "SHOW_ENTITY - Updating Entity=[entityName=幸运币 id=40 zone=HAND zonePos=1 cardId= player=2] CardID=GAME_005",
+    )
+    parser.feed_line(
+        f"D 12:00:00.0000000 GameState.DebugPrintGame() - PlayerID=2, PlayerName={private_local}",
+        now=101.0,
+    )
+    parser.feed_line(
+        "D 12:00:00.0000000 GameState.DebugPrintGame() - GameType=GT_RANKED",
+        now=101.1,
+    )
+    add_entity(parser, 50, "CHOICE_A", controller=2, zone="SETASIDE", card_type="SPELL")
+    feed(parser, "    tag=COST value=1")
+    add_entity(parser, 51, "CHOICE_B", controller=2, zone="SETASIDE", card_type="MINION")
+    feed(parser, "    tag=ATK value=2", "    tag=HEALTH value=3")
+
+    parser.feed_line(
+        f"D 12:00:00.0000000 GameState.DebugPrintEntityChoices() - id=7 Player={private_local} TaskList=9 ChoiceType=GENERAL CountMin=1 CountMax=1",
+        now=102.0,
+    )
+    parser.feed_line(
+        "D 12:00:00.0000000 GameState.DebugPrintEntityChoices() -   Source=GameEntity",
+        now=102.1,
+    )
+    parser.feed_line(
+        "D 12:00:00.0000000 GameState.DebugPrintEntityChoices() -   Entities[0]=[entityName=Option A id=50 zone=SETASIDE zonePos=0 cardId=CHOICE_A player=2]",
+        now=102.2,
+    )
+    parser.feed_line(
+        "D 12:00:00.0000000 GameState.DebugPrintEntityChoices() -   Entities[1]=[entityName=Option B id=51 zone=SETASIDE zonePos=0 cardId=CHOICE_B player=2]",
+        now=102.3,
+    )
+
+    public = parser.snapshot().to_public_dict()
+    assert public["choice"]["choice_type"] == "general"
+    assert public["choice"]["count_min"] == 1
+    assert public["choice"]["count_max"] == 1
+    assert public["choice"]["source"] is None
+    assert [card["card_id"] for card in public["choice"]["options"]] == [
+        "CHOICE_A",
+        "CHOICE_B",
+    ]
+    assert [card["card_type"] for card in public["choice"]["options"]] == [
+        "SPELL",
+        "MINION",
+    ]
+    assert private_local not in json.dumps(public)
+
+    parser.feed_line(
+        f"D 12:00:00.0000000 GameState.DebugPrintEntitiesChosen() - id=7 Player={private_local} EntitiesCount=1",
+        now=103.0,
+    )
+    assert parser.snapshot().choice is None
+
+
+def test_constructed_opponent_choice_identity_is_never_retained_or_exposed() -> None:
+    parser = PowerLogParser()
+    private_local = "PRIVATE_LOCAL#1000"
+    private_opponent = "PRIVATE_OPPONENT#2000"
+    feed(
+        parser,
+        "CREATE_GAME",
+        "Player EntityID=2 PlayerID=1 GameAccountId=[hi=0 lo=0]",
+        "Player EntityID=3 PlayerID=2 GameAccountId=[hi=0 lo=0]",
+        "SHOW_ENTITY - Updating Entity=[entityName=幸运币 id=40 zone=HAND zonePos=1 cardId= player=2] CardID=GAME_005",
+    )
+    parser.feed_line(
+        "D 12:00:00.0000000 GameState.DebugPrintGame() - GameType=GT_RANKED",
+        now=101.0,
+    )
+    for controller, player_name in ((1, private_opponent), (2, private_local)):
+        parser.feed_line(
+            f"D 12:00:00.0000000 GameState.DebugPrintGame() - PlayerID={controller}, PlayerName={player_name}",
+            now=101.1,
+        )
+    parser.feed_line(
+        f"D 12:00:00.0000000 GameState.DebugPrintEntityChoices() - id=9 Player={private_opponent} TaskList= ChoiceType=GENERAL CountMin=1 CountMax=1",
+        now=102.0,
+    )
+    parser.feed_line(
+        "D 12:00:00.0000000 GameState.DebugPrintEntityChoices() -   Entities[0]=[entityName=Opponent Secret Choice id=99 zone=SETASIDE zonePos=0 cardId=OPPONENT_CHOICE player=1]",
+        now=102.1,
+    )
+
+    public_json = json.dumps(parser.snapshot().to_public_dict(), ensure_ascii=False)
+
+    assert parser.snapshot().choice is None
+    assert 99 not in parser.entities
+    assert private_local not in repr(parser.__dict__)
+    assert private_opponent not in repr(parser.__dict__)
+    assert "OPPONENT_CHOICE" not in public_json
+    assert "Opponent Secret Choice" not in public_json
+
+
+def test_constructed_local_choice_can_use_option_controller_without_name_metadata() -> None:
+    parser = PowerLogParser()
+    feed(
+        parser,
+        "CREATE_GAME",
+        "Player EntityID=2 PlayerID=1 GameAccountId=[hi=0 lo=0]",
+        "Player EntityID=3 PlayerID=2 GameAccountId=[hi=0 lo=0]",
+        "SHOW_ENTITY - Updating Entity=[entityName=幸运币 id=40 zone=HAND zonePos=1 cardId= player=2] CardID=GAME_005",
+    )
+    parser.feed_line(
+        "D 12:00:00.0000000 GameState.DebugPrintGame() - GameType=GT_RANKED",
+        now=101.0,
+    )
+    parser.feed_line(
+        "D 12:00:00.0000000 GameState.DebugPrintEntityChoices() - id=11 Player=Unmapped TaskList=3 ChoiceType=GENERAL CountMin=1 CountMax=1",
+        now=102.0,
+    )
+    parser.feed_line(
+        "D 12:00:00.0000000 GameState.DebugPrintEntityChoices() -   Entities[0]=[entityName=Visible Option id=98 zone=SETASIDE zonePos=0 cardId=VISIBLE_CHOICE player=2]",
+        now=102.1,
+    )
+
+    choice = parser.snapshot().choice
+
+    assert choice is not None
+    assert [card.card_id for card in choice.options] == ["VISIBLE_CHOICE"]
+
+
+def test_constructed_game_type_builds_structured_public_state() -> None:
+    parser = PowerLogParser()
+    feed(
+        parser,
+        "CREATE_GAME",
+        "GameEntity EntityID=1",
+        "Player EntityID=2 PlayerID=3 GameAccountId=[hi=1 lo=2]",
+        "    tag=RESOURCES value=5",
+        "    tag=RESOURCES_USED value=2",
+        "Player EntityID=3 PlayerID=5 GameAccountId=[hi=3 lo=4]",
+    )
+    parser.feed_line(
+        "D 12:00:00.0000000 GameState.DebugPrintGame() - GameType=GT_RANKED_STANDARD",
+        now=100.0,
+    )
+    add_entity(parser, 40, "", controller=3, zone="HAND", card_type="SPELL")
+    feed(
+        parser,
+        "    tag=COST value=4",
+        "    tag=ZONE_POSITION value=1",
+        "SHOW_ENTITY - Updating Entity=[entityName=火球术 id=40 zone=HAND zonePos=1 cardId= player=3] CardID=CS2_029",
+    )
+    add_entity(parser, 10, "HERO_08", controller=3, zone="PLAY", card_type="HERO")
+    feed(parser, "    tag=HEALTH value=30", "    tag=DAMAGE value=4", "    tag=ARMOR value=2")
+    add_entity(parser, 20, "CS2_182", controller=3, zone="PLAY", card_type="MINION")
+    feed(
+        parser,
+        "    tag=ZONE_POSITION value=1",
+        "    tag=ATK value=3",
+        "    tag=HEALTH value=2",
+        "    tag=TAUNT value=1",
+    )
+    add_entity(parser, 21, "CS2_097", controller=3, zone="PLAY", card_type="WEAPON")
+    feed(parser, "    tag=ATK value=3", "    tag=DURABILITY value=2")
+    add_entity(parser, 22, "CS2_034", controller=3, zone="PLAY", card_type="HERO_POWER")
+    feed(parser, "    tag=COST value=2", "    tag=EXHAUSTED value=1")
+    add_entity(parser, 23, "REV_990", controller=3, zone="PLAY", card_type="LOCATION")
+    feed(parser, "    tag=ZONE_POSITION value=2", "    tag=DURABILITY value=3")
+    add_entity(parser, 50, "", controller=5, zone="HAND", card_type="SPELL")
+    add_entity(parser, 51, "", controller=5, zone="HAND", card_type="SPELL")
+    feed(
+        parser,
+        "SHOW_ENTITY - Updating Entity=[entityName=已揭示的牌 id=51 zone=HAND zonePos=2 cardId= player=5] CardID=EX1_001",
+    )
+
+    state = parser.snapshot().to_public_dict()
+
+    assert state["mode"] == "constructed"
+    assert state["constructed"]["game_type"] == "GT_RANKED_STANDARD"
+    assert state["constructed"]["format"] == "standard"
+    player = state["constructed"]["player"]
+    assert player["hero"]["health"] == 26
+    assert player["hero"]["armor"] == 2
+    assert player["mana"] == {
+        "available": 3,
+        "maximum": 5,
+        "overload_owed": 0,
+        "overload_locked": 0,
+    }
+    assert player["hand"]["count"] == 1
+    assert player["hand"]["identities_complete"] is True
+    assert player["hand"]["known_cards"][0]["card_id"] == "CS2_029"
+    assert player["hand"]["known_cards"][0]["cost"] == 4
+    assert player["board"]["minions"][0]["card_id"] == "CS2_182"
+    assert player["board"]["minions"][0]["keywords"] == ["taunt"]
+    assert player["weapon"]["durability"] == 2
+    assert player["hero_power"]["states"] == ["exhausted"]
+    assert player["locations"][0]["card_id"] == "REV_990"
+    opponent_hand = state["constructed"]["opponent"]["hand"]
+    assert opponent_hand["count"] == 2
+    assert opponent_hand["identities_complete"] is False
+    assert [card["card_id"] for card in opponent_hand["known_cards"]] == ["EX1_001"]
+
+
+def test_constructed_aggregates_exclude_hidden_entities_and_old_heroes() -> None:
+    parser = PowerLogParser()
+    feed(
+        parser,
+        "CREATE_GAME",
+        "Player EntityID=2 PlayerID=1 GameAccountId=[hi=1 lo=2]",
+        "Player EntityID=3 PlayerID=2 GameAccountId=[hi=3 lo=4]",
+        "SHOW_ENTITY - Updating Entity=[entityName=幸运币 id=40 zone=HAND zonePos=1 cardId= player=1] CardID=GAME_005",
+    )
+    parser.feed_line(
+        "D 12:00:00.0000000 GameState.DebugPrintGame() - GameType=GT_CASUAL",
+        now=100.0,
+    )
+    add_entity(parser, 10, "HERO_OLD", controller=1, zone="PLAY", card_type="HERO")
+    feed(parser, "    tag=HEALTH value=30", "    tag=DAMAGE value=20")
+    add_entity(parser, 11, "HERO_NEW", controller=1, zone="PLAY", card_type="HERO")
+    feed(parser, "    tag=HEALTH value=40", "    tag=DAMAGE value=3")
+    add_entity(parser, 20, "PRIVATE_MINION", controller=2, zone="PLAY", card_type="MINION")
+    feed(
+        parser,
+        "    tag=ATK value=9",
+        "    tag=HEALTH value=9",
+        "HIDE_ENTITY - Entity=[entityName=Private id=20 zone=PLAY zonePos=1 cardId=PRIVATE_MINION player=2] tag=1068 value=1",
+        "HIDE_ENTITY - Entity=[entityName=Old Hero id=10 zone=PLAY zonePos=0 cardId=HERO_OLD player=1] tag=1068 value=1",
+    )
+
+    state = parser.snapshot().to_public_dict()
+
+    assert state["player"]["health"] == 37
+    assert state["opponent"]["board"] == {
+        "count": 0,
+        "attack": 0,
+        "health": 0,
+        "cards": [],
+    }
+    assert state["constructed"]["player"]["hero"]["card_id"] == "HERO_NEW"
+    assert state["constructed"]["opponent"]["board"]["minions"] == []
+    assert "PRIVATE_MINION" not in json.dumps(state, ensure_ascii=False)
+
+
+def test_constructed_opponent_ignores_controller_zero_system_entities() -> None:
+    parser = PowerLogParser()
+    feed(
+        parser,
+        "CREATE_GAME",
+        "Player EntityID=2 PlayerID=1 GameAccountId=[hi=0 lo=0]",
+        "Player EntityID=3 PlayerID=2 GameAccountId=[hi=0 lo=0]",
+        "SHOW_ENTITY - Updating Entity=[entityName=幸运币 id=40 zone=HAND zonePos=1 cardId= player=2] CardID=GAME_005",
+    )
+    parser.feed_line(
+        "D 12:00:00.0000000 GameState.DebugPrintGame() - GameType=GT_RANKED",
+        now=100.0,
+    )
+    add_entity(parser, 30, "OPPONENT_BOARD", controller=1, zone="PLAY", card_type="MINION")
+    feed(parser, "    tag=ATK value=3", "    tag=HEALTH value=4")
+    add_entity(parser, 90, "SYSTEM_EFFECT", controller=0, zone="PLAY", card_type="ENCHANTMENT")
+
+    snapshot = parser.snapshot()
+
+    assert parser._opponent_controller() == 1
+    assert snapshot.opponent.board_count == 1
+    assert snapshot.constructed is not None
+    assert [card.card_id for card in snapshot.constructed.opponent.board] == [
+        "OPPONENT_BOARD"
+    ]
 
 
 def test_spectator_state_survives_create_game_until_explicit_end() -> None:
@@ -511,6 +993,73 @@ def test_battlegrounds_public_snapshot_never_exposes_hidden_shop_entity() -> Non
     assert "UNKNOWN ENTITY" not in encoded
     assert parser.snapshot().battlegrounds is not None
     assert parser.snapshot().battlegrounds.shop == ()
+
+
+def test_battlegrounds_shop_uses_newest_public_entity_per_position() -> None:
+    parser = PowerLogParser()
+    feed(
+        parser,
+        "CREATE_GAME",
+        "Player EntityID=8 PlayerID=3 GameAccountId=[hi=0 lo=0]",
+        "Player EntityID=9 PlayerID=11 GameAccountId=[hi=0 lo=0]",
+        "    tag=BACON_DUMMY_PLAYER value=1",
+        "TAG_CHANGE Entity=8 tag=MULLIGAN_STATE value=DONE",
+    )
+    for entity_id, card_id, position in (
+        (300, "BG_OLD_SLOT_ONE", 1),
+        (301, "BG_OLD_SLOT_TWO", 2),
+        (500, "BG_CURRENT_SLOT_ONE", 1),
+        (501, "BG_CURRENT_SLOT_TWO", 2),
+        (502, "Bacon_TagTransferPlayerE", 0),
+    ):
+        add_entity(
+            parser,
+            entity_id,
+            card_id,
+            controller=11,
+            zone="PLAY",
+            card_type="MINION",
+        )
+        feed(parser, f"    tag=ZONE_POSITION value={position}")
+
+    battlegrounds = parser.snapshot().battlegrounds
+
+    assert battlegrounds is not None
+    assert [card.card_id for card in battlegrounds.shop] == [
+        "BG_CURRENT_SLOT_ONE",
+        "BG_CURRENT_SLOT_TWO",
+    ]
+
+
+def test_battlegrounds_setup_signals_do_not_close_live_hero_selection() -> None:
+    parser = PowerLogParser()
+    feed(
+        parser,
+        "CREATE_GAME",
+        "Player EntityID=8 PlayerID=3 GameAccountId=[hi=0 lo=0]",
+        "Player EntityID=9 PlayerID=11 GameAccountId=[hi=0 lo=0]",
+        "    tag=BACON_DUMMY_PLAYER value=1",
+    )
+    add_entity(
+        parser,
+        91,
+        "BG_HERO_CHOICE",
+        controller=3,
+        zone="HAND",
+        card_type="HERO",
+    )
+    feed(parser, "    tag=BACON_HERO_CAN_BE_DRAFTED value=1")
+
+    feed(
+        parser,
+        "TAG_CHANGE Entity=8 tag=CURRENT_PLAYER value=1",
+        "TAG_CHANGE Entity=GameEntity tag=STEP value=BEGIN_MULLIGAN",
+    )
+
+    battlegrounds = parser.snapshot().battlegrounds
+    assert parser.snapshot().phase == "hero_select"
+    assert battlegrounds is not None
+    assert [choice.card_id for choice in battlegrounds.hero_choices] == ["BG_HERO_CHOICE"]
 
 
 def test_battlegrounds_combat_edge_does_not_record_previous_bob_shop_as_opponent() -> None:
@@ -887,7 +1436,7 @@ def test_battlegrounds_rehidden_known_card_never_exposes_card_id_or_stats() -> N
         "Player EntityID=8 PlayerID=3 GameAccountId=[hi=0 lo=0]",
         "Player EntityID=9 PlayerID=11 GameAccountId=[hi=0 lo=0]",
         "    tag=BACON_DUMMY_PLAYER value=1",
-        "TAG_CHANGE Entity=8 tag=CURRENT_PLAYER value=1",
+        "TAG_CHANGE Entity=8 tag=MULLIGAN_STATE value=DONE",
     )
     add_entity(parser, 400, "BG_SECRET", controller=11, zone="PLAY", card_type="MINION")
     feed(
@@ -923,7 +1472,7 @@ def test_numeric_battleground_spell_appears_in_recruit_shop() -> None:
         "Player EntityID=8 PlayerID=3 GameAccountId=[hi=0 lo=0]",
         "Player EntityID=9 PlayerID=11 GameAccountId=[hi=0 lo=0]",
         "    tag=BACON_DUMMY_PLAYER value=1",
-        "TAG_CHANGE Entity=8 tag=CURRENT_PLAYER value=1",
+        "TAG_CHANGE Entity=8 tag=MULLIGAN_STATE value=DONE",
     )
     add_entity(parser, 420, "BG_SPELL", controller=11, zone="PLAY", card_type="42")
 

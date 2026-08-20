@@ -198,7 +198,145 @@ def _compact_battlegrounds(value: Any) -> dict[str, Any] | None:
     }
 
 
-def _prompt_prefix(max_reply_chars: int, *, terminal: bool) -> str:
+def _compact_constructed(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+
+    def compact_side(raw: Any) -> dict[str, Any]:
+        side = raw if isinstance(raw, Mapping) else {}
+        hand = side.get("hand") if isinstance(side.get("hand"), Mapping) else {}
+        board = side.get("board") if isinstance(side.get("board"), Mapping) else {}
+        return {
+            "hero": _bounded_json_value(side.get("hero"), string_limit=40, list_limit=4),
+            "mana": _bounded_json_value(side.get("mana"), string_limit=40, list_limit=4),
+            "hand": {
+                "count": hand.get("count"),
+                "identities_complete": hand.get("identities_complete"),
+            },
+            "deck": _bounded_json_value(side.get("deck"), string_limit=40, list_limit=4),
+            "secrets": _bounded_json_value(
+                side.get("secrets"), string_limit=40, list_limit=4
+            ),
+            "board": {
+                "count": board.get("count"),
+                "attack": board.get("attack"),
+                "health": board.get("health"),
+                "minions": _bounded_json_value(
+                    board.get("minions") or (), string_limit=40, list_limit=7
+                ),
+            },
+            "weapon": _bounded_json_value(
+                side.get("weapon"), string_limit=40, list_limit=4
+            ),
+            "hero_power": _bounded_json_value(
+                side.get("hero_power"), string_limit=40, list_limit=4
+            ),
+            "locations": _bounded_json_value(
+                side.get("locations") or (), string_limit=40, list_limit=2
+            ),
+        }
+
+    return {
+        "game_type": value.get("game_type"),
+        "format": value.get("format"),
+        "variant": value.get("variant"),
+        "player": compact_side(value.get("player")),
+        "opponent": compact_side(value.get("opponent")),
+    }
+
+
+def _compact_choice(value: Any, *, option_limit: int = 8) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    return {
+        "choice_type": value.get("choice_type"),
+        "count_min": value.get("count_min"),
+        "count_max": value.get("count_max"),
+        "option_count": min(
+            max(0, int(value.get("option_count") or len(list(value.get("options") or [])))),
+            max(0, int(option_limit)),
+        ),
+    }
+
+
+def _minimal_constructed(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+
+    def compact_side(raw: Any) -> dict[str, Any]:
+        side = raw if isinstance(raw, Mapping) else {}
+        hero = side.get("hero") if isinstance(side.get("hero"), Mapping) else {}
+        mana = side.get("mana") if isinstance(side.get("mana"), Mapping) else {}
+        hand = side.get("hand") if isinstance(side.get("hand"), Mapping) else {}
+        board = side.get("board") if isinstance(side.get("board"), Mapping) else {}
+        return {
+            "effective_health": hero.get("effective_health"),
+            "mana_available": mana.get("available"),
+            "mana_max": mana.get("maximum"),
+            "hand_count": hand.get("count"),
+            "board_count": board.get("count"),
+            "board_attack": board.get("attack"),
+            "board_health": board.get("health"),
+        }
+
+    return {
+        "variant": str(value.get("variant") or "")[:24],
+        "player": compact_side(value.get("player")),
+        "opponent": compact_side(value.get("opponent")),
+    }
+
+
+def _minimal_battlegrounds(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    lobby = [item for item in list(value.get("lobby") or [])[:8] if isinstance(item, Mapping)]
+
+    def compact_player(player: Mapping[str, Any] | None) -> dict[str, Any] | None:
+        if player is None:
+            return None
+        board = player.get("board") if isinstance(player.get("board"), Mapping) else {}
+        return {
+            "hero": str(player.get("hero_card_id") or "")[:24],
+            "health": player.get("health"),
+            "armor": player.get("armor"),
+            "tavern_tier": player.get("tavern_tier"),
+            "placement": player.get("placement"),
+            "last_seen_round": player.get("last_seen_round"),
+            "board": {
+                "count": board.get("count"),
+                "attack": board.get("attack"),
+                "health": board.get("health"),
+            },
+        }
+
+    return {
+        "variant": str(value.get("variant") or "")[:16],
+        "round": value.get("round"),
+        "phase": value.get("phase"),
+        "gold": value.get("gold"),
+        "tavern_tier": value.get("tavern_tier"),
+        "placement": value.get("placement"),
+        "local": compact_player(next((item for item in lobby if item.get("is_local")), None)),
+        "next_opponent": compact_player(
+            next((item for item in lobby if item.get("next_opponent")), None)
+        ),
+        "shop_count": len(list(value.get("shop") or [])),
+        "warband_count": len(list(value.get("warband") or [])),
+    }
+
+
+def _prompt_prefix(
+    max_reply_chars: int,
+    *,
+    terminal: bool,
+    context_already_included: bool,
+) -> str:
+    if context_already_included:
+        return (
+            f"只输出一句不超过 {max_reply_chars} 个汉字的即时情绪短评，只输出台词。"
+            + ("这是本局最后一句；说完后结束炉石场景。" if terminal else "")
+            + "公开局势 JSON："
+        )
     return (
         "Hearthstone companion commentary boundary:\n"
         "- 保持当前 N.E.K.O 角色的人设和自然猫娘语气。\n"
@@ -223,14 +361,28 @@ def build_llm_prompt(
     *,
     max_reply_chars: int = 28,
     max_prompt_chars: int = 1800,
+    context_already_included: bool = False,
 ) -> str:
     terminal = event.kind in {"battlegrounds_game_ended", "game_ended"}
-    prefix = _prompt_prefix(max(1, int(max_reply_chars)), terminal=terminal)
+    prefix = _prompt_prefix(
+        max(1, int(max_reply_chars)),
+        terminal=terminal,
+        context_already_included=bool(context_already_included),
+    )
     limit = int(max_prompt_chars)
     if limit <= len(prefix) + 96:
         raise ValueError("max_prompt_chars is too small for the commentary contract")
 
     public_state = copy.deepcopy(snapshot.to_public_dict())
+    public_state["constructed"] = _compact_constructed(public_state.get("constructed"))
+    choice = public_state.get("choice")
+    if isinstance(choice, Mapping):
+        public_state["choice"] = {
+            "choice_type": choice.get("choice_type"),
+            "count_min": choice.get("count_min"),
+            "count_max": choice.get("count_max"),
+            "option_count": len(list(choice.get("options") or ())),
+        }
     event_payload = {
         "kind": str(event.kind)[:64],
         "priority": max(0, min(10, int(event.priority))),
@@ -238,6 +390,21 @@ def build_llm_prompt(
         "details": _bounded_json_value(dict(event.details), string_limit=80, list_limit=8),
     }
     emotion = build_emotion_cue(event, snapshot)
+    minimal_state = {
+        "mode": public_state.get("mode"),
+        "phase": public_state.get("phase"),
+        "round": public_state.get("round"),
+        "active_side": public_state.get("active_side"),
+        "result": public_state.get("result"),
+        "constructed": _minimal_constructed(public_state.get("constructed")),
+        "battlegrounds": _minimal_battlegrounds(public_state.get("battlegrounds")),
+        "choice": _compact_choice(public_state.get("choice"), option_limit=2),
+    }
+    minimal_state = {
+        key: value
+        for key, value in minimal_state.items()
+        if value is not None and value != ""
+    }
     candidates: list[dict[str, Any]] = [
         {
             "event": event_payload,
@@ -251,11 +418,15 @@ def build_llm_prompt(
                 "phase": public_state.get("phase"),
                 "game_number": public_state.get("game_number"),
                 "turn": public_state.get("turn"),
+                "round": public_state.get("round"),
+                "active_side": public_state.get("active_side"),
                 "result": public_state.get("result"),
                 "player": public_state.get("player"),
                 "opponent": public_state.get("opponent"),
                 "recent_cards": list(public_state.get("recent_cards") or [])[-3:],
+                "constructed": _compact_constructed(public_state.get("constructed")),
                 "battlegrounds": _compact_battlegrounds(public_state.get("battlegrounds")),
+                "choice": _compact_choice(public_state.get("choice")),
             },
             "emotion_cue": emotion,
         },
@@ -265,8 +436,13 @@ def build_llm_prompt(
                 "mode": public_state.get("mode"),
                 "phase": public_state.get("phase"),
                 "game_number": public_state.get("game_number"),
+                "turn": public_state.get("turn"),
+                "round": public_state.get("round"),
+                "active_side": public_state.get("active_side"),
                 "result": public_state.get("result"),
+                "constructed": _compact_constructed(public_state.get("constructed")),
                 "battlegrounds": _compact_battlegrounds(public_state.get("battlegrounds")),
+                "choice": _compact_choice(public_state.get("choice"), option_limit=4),
             },
             "emotion_cue": emotion,
         },
@@ -276,27 +452,7 @@ def build_llm_prompt(
                 "priority": event_payload["priority"],
                 "summary": str(event_payload["summary"])[:48],
             },
-            "state": {
-                "mode": public_state.get("mode"),
-                "phase": public_state.get("phase"),
-                "game_number": public_state.get("game_number"),
-                "result": public_state.get("result"),
-                "battlegrounds": {
-                    key: value
-                    for key, value in (_compact_battlegrounds(public_state.get("battlegrounds")) or {}).items()
-                    if key
-                    in {
-                        "variant",
-                        "round",
-                        "phase",
-                        "gold",
-                        "tavern_tier",
-                        "placement",
-                        "local",
-                    }
-                }
-                or None,
-            },
+            "state": minimal_state,
             "emotion_cue": emotion,
         },
     ]

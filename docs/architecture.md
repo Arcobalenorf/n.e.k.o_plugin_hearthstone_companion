@@ -29,7 +29,9 @@ CompanionMonitor single-owner pipeline
         +--> fixed target scene enter/leave --> [] + read --> context / restore
         +--> active role per message --> inline context + [] + respond
 
-User question --> hearthstone_battlegrounds_advice
+Constructed question --> hearthstone_current_state --> fresh player-visible snapshot --> NEKO answer
+
+Battlegrounds question --> hearthstone_battlegrounds_advice
         |
         +--> live public snapshot + attributed card facts + official rules + local sample stats
         +--> tool result returns to NEKO; the character writes the answer
@@ -45,11 +47,15 @@ hsbg.cards public API --> fixed-origin background GET --> atomic cache --> obser
 
 实时链路按日志职责合并而不是二选一：`PowerTaskList.DebugPrintPower` 是动态实体、tag 和 block 的权威实时流；`GameState.DebugPrintGame` 提供模式元数据；`GameState.DebugPrintPower` 只提供最早的新局边界、受限静态实体补全和 `STATE=COMPLETE`/终局 `PLAYSTATE`。新局静态包先进入隔离暂存区，直到 PowerTaskList 确认 `CREATE_GAME` 后才提交；进行中的静态补全只能填空，不能覆盖 PowerTaskList 已观察字段，也不能恢复被 `HIDE_ENTITY` 撤销的可见性。
 
+普通对战中的 `CURRENT_PLAYER`、`RESOURCES` 等 tag 可能用临时玩家显示名引用 entity。解析器只在进程内用随机密钥生成摘要并映射到 `PlayerID`；原始显示名不会写入 Entity、快照、日志、Store 或模型上下文。`TURN` 保留为原始行动回合，用户口语中的完整轮次为 `(TURN+1)//2`。换牌阶段可能已经出现初始 `TURN=1` 和首手玩家标记，因此在双方 `MULLIGAN_STATE=DONE` 或 `STEP=MAIN_READY` 前，公开轮次固定为 `0`、行动方为 `unknown`；完成边沿会立即补发首回合状态，不等待下一次 `TURN`。行动方的 `CURRENT_PLAYER=0` 边沿会先清空旧值，再由下一方的正边沿重新建立，工具不会在切换空窗沿用上一方。
+
 战棋实现不假设本地 `PlayerID=1`。Bob 通过 `BACON_DUMMY_PLAYER` 识别；大厅由带 `PLAYER_ID` 的英雄实体组成；单排和双排分别使用可验证的战斗状态 tag；最终名次来自本地英雄的 `PLAYER_LEADERBOARD_PLACE`。
 
 对手战团是过去战斗中看到的公开信息，快照始终携带 `last_seen_round` 和 `is_last_observed`，禁止把它描述成当前阵容。战斗边沿只隔离上一轮 Bob 商店；只有实体出现明确的 `ATTACKING/DEFENDING` 战斗标记后，才在每场公开战斗开始时冻结首次确认的阵容。插件按对手保留最近一次观察，同一场战斗中产生的召唤物、变形或死亡不会改写这份记录。记录保留随从 CardID、名称、攻血和星级，供后续陪伴回忆和规则事实查询。缺失 `CARDTYPE` 的实体必须额外具备合法站位或攻血联合证据，内部效果实体不能仅凭 CardID 进入公开战团。`snapshot()` 与 `to_public_dict()` 必须保持纯读，UI 刷新或工具查询频率不能改变解析结果。
 
-英雄选择快照只收集 `Power.log` 明确归属于本地 controller、未隐藏、未锁定且带可选/皮肤标记的英雄。候选持续保留到本地玩家明确出现 `MULLIGAN_STATE=DONE`；选择完成标记在一局内单调，迟到的 INPUT/DEALING 镜像不会重新打开候选，普通招募阶段信号也不会提前清空。它不根据卡池、远端玩家或缺失日志补猜候选；选择完成后的我方英雄仍由大厅实体识别。普通构筑快照只公开我方手牌数量，不包含具体手牌身份；因此它适合公开场面、生命和法力层面的陪伴，不支持可靠的逐张手牌出牌建议。
+英雄选择快照只收集 `Power.log` 明确归属于本地 controller、未隐藏、未锁定且带可选/皮肤标记的英雄。候选持续保留到本地玩家明确出现 `MULLIGAN_STATE=DONE`；选择完成标记在一局内单调，迟到的 INPUT/DEALING 镜像不会重新打开候选，普通招募阶段信号也不会提前清空。它不根据卡池、远端玩家或缺失日志补猜候选；选择完成后的我方英雄仍由大厅实体识别。
+
+普通对战使用独立 `ConstructedSnapshot`。它包含对局类型、模式变体、双方英雄与公开资源、我方当前可见手牌、公开场面、英雄技能、武器、地标、过载、疲劳、最近公开出牌及本地 Choice 选项。动态费用只在实体具有实时 `COST` 时提供；缺失时为 `null`，不以静态卡库猜测。对手手牌只公开数量和确实揭示且尚未撤销的 identity；未揭示手牌、奥秘身份、牌序和完整合法操作集合始终不可用。Choice 流按本地玩家摘要映射过滤，对手选项不进入公开快照。
 
 ## 陪伴调度
 
@@ -62,7 +68,11 @@ hsbg.cards public API --> fixed-origin background GET --> atomic cache --> obser
 - 普通或关键冷却结束；
 - 用户最近 30 秒没有聊天，除非事件优先级达到 9。
 
-单次请求包含事件事实、公开快照和 `emotion_cue`。提示要求保持当前角色人设、只依据公开事实、避免机械报字段，并限制主动发言为一句。低血量、三连、升本、战斗和结算只决定情绪方向，不决定角色具体措辞。
+单次请求包含事件事实、适合情绪陪伴的精简快照和 `emotion_cue`。普通对战主动短评只携带手牌数量，不持续发送具体手牌或 Choice identity；用户主动提问时才由工具按需提供完整玩家可见状态。提示要求保持当前角色人设、只依据已给事实、避免机械报字段，并限制主动发言为一句。低血量、三连、升本、战斗和结算只决定情绪方向，不决定角色具体措辞。
+
+## 普通对战状态工具
+
+`hearthstone_current_state` 是普通对战当前事实与决策问题的只读入口。角色回答回合、行动方、资源、当前手牌/场面、应打哪张牌或当前选择项前必须重新调用，不能依赖之前的主动短评。结果携带逐项 capability：是否读到回合、行动方、我方可见手牌、完整手牌 identity 和 Choice；`complete_legal_actions` 固定为 `false`，防止把局势分析说成完整求解器结论。酒馆策略仍必须路由到专用工具。
 
 显式配置非空 `target_lanlan` 时，场景进入发送 `visibility=[] + ai_behavior="read"`；关键事件发送定向的 `visibility=[] + ai_behavior="respond"`；场景结束、停止监听、关闭插件、撤销同意或更换显式目标时发送恢复 `read`。目标为空时不解析或冻结宿主的活动角色 ID、不注入跨消息场景，也不发送 `target_lanlan` 或 `coalesce_key`；每条 `respond` 都内嵌完整陪伴约束，由宿主逐消息选择当时的活动角色。
 
@@ -100,7 +110,7 @@ Plugin Store 长期只保存赛季/模式/英雄维度的聚合计数。N.E.K.O 
 | --- | --- | --- |
 | `monitor_on_start` | `true` | 启动后监听日志 |
 | `initial_read_max_bytes` | `67108864` | 首次本地恢复最多读取 64 MiB |
-| `llm_data_consent` | `false` | 允许工具/上下文读取过滤后的公开局势 |
+| `llm_data_consent` | `false` | 允许工具/上下文读取过滤后的玩家可见局势 |
 | `llm_commentary_enabled` | `false` | 允许角色主动解说 |
 | `llm_min_priority` | `5` | 主动事件最低优先级 |
 | `llm_cooldown_seconds` | `25` | 普通主动解说冷却 |

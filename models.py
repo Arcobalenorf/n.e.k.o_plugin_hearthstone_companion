@@ -45,7 +45,7 @@ class Entity:
         return max(0, self.tag_int("ATK"))
 
     def public_name(self) -> str:
-        if self.hidden:
+        if self.hidden or self.visibility_revoked:
             return ""
         normalized_name = " ".join(self.name.split()).strip()
         if normalized_name.upper().startswith("UNKNOWN ENTITY"):
@@ -102,6 +102,157 @@ class SideSnapshot:
                 "health": self.board_health,
                 "cards": list(self.board_cards),
             },
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ConstructedCardSnapshot:
+    card_id: str = ""
+    name: str = ""
+    card_type: str = ""
+    zone_position: int = 0
+    cost: int | None = None
+    attack: int | None = None
+    health: int | None = None
+    max_health: int | None = None
+    durability: int | None = None
+    exhausted: bool | None = None
+    keywords: tuple[str, ...] = ()
+    states: tuple[str, ...] = ()
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "card_id": self.card_id,
+            "name": self.name,
+            "card_type": self.card_type,
+            "zone_position": self.zone_position,
+            "cost": self.cost,
+            "attack": self.attack,
+            "health": self.health,
+            "max_health": self.max_health,
+            "durability": self.durability,
+            "exhausted": self.exhausted,
+            "keywords": list(self.keywords),
+            "states": list(self.states),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ConstructedHeroSnapshot:
+    card_id: str = ""
+    name: str = ""
+    health: int | None = None
+    armor: int = 0
+    attack: int = 0
+    states: tuple[str, ...] = ()
+
+    @property
+    def effective_health(self) -> int | None:
+        return None if self.health is None else self.health + self.armor
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "card_id": self.card_id,
+            "name": self.name,
+            "health": self.health,
+            "armor": self.armor,
+            "effective_health": self.effective_health,
+            "attack": self.attack,
+            "states": list(self.states),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ConstructedSideSnapshot:
+    hero: ConstructedHeroSnapshot | None = None
+    mana_available: int | None = None
+    mana_max: int | None = None
+    overload_owed: int = 0
+    overload_locked: int = 0
+    hand_count: int = 0
+    known_hand: tuple[ConstructedCardSnapshot, ...] = ()
+    hand_identities_complete: bool = False
+    deck_count: int = 0
+    fatigue: int = 0
+    cards_played_this_turn: int = 0
+    secret_count: int = 0
+    board: tuple[ConstructedCardSnapshot, ...] = ()
+    weapon: ConstructedCardSnapshot | None = None
+    hero_power: ConstructedCardSnapshot | None = None
+    locations: tuple[ConstructedCardSnapshot, ...] = ()
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "hero": self.hero.to_public_dict() if self.hero else None,
+            "mana": {
+                "available": self.mana_available,
+                "maximum": self.mana_max,
+                "overload_owed": self.overload_owed,
+                "overload_locked": self.overload_locked,
+            },
+            "hand": {
+                "count": self.hand_count,
+                "known_cards": [card.to_public_dict() for card in self.known_hand],
+                "identities_complete": self.hand_identities_complete,
+            },
+            "deck": {
+                "count": self.deck_count,
+                "fatigue": self.fatigue,
+            },
+            "cards_played_this_turn": self.cards_played_this_turn,
+            "secrets": {"count": self.secret_count},
+            "board": {
+                "count": len(self.board),
+                "attack": sum(card.attack or 0 for card in self.board),
+                "health": sum(card.health or 0 for card in self.board),
+                "minions": [card.to_public_dict() for card in self.board],
+            },
+            "weapon": self.weapon.to_public_dict() if self.weapon else None,
+            "hero_power": self.hero_power.to_public_dict() if self.hero_power else None,
+            "locations": [card.to_public_dict() for card in self.locations],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ConstructedSnapshot:
+    game_type: str = ""
+    format: str = "unknown"
+    variant: str = "unknown"
+    player: ConstructedSideSnapshot = field(default_factory=ConstructedSideSnapshot)
+    opponent: ConstructedSideSnapshot = field(default_factory=ConstructedSideSnapshot)
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "game_type": self.game_type,
+            "format": self.format,
+            "variant": self.variant,
+            "player": self.player.to_public_dict(),
+            "opponent": self.opponent.to_public_dict(),
+            "capabilities": {
+                "own_hand_identities_complete": self.player.hand_identities_complete,
+                "complete_action_legality": False,
+                "hidden_information": False,
+                "automatic_gameplay": False,
+            },
+            "source": "power_log",
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ChoiceSnapshot:
+    choice_type: str = "unknown"
+    count_min: int = 0
+    count_max: int = 0
+    source: ConstructedCardSnapshot | None = None
+    options: tuple[ConstructedCardSnapshot, ...] = ()
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "choice_type": self.choice_type,
+            "count_min": self.count_min,
+            "count_max": self.count_max,
+            "source": self.source.to_public_dict() if self.source else None,
+            "options": [card.to_public_dict() for card in self.options],
         }
 
 
@@ -234,12 +385,15 @@ class GameSnapshot:
     phase: str = "idle"
     game_number: int = 0
     turn: int = 0
+    round: int = 0
     active_side: str = "unknown"
     player: SideSnapshot = field(default_factory=SideSnapshot)
     opponent: SideSnapshot = field(default_factory=SideSnapshot)
     recent_cards: tuple[dict[str, Any], ...] = ()
     result: str = ""
+    constructed: ConstructedSnapshot | None = None
     battlegrounds: BattlegroundsSnapshot | None = None
+    choice: ChoiceSnapshot | None = None
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
@@ -247,12 +401,15 @@ class GameSnapshot:
             "phase": self.phase,
             "game_number": self.game_number,
             "turn": self.turn,
+            "round": self.round,
             "active_side": self.active_side,
             "player": self.player.to_public_dict(),
             "opponent": self.opponent.to_public_dict(),
             "recent_cards": [dict(item) for item in self.recent_cards],
             "result": self.result,
+            "constructed": self.constructed.to_public_dict() if self.constructed else None,
             "battlegrounds": self.battlegrounds.to_public_dict() if self.battlegrounds else None,
+            "choice": self.choice.to_public_dict() if self.choice else None,
         }
 
 
