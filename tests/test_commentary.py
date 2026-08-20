@@ -11,6 +11,7 @@ from hearthstone_companion_under_test.commentary import (
 from hearthstone_companion_under_test.config import CompanionConfig
 from hearthstone_companion_under_test.models import (
     BattlegroundsCardSnapshot,
+    BattlegroundsHeroChoiceSnapshot,
     BattlegroundsPlayerSnapshot,
     BattlegroundsSnapshot,
     GameEvent,
@@ -91,6 +92,48 @@ def test_llm_prompt_delegates_visible_wording_to_current_neko_character() -> Non
     assert '"emotion_cue"' in prompt
     assert "公开局势 JSON" in prompt
     assert "这一击真疼" not in prompt
+
+
+def test_battlegrounds_prompt_includes_hero_choices_and_observed_opponent_board() -> None:
+    snapshot = GameSnapshot(
+        mode="battlegrounds",
+        phase="hero_select",
+        game_number=1,
+        battlegrounds=BattlegroundsSnapshot(
+            phase="hero_select",
+            hero_choices=(
+                BattlegroundsHeroChoiceSnapshot(card_id="BG_HERO_A", name="候选英雄"),
+            ),
+            lobby=(
+                BattlegroundsPlayerSnapshot(player_id=1, is_local=True),
+                BattlegroundsPlayerSnapshot(
+                    player_id=2,
+                    next_opponent=True,
+                    last_seen_round=2,
+                    board_count=1,
+                    board_cards=("见过的随从",),
+                    board_minions=(
+                        BattlegroundsCardSnapshot(
+                            card_id="BG_MINION_A",
+                            name="见过的随从",
+                            attack=4,
+                            health=5,
+                            tier=2,
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    prompt = build_llm_prompt(
+        GameEvent("battlegrounds_detected", 7, "进入酒馆", 100.0, {}),
+        snapshot,
+    )
+
+    assert "BG_HERO_A" in prompt
+    assert "BG_MINION_A" in prompt
+    assert "last_seen_round" in prompt
 
 
 def test_rejected_delivery_does_not_burn_cooldown_or_semantic_key() -> None:

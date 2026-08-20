@@ -16,7 +16,7 @@ from hearthstone_companion_under_test.models import (
 from hearthstone_companion_under_test.monitor import CompanionMonitor
 from hearthstone_companion_under_test.tailer import TailBatch
 
-PREFIX = "D 12:00:00.0000000 GameState.DebugPrintPower() - "
+PREFIX = "D 12:00:00.0000000 PowerTaskList.DebugPrintPower() - "
 
 
 def _line(payload: str) -> str:
@@ -110,9 +110,10 @@ def test_active_constructed_bootstrap_notifies_state_ready_without_replaying_eve
 def test_active_battlegrounds_bootstrap_notifies_state_ready_before_first_turn() -> None:
     path = Path("battlegrounds/Power.log")
     lines = (
+        "D 12:00:00.0000000 GameState.DebugPrintPower() - CREATE_GAME",
+        "D 12:00:00.0000000 GameState.DebugPrintGame() - GameType=GT_BATTLEGROUNDS",
         _line("CREATE_GAME"),
         _line("GameEntity EntityID=1"),
-        "D 12:00:00.0000000 GameState.DebugPrintGame() - GameType=GT_BATTLEGROUNDS",
     )
 
     monitor, observed, llm_events, results = _run_bootstrap_batches(

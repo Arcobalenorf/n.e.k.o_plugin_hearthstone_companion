@@ -342,9 +342,9 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
       } catch {
         // Background refresh is best-effort and must not create recurring alerts.
       }
-      if (!cancelled) timerId = window.setTimeout(refreshLater, 2500)
+      if (!cancelled) timerId = window.setTimeout(refreshLater, 500)
     }
-    timerId = window.setTimeout(refreshLater, 2500)
+    timerId = window.setTimeout(refreshLater, 500)
     return () => {
       cancelled = true
       if (timerId !== undefined) window.clearTimeout(timerId)

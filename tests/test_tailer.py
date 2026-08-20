@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
 from hearthstone_companion_under_test import tailer as tailer_module
 from hearthstone_companion_under_test.tailer import MAX_LINE_BYTES, PowerLogLocator, PowerLogTailer
 
@@ -78,26 +79,52 @@ def test_bootstrap_drops_ended_spectator_marker_before_create_game(tmp_path: Pat
     assert batch.lines == ("CREATE_GAME",)
 
 
-def test_bootstrap_prefers_canonical_game_state_create_over_later_mirror(tmp_path: Path) -> None:
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n"])
+def test_bootstrap_prefers_current_canonical_game_for_lf_and_crlf(
+    tmp_path: Path,
+    newline: bytes,
+) -> None:
     path = tmp_path / "Power.log"
-    path.write_text(
-        "D GameState.DebugPrintPower() - CREATE_GAME\n"
-        "D GameState.DebugPrintPower() - Player EntityID=8 PlayerID=3\n"
-        "D PowerTaskList.DebugPrintPower() - CREATE_GAME\n"
-        "D PowerTaskList.DebugPrintPower() - mirrored\n",
-        encoding="utf-8",
+    old_create = b"D GameState.DebugPrintPower() - CREATE_GAME"
+    current_create = b"D GameState.DebugPrintPower() - CREATE_GAME"
+    current_entity = b"D GameState.DebugPrintPower() - Player EntityID=8 PlayerID=3"
+    mirror_create = b"D PowerTaskList.DebugPrintPower() - CREATE_GAME"
+    path.write_bytes(
+        newline.join(
+            (
+                old_create,
+                b"D GameState.DebugPrintPower() - old game",
+                current_create,
+                current_entity,
+                mirror_create,
+                b"D PowerTaskList.DebugPrintPower() - mirrored",
+            )
+        )
+        + newline
     )
 
     batch = PowerLogTailer(PowerLogLocator(str(path))).poll()
 
-    assert "GameState.DebugPrintPower() - CREATE_GAME" in batch.lines[0]
-    assert any("Player EntityID=8" in line for line in batch.lines)
+    assert batch.lines == tuple(
+        line.decode("ascii")
+        for line in (
+            current_create,
+            current_entity,
+            mirror_create,
+            b"D PowerTaskList.DebugPrintPower() - mirrored",
+        )
+    )
     assert batch.bootstrap_complete is True
 
 
-def test_truncated_bootstrap_without_canonical_start_is_marked_incomplete(tmp_path: Path) -> None:
+def test_truncated_bootstrap_with_canonical_start_outside_window_is_incomplete(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "Power.log"
-    path.write_bytes(b"old\n" + b"x\n" * (600 * 1024))
+    path.write_bytes(
+        b"D GameState.DebugPrintPower() - CREATE_GAME\r\n"
+        + b"D GameState.DebugPrintPower() - old\r\n" * (32 * 1024)
+    )
 
     batch = PowerLogTailer(
         PowerLogLocator(str(path)), initial_read_max_bytes=1024 * 1024
@@ -105,6 +132,30 @@ def test_truncated_bootstrap_without_canonical_start_is_marked_incomplete(tmp_pa
 
     assert batch.bootstrap is True
     assert batch.bootstrap_complete is False
+    assert not any("CREATE_GAME" in line for line in batch.lines)
+
+
+def test_truncated_crlf_bootstrap_recovers_at_current_canonical_start(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "Power.log"
+    current_create = b"D GameState.DebugPrintPower() - CREATE_GAME"
+    current_entity = b"D GameState.DebugPrintPower() - Player EntityID=8 PlayerID=3"
+    path.write_bytes(
+        b"D GameState.DebugPrintPower() - old\r\n" * (32 * 1024)
+        + current_create
+        + b"\r\n"
+        + current_entity
+        + b"\r\n"
+    )
+
+    batch = PowerLogTailer(
+        PowerLogLocator(str(path)), initial_read_max_bytes=1024 * 1024
+    ).poll()
+
+    assert batch.bootstrap is True
+    assert batch.bootstrap_complete is True
+    assert batch.lines == (current_create.decode("ascii"), current_entity.decode("ascii"))
 
 
 def test_oversized_partial_line_is_discarded_with_bounded_memory(tmp_path: Path) -> None:
@@ -171,18 +222,29 @@ def test_bootstrap_reports_source_modified_time(tmp_path: Path) -> None:
 
 def test_same_path_file_replacement_reboots_source(tmp_path: Path) -> None:
     path = tmp_path / "Power.log"
-    path.write_text("CREATE_GAME\nold\n", encoding="utf-8")
+    canonical_create = b"D GameState.DebugPrintPower() - CREATE_GAME"
+    path.write_bytes(
+        b"D GameState.DebugPrintPower() - discarded\r\n"
+        + canonical_create
+        + b"\r\nold\r\n"
+    )
     tailer = PowerLogTailer(PowerLogLocator(str(path)))
-    tailer.poll()
+    first = tailer.poll()
+
+    assert first.lines == (canonical_create.decode("ascii"), "old")
 
     replacement = tmp_path / "Power.next.log"
-    replacement.write_text("CREATE_GAME\nnew session\n", encoding="utf-8")
+    replacement.write_bytes(
+        b"D GameState.DebugPrintPower() - stale\r\n"
+        + canonical_create
+        + b"\r\nnew session\r\n"
+    )
     replacement.replace(path)
     batch = tailer.poll()
 
     assert batch.bootstrap is True
     assert batch.source_reset is True
-    assert batch.lines == ("CREATE_GAME", "new session")
+    assert batch.lines == (canonical_create.decode("ascii"), "new session")
 
 
 def test_disappearing_source_emits_one_reset_edge(tmp_path: Path) -> None:

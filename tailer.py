@@ -15,7 +15,7 @@ _CURSOR_GUARD_BYTES = 256
 _SPECTATOR_START_MARKERS = (b"Start Spectator Game", b"Begin Spectating 1st player", b"Begin Spectating 2nd player")
 _SPECTATOR_END_MARKERS = (b"End Spectator Mode", b"End Spectator Game")
 _GAMESTATE_CREATE_RE = re.compile(
-    rb"(?m)^[^\r\n]*GameState\.DebugPrintPower\(\)\s+-\s+CREATE_GAME[^\r\n]*$"
+    rb"(?m)^[^\r\n]*GameState\.DebugPrintPower\(\)\s+-\s+CREATE_GAME[^\r\n]*\r?$"
 )
 _BARE_CREATE_RE = re.compile(rb"(?m)^\s*CREATE_GAME\s*\r?$")
 

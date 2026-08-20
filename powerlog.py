@@ -33,6 +33,12 @@ _ZONE_RE = re.compile(r"(?:^|\s)zone=([^\s\]]+)")
 _NAME_RE = re.compile(r"(?:entityName|name)=(.*?)\s+id=\d+")
 _GAME_TYPE_RE = re.compile(r"\bGameType=(GT_[A-Z0-9_]+)")
 _LOG_SOURCE_RE = re.compile(r"\b(GameState|PowerTaskList)\.DebugPrint(Power|Game)\(\)\s+-\s")
+_GAMESTATE_STATIC_ENTITY_RE = re.compile(
+    r"\b(?:GameEntity EntityID=|Player EntityID=|FULL_ENTITY - (?:Creating|Updating))"
+)
+_GAMESTATE_INLINE_TAG_RE = re.compile(
+    r"\bGameState\.DebugPrintPower\(\)\s+-\s+\s*tag=[^\s]+\s+value="
+)
 
 _CARD_TYPES = {
     "1": "GAME",
@@ -168,6 +174,10 @@ class PowerLogParser:
         self.local_controller: int | None = None
         self.current_controller: int | None = None
         self.current_entity_id: int | None = None
+        self._game_state_current_entity_id: int | None = None
+        self._pending_game_state_entities: dict[int, Entity] = {}
+        self._pending_game_state_player_entities: dict[int, int] = {}
+        self._pending_game_state_game_entity_id: int | None = None
         self.turn = 0
         self.phase = "idle"
         self.mode = "unknown"
@@ -180,9 +190,13 @@ class PowerLogParser:
         self._mulligan_announced = False
         self._block_stack: list[_BlockFrame] = []
         self._recent_cards: deque[dict[str, Any]] = deque(maxlen=8)
-        self._observed_boards: dict[int, tuple[int, tuple[str, ...], int, int]] = {}
+        self._observed_boards: dict[
+            int, tuple[int, tuple[BattlegroundsCardSnapshot, ...]]
+        ] = {}
+        self._pending_game_type: str | None = None
+        self._game_boundary_pending = False
+        self._battlegrounds_hero_selection_complete = False
         self._battlegrounds_result_emitted = False
-        self._power_source: str | None = None
         self._combat_active_round = 0
         self._combat_result_emitted_round = 0
         self._combat_damage_taken = 0
@@ -201,6 +215,10 @@ class PowerLogParser:
         self.local_controller = None
         self.current_controller = None
         self.current_entity_id = None
+        self._game_state_current_entity_id = None
+        self._pending_game_state_entities.clear()
+        self._pending_game_state_player_entities.clear()
+        self._pending_game_state_game_entity_id = None
         self.turn = 0
         self.phase = "idle"
         self.mode = "unknown"
@@ -214,8 +232,10 @@ class PowerLogParser:
         self._block_stack.clear()
         self._recent_cards.clear()
         self._observed_boards.clear()
+        self._pending_game_type = None
+        self._game_boundary_pending = False
+        self._battlegrounds_hero_selection_complete = False
         self._battlegrounds_result_emitted = False
-        self._power_source = None
         self._combat_active_round = 0
         self._combat_result_emitted_round = 0
         self._combat_damage_taken = 0
@@ -241,30 +261,50 @@ class PowerLogParser:
         source_match = _LOG_SOURCE_RE.search(line)
         source = source_match.group(1) if source_match else None
         source_kind = source_match.group(2) if source_match else None
-        if source_kind == "Power" and source is not None:
-            if self._power_source is None:
-                self._power_source = source
-            elif source != self._power_source:
+        # PowerTaskList owns real-time entity/task updates. GameState Power is a
+        # replay-style mirror, but its CREATE_GAME line is the earliest stable
+        # boundary and precedes DebugPrintGame metadata in real logs.
+        if source_kind == "Power" and source == "GameState":
+            if "CREATE_GAME" in line:
+                self._pending_game_type = None
+                self._game_boundary_pending = True
+                self._game_state_current_entity_id = None
+                self._pending_game_state_entities.clear()
+                self._pending_game_state_player_entities.clear()
+                self._pending_game_state_game_entity_id = None
+                return []
+            terminal_match = _TAG_CHANGE_RE.search(line)
+            is_terminal_signal = bool(
+                not self._game_boundary_pending
+                and terminal_match
+                and self._is_game_state_terminal_tag(
+                    terminal_match.group(2), terminal_match.group(3)
+                )
+            )
+            is_battlegrounds_context = bool(
+                self.mode == "battlegrounds"
+                or self._pending_game_type in _BATTLEGROUNDS_GAME_TYPES
+                or self._game_boundary_pending
+            )
+            if not is_terminal_signal and (
+                not is_battlegrounds_context
+                or not (
+                    _GAMESTATE_STATIC_ENTITY_RE.search(line)
+                    or _GAMESTATE_INLINE_TAG_RE.search(line)
+                )
+            ):
+                self._game_state_current_entity_id = None
                 return []
 
         game_type_match = _GAME_TYPE_RE.search(line)
         if game_type_match:
             game_type = game_type_match.group(1)
             if game_type in _BATTLEGROUNDS_GAME_TYPES:
-                first_detection = self.mode != "battlegrounds"
-                self.mode = "battlegrounds"
-                self.battlegrounds_variant = "duos" if game_type in _BATTLEGROUNDS_DUO_GAME_TYPES else "solo"
-                if first_detection:
-                    self.phase = "hero_select" if not self.spectating else "spectator"
-                    return [
-                        GameEvent(
-                            "battlegrounds_detected",
-                            7,
-                            "已进入酒馆战棋",
-                            timestamp,
-                            {"variant": self.battlegrounds_variant},
-                        )
-                    ]
+                if self._game_boundary_pending:
+                    self._pending_game_type = game_type
+                    return []
+                detected = self._apply_game_type(game_type, timestamp)
+                return [detected] if detected else []
 
         if any(marker in line for marker in _SPECTATOR_START_MARKERS):
             self.spectating = True
@@ -274,59 +314,129 @@ class PowerLogParser:
             if self.phase == "spectator":
                 self.phase = "idle"
 
+        # DebugPrintGame is metadata-only. Never let entity-shaped text from
+        # this channel enter the Power packet parser.
+        if source == "GameState" and source_kind == "Game":
+            return []
+
         if "CREATE_GAME" in line:
-            self._start_game(source)
-            return [GameEvent("game_started", 7, "新对局开始", timestamp, {"game_number": self.game_number})]
+            pending_game_type = self._pending_game_type
+            pending_entities = dict(self._pending_game_state_entities)
+            pending_player_entities = dict(self._pending_game_state_player_entities)
+            pending_game_entity_id = self._pending_game_state_game_entity_id
+            self._start_game()
+            self._commit_pending_game_state(
+                pending_entities,
+                pending_player_entities,
+                pending_game_entity_id,
+            )
+            events = [
+                GameEvent(
+                    "game_started",
+                    7,
+                    "新对局开始",
+                    timestamp,
+                    {"game_number": self.game_number},
+                )
+            ]
+            if pending_game_type:
+                detected = self._apply_game_type(pending_game_type, timestamp)
+                if detected:
+                    events.append(detected)
+            return events
 
         match = _GAME_ENTITY_RE.search(line)
         if match:
             entity_id = int(match.group(1))
-            self.game_entity_id = entity_id
-            entity = self._entity(entity_id)
+            if source == "GameState" and self._game_boundary_pending:
+                self._pending_game_state_game_entity_id = entity_id
+            elif source == "GameState":
+                if self.game_entity_id is None:
+                    self.game_entity_id = entity_id
+            else:
+                self.game_entity_id = entity_id
+            entity = self._entity_for_source(entity_id, source)
             if entity:
-                entity.card_type = "GAME"
-            self.current_entity_id = entity_id
+                self._set_static_field(entity, "CARDTYPE", "GAME", source)
+            self._set_current_entity(entity_id, source)
             return []
 
         match = _PLAYER_RE.search(line)
         if match:
             entity_id, player_id = int(match.group(1)), int(match.group(2))
-            entity = self._entity(entity_id)
+            entity = self._entity_for_source(entity_id, source)
             if entity:
-                entity.card_type = "PLAYER"
-                entity.controller = player_id
-                entity.tags["PLAYER_ID"] = str(player_id)
-                self.player_entities[player_id] = entity_id
-            self.current_entity_id = entity_id
+                self._set_static_field(entity, "CARDTYPE", "PLAYER", source)
+                self._set_static_field(entity, "CONTROLLER", player_id, source)
+                self._set_static_field(entity, "PLAYER_ID", str(player_id), source)
+                if source == "GameState" and self._game_boundary_pending:
+                    self._pending_game_state_player_entities[player_id] = entity_id
+                elif source == "GameState":
+                    self.player_entities.setdefault(player_id, entity_id)
+                else:
+                    self.player_entities[player_id] = entity_id
+            self._set_current_entity(entity_id, source)
             return []
 
         match = _FULL_ENTITY_RE.search(line)
         if match:
             entity_id, card_id = int(match.group(1)), _clean(match.group(2), limit=80)
-            entity = self._entity(entity_id)
+            entity = self._entity_for_source(entity_id, source)
             if entity:
-                entity.card_id = card_id
-                entity.hidden = not bool(card_id)
-                if card_id:
+                identity_updated = source != "GameState" or (
+                    "CARD_ID" not in entity.realtime_fields
+                    and not entity.card_id
+                    and not entity.visibility_revoked
+                )
+                if identity_updated:
+                    entity.card_id = card_id
+                    entity.hidden = not bool(card_id)
+                    if source != "GameState":
+                        entity.realtime_fields.update({"CARD_ID", "HIDDEN"})
+                if entity.card_id and (source != "GameState" or not entity.visibility_revoked):
                     entity.visibility_revoked = False
                 self._mark_battlegrounds_combat_identity(entity)
-            self.current_entity_id = entity_id
+            self._set_current_entity(entity_id, source)
             return []
 
         match = _FULL_ENTITY_REF_RE.search(line)
         if match:
             ref = self._parse_entity_ref(match.group(1))
             card_id = _clean(match.group(2), limit=80)
-            entity = self._merge_ref(ref)
+            entity = self._merge_ref(
+                ref,
+                source=source,
+                include_identity=source != "GameState",
+            )
             if entity:
-                entity.card_id = card_id or entity.card_id
-                entity.hidden = not bool(card_id)
-                if ref.name and card_id:
+                identity_updated = source != "GameState" or (
+                    "CARD_ID" not in entity.realtime_fields
+                    and not entity.card_id
+                    and not entity.visibility_revoked
+                )
+                if identity_updated:
+                    entity.card_id = card_id or entity.card_id
+                    entity.hidden = not bool(card_id)
+                    if source != "GameState":
+                        entity.realtime_fields.update({"CARD_ID", "HIDDEN"})
+                can_enrich_name = bool(
+                    source != "GameState"
+                    or (
+                        not entity.visibility_revoked
+                        and "NAME" not in entity.realtime_fields
+                        and not entity.name
+                        and (not ref.card_id or ref.card_id == entity.card_id)
+                        and (not card_id or card_id == entity.card_id)
+                    )
+                )
+                if ref.name and card_id and can_enrich_name:
                     entity.name = ref.name
-                if card_id:
+                    if source != "GameState":
+                        entity.realtime_fields.add("NAME")
+                if entity.card_id and (source != "GameState" or not entity.visibility_revoked):
                     entity.visibility_revoked = False
                 self._mark_battlegrounds_combat_identity(entity)
-                self.current_entity_id = entity.entity_id
+                self._set_current_entity(entity.entity_id, source)
             return []
 
         match = _SHOW_ENTITY_RE.search(line)
@@ -334,7 +444,7 @@ class PowerLogParser:
             opcode = match.group(1)
             ref = self._parse_entity_ref(match.group(2))
             card_id = _clean(match.group(3), limit=80)
-            entity = self._merge_ref(ref)
+            entity = self._merge_ref(ref, source=source)
             if entity:
                 can_reveal = not entity.visibility_revoked or (
                     opcode == "SHOW_ENTITY" and bool(card_id)
@@ -344,24 +454,30 @@ class PowerLogParser:
                     entity.revealed = True
                     entity.hidden = False
                     entity.visibility_revoked = False
+                    entity.realtime_fields.update(
+                        {"CARD_ID", "NAME", "REVEALED", "HIDDEN", "VISIBILITY"}
+                    )
                     if ref.name and entity.card_id:
                         entity.name = ref.name
                 if opcode == "SHOW_ENTITY":
                     self._infer_local_controller_from_show(entity)
                 if can_reveal:
                     self._mark_battlegrounds_combat_identity(entity)
-                self.current_entity_id = entity.entity_id
+                self._set_current_entity(entity.entity_id, source)
             return []
 
         match = _HIDE_ENTITY_RE.search(line)
         if match:
             ref = self._parse_entity_ref(match.group(1))
-            entity = self._merge_ref(ref)
+            entity = self._merge_ref(ref, source=source)
             if entity:
                 entity.revealed = False
                 entity.hidden = True
                 entity.visibility_revoked = True
                 entity.name = ""
+                entity.realtime_fields.update(
+                    {"CARD_ID", "NAME", "REVEALED", "HIDDEN", "VISIBILITY"}
+                )
             return []
 
         match = _BLOCK_START_RE.search(line)
@@ -369,7 +485,7 @@ class PowerLogParser:
             if len(self._block_stack) >= 64:
                 self._block_stack.clear()
             ref = self._parse_entity_ref(match.group(2))
-            entity = self._merge_ref(ref)
+            entity = self._merge_ref(ref, source=source)
             self._block_stack.append(
                 _BlockFrame(
                     block_type=_clean(match.group(1), limit=32).upper(),
@@ -386,18 +502,50 @@ class PowerLogParser:
         match = _TAG_CHANGE_RE.search(line)
         if match:
             ref = self._parse_entity_ref(match.group(1))
-            entity = self._merge_ref(ref)
+            if source == "GameState":
+                self._game_state_current_entity_id = None
+                entity = self._terminal_entity(ref, match.group(2), match.group(1))
+                if entity is None:
+                    return []
+                return self._apply_tag(
+                    entity,
+                    match.group(2),
+                    match.group(3),
+                    timestamp,
+                    realtime=False,
+                )
+            entity = self._merge_ref(ref, source=source)
             if entity is None:
                 entity = self._unresolved_tag_entity(match.group(1), match.group(2), match.group(3))
             if entity is None:
                 return []
-            return self._apply_tag(entity, match.group(2), match.group(3), timestamp)
+            return self._apply_tag(
+                entity,
+                match.group(2),
+                match.group(3),
+                timestamp,
+                realtime=True,
+            )
 
         match = _INLINE_TAG_RE.search(line)
-        if match and self.current_entity_id is not None:
-            entity = self.entities.get(self.current_entity_id)
+        inline_entity_id = (
+            self._game_state_current_entity_id
+            if source_kind == "Power" and source == "GameState"
+            else self.current_entity_id
+        )
+        if match and inline_entity_id is not None:
+            entity = self._entities_for_source(source).get(inline_entity_id)
             if entity:
-                return self._apply_tag(entity, match.group(1), match.group(2), timestamp)
+                if source == "GameState":
+                    self._apply_enrichment_tag(entity, match.group(1), match.group(2))
+                    return []
+                return self._apply_tag(
+                    entity,
+                    match.group(1),
+                    match.group(2),
+                    timestamp,
+                    realtime=True,
+                )
         return []
 
     def snapshot(self) -> GameSnapshot:
@@ -422,14 +570,71 @@ class PowerLogParser:
             battlegrounds=self._battlegrounds_snapshot() if self.mode == "battlegrounds" else None,
         )
 
-    def _start_game(self, source: str | None) -> None:
+    def _start_game(self) -> None:
         next_game_number = self.game_number + 1
         spectating = self.spectating
         self.reset_source()
         self.game_number = next_game_number
         self.spectating = spectating
-        self._power_source = source
         self.phase = "spectator" if spectating else "starting"
+
+    def _commit_pending_game_state(
+        self,
+        entities: dict[int, Entity],
+        player_entities: dict[int, int],
+        game_entity_id: int | None,
+    ) -> None:
+        for entity_id, entity in entities.items():
+            if len(self.entities) >= self.max_entities:
+                self.entity_capacity_exceeded = True
+                break
+            self.entities[entity_id] = entity
+        self.player_entities.update(
+            {
+                player_id: entity_id
+                for player_id, entity_id in player_entities.items()
+                if entity_id in self.entities
+            }
+        )
+        if game_entity_id in self.entities:
+            self.game_entity_id = game_entity_id
+
+    def _apply_game_type(self, game_type: str, timestamp: float) -> GameEvent | None:
+        if game_type not in _BATTLEGROUNDS_GAME_TYPES:
+            return None
+        first_detection = self.mode != "battlegrounds"
+        self.mode = "battlegrounds"
+        self.battlegrounds_variant = (
+            "duos" if game_type in _BATTLEGROUNDS_DUO_GAME_TYPES else "solo"
+        )
+        if first_detection:
+            self.phase = "hero_select" if not self.spectating else "spectator"
+        self._hydrate_committed_game_state()
+        if not first_detection:
+            return None
+        return GameEvent(
+            "battlegrounds_detected",
+            7,
+            "已进入酒馆战棋",
+            timestamp,
+            {"variant": self.battlegrounds_variant},
+        )
+
+    def _hydrate_committed_game_state(self) -> None:
+        for player_id, entity_id in self.player_entities.items():
+            entity = self.entities.get(entity_id)
+            if entity and entity.tag_int("BACON_DUMMY_PLAYER") > 0:
+                self.bob_controller = player_id
+                break
+        if not self.spectating and self.local_controller is None and self.bob_controller is not None:
+            candidates = [
+                player_id
+                for player_id in self.player_entities
+                if player_id != self.bob_controller
+            ]
+            if len(candidates) == 1:
+                self._set_local_controller(candidates[0])
+        self._reconcile_battlegrounds_hero_selection()
 
     def _entity(self, entity_id: int | None) -> Entity | None:
         if entity_id is None or entity_id <= 0:
@@ -444,10 +649,153 @@ class PowerLogParser:
         self.entities[entity_id] = entity
         return entity
 
+    def _entities_for_source(self, source: str | None) -> dict[int, Entity]:
+        if source == "GameState" and self._game_boundary_pending:
+            return self._pending_game_state_entities
+        return self.entities
+
+    def _entity_for_source(self, entity_id: int | None, source: str | None) -> Entity | None:
+        if source != "GameState" or not self._game_boundary_pending:
+            return self._entity(entity_id)
+        if entity_id is None or entity_id <= 0:
+            return None
+        entity = self._pending_game_state_entities.get(entity_id)
+        if entity is not None:
+            return entity
+        if len(self._pending_game_state_entities) >= self.max_entities:
+            self.entity_capacity_exceeded = True
+            return None
+        entity = Entity(entity_id=entity_id)
+        self._pending_game_state_entities[entity_id] = entity
+        return entity
+
+    @staticmethod
+    def _set_static_field(
+        entity: Entity,
+        field_name: str,
+        value: str | int,
+        source: str | None,
+    ) -> None:
+        realtime = source != "GameState"
+        if not realtime and field_name in entity.realtime_fields:
+            return
+        if field_name == "CARDTYPE":
+            if realtime or not entity.card_type:
+                entity.card_type = _normalize_card_type(value)
+        elif field_name == "CONTROLLER":
+            controller = _int(value)
+            if controller is not None and (realtime or entity.controller is None):
+                entity.controller = controller
+        elif field_name == "PLAYER_ID":
+            if realtime or field_name not in entity.tags:
+                entity.tags[field_name] = _clean(value, limit=40)
+        if realtime:
+            entity.realtime_fields.add(field_name)
+
+    @staticmethod
+    def _apply_enrichment_tag(entity: Entity, raw_tag: str, raw_value: str) -> None:
+        tag = _clean(raw_tag, limit=60).upper()
+        if tag in entity.realtime_fields or tag in entity.tags:
+            return
+        value = _clean(raw_value, limit=160)
+        if tag == "CONTROLLER":
+            controller = _int(value)
+            if controller is not None and "CONTROLLER" not in entity.realtime_fields:
+                entity.controller = controller
+        elif tag == "CARDTYPE":
+            value = _normalize_card_type(value)
+            if "CARDTYPE" not in entity.realtime_fields:
+                entity.card_type = value
+        elif tag == "ZONE":
+            value = _normalize_zone(value)
+            if "ZONE" not in entity.realtime_fields:
+                entity.zone = value
+                if value in _PUBLIC_ZONES and not entity.hidden:
+                    entity.revealed = True
+        entity.tags[tag] = value
+
+    def _set_current_entity(self, entity_id: int, source: str | None) -> None:
+        if source == "GameState":
+            self._game_state_current_entity_id = entity_id
+        else:
+            self.current_entity_id = entity_id
+
+    @staticmethod
+    def _is_game_state_terminal_tag(raw_tag: str, raw_value: str) -> bool:
+        tag = _clean(raw_tag, limit=60).upper()
+        value = _clean(raw_value, limit=160).upper()
+        return (tag == "STATE" and value == "COMPLETE") or (
+            tag == "PLAYSTATE" and value in _END_RESULTS
+        )
+
+    def _terminal_entity(
+        self,
+        ref: _EntityRef,
+        raw_tag: str,
+        raw_ref: str,
+    ) -> Entity | None:
+        tag = _clean(raw_tag, limit=60).upper()
+        entity_id = ref.entity_id
+        if tag == "STATE":
+            if entity_id is not None:
+                entity = self.entities.get(entity_id)
+                if self.game_entity_id is not None and entity_id != self.game_entity_id:
+                    return None
+                if entity is None or entity.card_type != "GAME":
+                    return None
+                return entity
+            if _clean(raw_ref, limit=80).casefold() != "gameentity":
+                return None
+            entity = self.entities.get(self.game_entity_id or -1)
+            return entity or Entity(entity_id=-1, card_type="GAME")
+        entity = self.entities.get(entity_id or -1)
+        if entity is not None:
+            return entity if entity.card_type == "PLAYER" else None
+        local_entity = self.entities.get(
+            self.player_entities.get(self.local_controller or -1, -1)
+        )
+        if (
+            local_entity is not None
+            and entity_id is None
+            and self.local_controller is not None
+            and ref.controller == self.local_controller
+        ):
+            return local_entity
+        if (
+            self.local_controller is not None
+            and ref.controller is not None
+            and ref.controller == self.local_controller
+        ):
+            return Entity(entity_id=entity_id or -1, controller=ref.controller)
+        return None
+
+    def _set_local_controller(self, controller: int | None) -> None:
+        if controller is None or controller <= 0 or self.spectating:
+            return
+        self.local_controller = controller
+        self._reconcile_battlegrounds_hero_selection()
+
+    def _reconcile_battlegrounds_hero_selection(self) -> None:
+        if (
+            self.mode != "battlegrounds"
+            or self.local_controller is None
+            or self._battlegrounds_hero_selection_complete
+        ):
+            return
+        if any(
+            entity.tags.get("MULLIGAN_STATE", "").upper() == "DONE"
+            and self._controller(entity) == self.local_controller
+            for entity in self.entities.values()
+        ):
+            self._battlegrounds_hero_selection_complete = True
+            if self.phase not in {"combat", "ended", "spectator"}:
+                self.phase = "recruit"
+
     def _evict_stale_entity(self) -> bool:
         protected = {
             self.game_entity_id,
             self.current_entity_id,
+            self._game_state_current_entity_id,
             *self.player_entities.values(),
             *(frame.entity_id for frame in self._block_stack),
         }
@@ -494,24 +842,68 @@ class PowerLogParser:
             name=_clean(name_match.group(1), limit=80) if name_match else "",
         )
 
-    def _merge_ref(self, ref: _EntityRef) -> Entity | None:
-        entity = self._entity(ref.entity_id)
+    def _merge_ref(
+        self,
+        ref: _EntityRef,
+        *,
+        source: str | None,
+        include_identity: bool = True,
+    ) -> Entity | None:
+        realtime = source != "GameState"
+        entity = self._entity_for_source(ref.entity_id, source)
         if entity is None:
             return None
-        if ref.card_id and not entity.hidden:
+        if (
+            include_identity
+            and ref.card_id
+            and not entity.hidden
+            and not entity.visibility_revoked
+            and (realtime or ("CARD_ID" not in entity.realtime_fields and not entity.card_id))
+        ):
             entity.card_id = ref.card_id
-        if ref.controller is not None and "CONTROLLER" not in entity.tags:
+            if realtime:
+                entity.realtime_fields.add("CARD_ID")
+        if ref.controller is not None and (
+            (realtime and "CONTROLLER" not in entity.realtime_fields)
+            or (not realtime and "CONTROLLER" not in entity.realtime_fields and entity.controller is None)
+        ):
             entity.controller = ref.controller
-        if ref.zone and "ZONE" not in entity.tags:
+            if realtime:
+                entity.realtime_fields.add("CONTROLLER")
+        if ref.zone and (
+            (realtime and "ZONE" not in entity.realtime_fields)
+            or (not realtime and "ZONE" not in entity.realtime_fields and not entity.zone)
+        ):
             entity.zone = ref.zone
-        if ref.name and ref.card_id and not entity.hidden:
+            if realtime:
+                entity.realtime_fields.add("ZONE")
+        if (
+            include_identity
+            and ref.name
+            and ref.card_id
+            and not entity.hidden
+            and not entity.visibility_revoked
+            and (realtime or ("NAME" not in entity.realtime_fields and not entity.name))
+        ):
             entity.name = ref.name
+            if realtime:
+                entity.realtime_fields.add("NAME")
         return entity
 
-    def _apply_tag(self, entity: Entity, raw_tag: str, raw_value: str, timestamp: float) -> list[GameEvent]:
+    def _apply_tag(
+        self,
+        entity: Entity,
+        raw_tag: str,
+        raw_value: str,
+        timestamp: float,
+        *,
+        realtime: bool = True,
+    ) -> list[GameEvent]:
         tag = _clean(raw_tag, limit=60).upper()
         value = _clean(raw_value, limit=160)
         old_value = entity.tags.get(tag)
+        if realtime:
+            entity.realtime_fields.add(tag)
 
         if tag == "CONTROLLER":
             controller = _int(value)
@@ -530,6 +922,7 @@ class PowerLogParser:
             if self.mode != "battlegrounds":
                 self.mode = "battlegrounds"
                 self.phase = "hero_select" if not self.spectating else "spectator"
+                self._reconcile_battlegrounds_hero_selection()
                 events.append(
                     GameEvent(
                         "battlegrounds_detected",
@@ -547,7 +940,7 @@ class PowerLogParser:
             if not self.spectating and self.local_controller is None:
                 candidates = [player_id for player_id in self.player_entities if player_id != self.bob_controller]
                 if len(candidates) == 1:
-                    self.local_controller = candidates[0]
+                    self._set_local_controller(candidates[0])
 
         if (
             tag == "MULLIGAN_STATE"
@@ -555,7 +948,7 @@ class PowerLogParser:
             and not self.spectating
             and self.local_controller is None
         ):
-            self.local_controller = self._controller(entity)
+            self._set_local_controller(self._controller(entity))
 
         if tag == "ZONE":
             old_zone = _normalize_zone(old_value)
@@ -597,7 +990,7 @@ class PowerLogParser:
                         player_id = self._battlegrounds_player_id(entity)
                         if self._is_local_battlegrounds_entity(entity):
                             self._combat_damage_taken += amount
-                        elif player_id == self.next_opponent_player_id:
+                        elif player_id == self._resolved_next_opponent_player_id():
                             self._combat_damage_dealt += amount
                     priority = 8 if side == "player" and health is not None and health <= 10 else 5
                     if self.mode != "battlegrounds" or self._is_local_battlegrounds_entity(entity):
@@ -636,7 +1029,7 @@ class PowerLogParser:
                     player_id = self._battlegrounds_player_id(entity)
                     if self._is_local_battlegrounds_entity(entity):
                         self._combat_damage_taken += amount
-                    elif player_id == self.next_opponent_player_id:
+                    elif player_id == self._resolved_next_opponent_player_id():
                         self._combat_damage_dealt += amount
                 if self.mode != "battlegrounds" or self._is_local_battlegrounds_entity(entity):
                     health = entity.health
@@ -734,16 +1127,33 @@ class PowerLogParser:
                                     timestamp,
                                     {
                                         "round": self.battlegrounds_round,
-                                        "opponent_player_id": self.next_opponent_player_id,
+                                        "opponent_player_id": self._resolved_next_opponent_player_id(),
                                     },
                                 )
                             )
 
         elif tag == "MULLIGAN_STATE":
             if self.mode == "battlegrounds":
-                self.phase = "hero_select" if value.upper() != "DONE" else "recruit"
-                if value.upper() == "DONE":
-                    events.append(GameEvent("battlegrounds_hero_selected", 6, "英雄已选定", timestamp, {}))
+                if self._is_local_battlegrounds_entity(entity):
+                    selection_complete = value.upper() == "DONE"
+                    was_complete = self._battlegrounds_hero_selection_complete
+                    if selection_complete:
+                        self._battlegrounds_hero_selection_complete = True
+                    if self._battlegrounds_hero_selection_complete:
+                        if self.phase not in {"combat", "ended", "spectator"}:
+                            self.phase = "recruit"
+                    else:
+                        self.phase = "hero_select"
+                    if selection_complete and not was_complete:
+                        events.append(
+                            GameEvent(
+                                "battlegrounds_hero_selected",
+                                6,
+                                "英雄已选定",
+                                timestamp,
+                                {},
+                            )
+                        )
             elif value.upper() in {"INPUT", "DEALING", "DONE"}:
                 self.phase = "mulligan" if value.upper() != "DONE" else "playing"
             if self.mode != "battlegrounds" and value.upper() == "INPUT" and not self._mulligan_announced:
@@ -793,6 +1203,28 @@ class PowerLogParser:
                 and self.phase not in {"combat", "ended", "spectator"}
             ):
                 self.phase = "recruit"
+            elif (
+                tag == expected
+                and previous is None
+                and current == 0
+                and self.battlegrounds_round > 0
+                and self.phase not in {"combat", "ended", "spectator"}
+            ):
+                self._cache_recruit_warband()
+                self.phase = "combat"
+                if self._begin_battlegrounds_combat():
+                    events.append(
+                        GameEvent(
+                            "battlegrounds_combat_started",
+                            6,
+                            f"第{self.battlegrounds_round}回合战斗开始",
+                            timestamp,
+                            {
+                                "round": self.battlegrounds_round,
+                                "opponent_player_id": self._resolved_next_opponent_player_id(),
+                            },
+                        )
+                    )
             elif tag == expected and previous == 1 and current == 0 and self.phase != "combat":
                 self._cache_recruit_warband()
                 self.phase = "combat"
@@ -805,7 +1237,7 @@ class PowerLogParser:
                             timestamp,
                             {
                                 "round": self.battlegrounds_round,
-                                "opponent_player_id": self.next_opponent_player_id,
+                                "opponent_player_id": self._resolved_next_opponent_player_id(),
                             },
                         )
                     )
@@ -1056,10 +1488,7 @@ class PowerLogParser:
             max_gold=max_gold,
             tavern_tier=self._battlegrounds_tavern_tier(local_hero, local_player),
             frozen=any(entity.tag_int("FROZEN") > 0 for entity in shop_entities),
-            next_opponent_player_id=(
-                self.next_opponent_player_id
-                or (local_player.tag_int("NEXT_OPPONENT_PLAYER_ID") if local_player else 0)
-            ),
+            next_opponent_player_id=self._resolved_next_opponent_player_id(),
             placement=local_hero.tag_int("PLAYER_LEADERBOARD_PLACE") if local_hero else 0,
             hero_choices=self._battlegrounds_hero_choices(),
             shop=self._battlegrounds_cards(shop_entities),
@@ -1093,7 +1522,11 @@ class PowerLogParser:
         return tuple(cards[: max(0, maximum)])
 
     def _battlegrounds_hero_choices(self) -> tuple[BattlegroundsHeroChoiceSnapshot, ...]:
-        if self.local_controller is None or self.phase in {"recruit", "combat", "ended", "spectator"}:
+        if (
+            self.local_controller is None
+            or self._battlegrounds_hero_selection_complete
+            or self.phase in {"combat", "ended", "spectator"}
+        ):
             return ()
         choices = [
             entity
@@ -1142,7 +1575,7 @@ class PowerLogParser:
             if entity.entity_id not in excluded
             and self._controller(entity) == controller
             and entity.zone == "PLAY"
-            and self._is_minion(entity)
+            and self._is_battlegrounds_minion(entity)
             and self._is_battlegrounds_gameplay_entity(entity)
             and not entity.hidden
         ]
@@ -1185,10 +1618,10 @@ class PowerLogParser:
     def _battlegrounds_hero_entities(self) -> dict[int, Entity]:
         heroes: dict[int, Entity] = {}
         for entity in self.entities.values():
-            if not self._is_hero(entity):
+            if entity.hidden or entity.visibility_revoked or not self._is_hero(entity):
                 continue
             if (
-                self.phase not in {"recruit", "combat", "ended", "spectator"}
+                not self._battlegrounds_hero_selection_complete
                 and self._is_battlegrounds_hero_choice_entity(entity)
             ):
                 continue
@@ -1211,13 +1644,17 @@ class PowerLogParser:
 
     def _battlegrounds_local_hero(self) -> Entity | None:
         heroes = self._battlegrounds_hero_entities()
+        direct = heroes.get(self.local_controller or -1)
+        if direct is not None:
+            return direct
         for hero in heroes.values():
-            if self._controller(hero) == self.local_controller:
+            if hero.tag_int("PLAYER_ID") <= 0 and self._controller(hero) == self.local_controller:
                 return hero
-        return heroes.get(self.local_controller or -1)
+        return None
 
     def _battlegrounds_lobby(self) -> tuple[BattlegroundsPlayerSnapshot, ...]:
         result: list[BattlegroundsPlayerSnapshot] = []
+        next_opponent_player_id = self._resolved_next_opponent_player_id()
         local_team_id = self._battlegrounds_team_id(
             self.local_controller or 0,
             self._battlegrounds_local_hero(),
@@ -1228,25 +1665,18 @@ class PowerLogParser:
             if is_local:
                 board_entities = self._battlegrounds_board_entities(self.local_controller)
                 if board_entities:
-                    board_cards = tuple(
-                        label for entity in board_entities if (label := self._visible_card_label(entity))
-                    )[:7]
-                    board_count = min(7, len(board_entities))
-                    board_attack = sum(entity.attack for entity in board_entities)
-                    board_health = sum(entity.health or 0 for entity in board_entities)
+                    board_minions = self._battlegrounds_cards(board_entities, maximum=7)
                 else:
-                    board_cards = tuple(
-                        card.name or card.card_id for card in self._last_recruit_warband
-                    )
-                    board_count = len(self._last_recruit_warband)
-                    board_attack = sum(card.attack for card in self._last_recruit_warband)
-                    board_health = sum(card.health or 0 for card in self._last_recruit_warband)
+                    board_minions = self._last_recruit_warband
                 last_seen_round = self.battlegrounds_round
             elif observed:
-                last_seen_round, board_cards, board_attack, board_health = observed
-                board_count = len(board_cards)
+                last_seen_round, board_minions = observed
             else:
-                last_seen_round, board_cards, board_attack, board_health, board_count = 0, (), 0, 0, 0
+                last_seen_round, board_minions = 0, ()
+            board_cards = tuple(card.name or card.card_id for card in board_minions)
+            board_count = len(board_minions)
+            board_attack = sum(card.attack for card in board_minions)
+            board_health = sum(card.health or 0 for card in board_minions)
             placement = hero.tag_int("PLAYER_LEADERBOARD_PLACE")
             eliminated = hero.health == 0 or hero.tag_int("BACON_DIED_LAST_COMBAT") > 0
             if hero.tags.get("PLAYSTATE", "").upper() in {"LOST", "CONCEDED"}:
@@ -1263,7 +1693,7 @@ class PowerLogParser:
                     triples=hero.tag_int("PLAYER_TRIPLES"),
                     placement=placement,
                     eliminated=eliminated,
-                    next_opponent=player_id == self.next_opponent_player_id,
+                    next_opponent=player_id == next_opponent_player_id,
                     is_teammate=(
                         not is_local
                         and self.battlegrounds_variant == "duos"
@@ -1275,32 +1705,41 @@ class PowerLogParser:
                     board_attack=board_attack,
                     board_health=board_health,
                     board_cards=board_cards,
+                    board_minions=board_minions,
                 )
             )
         return tuple(sorted(result, key=lambda item: (item.placement or 99, item.player_id))[:8])
 
     def _capture_observed_opponent_board(self) -> None:
-        player_id = self.next_opponent_player_id
+        player_id = self._resolved_next_opponent_player_id()
         if player_id <= 0:
             return
-        entities = self._battlegrounds_board_entities(player_id)
+        direct_entities = self._battlegrounds_board_entities(player_id)
+        bob_entities: list[Entity] = []
         if self.bob_controller is not None:
-            entities.extend(
-                self._battlegrounds_board_entities(
-                    self.bob_controller,
-                    excluded_entity_ids=self._combat_bob_stale_entity_ids,
-                )
+            bob_entities = self._battlegrounds_board_entities(
+                self.bob_controller,
+                excluded_entity_ids=self._combat_bob_stale_entity_ids,
             )
-        entities = entities[:7]
-        cards = tuple(label for entity in entities if (label := self._visible_card_label(entity)))[:7]
+        combined = [*direct_entities, *bob_entities]
+        positioned: dict[int, Entity] = {}
+        for entity in combined:
+            position = entity.tag_int("ZONE_POSITION")
+            if 1 <= position <= 7:
+                positioned.setdefault(position, entity)
+        if positioned:
+            entities = [positioned[position] for position in sorted(positioned)]
+        else:
+            # Without positions there is no safe way to distinguish duplicate
+            # views from legitimate copies of the same minion.
+            entities = direct_entities or bob_entities
+        cards = self._battlegrounds_cards(entities, maximum=7)
         if not cards:
             return
-        self._observed_boards[player_id] = (
-            self.battlegrounds_round,
-            cards,
-            sum(entity.attack for entity in entities),
-            sum(entity.health or 0 for entity in entities),
-        )
+        previous = self._observed_boards.get(player_id)
+        if previous and previous[0] == self.battlegrounds_round:
+            return
+        self._observed_boards[player_id] = (self.battlegrounds_round, cards)
 
     def _observe_battlegrounds_combat_marker(
         self,
@@ -1318,10 +1757,8 @@ class PowerLogParser:
         if self.bob_controller is not None and controller == self.bob_controller:
             if entity.entity_id in self._combat_bob_stale_entity_ids:
                 self._combat_bob_stale_entity_ids.clear()
-        elif controller != self.next_opponent_player_id:
-            return
-        observed = self._observed_boards.get(self.next_opponent_player_id)
-        if observed is not None and observed[0] == self.battlegrounds_round:
+        next_opponent_player_id = self._resolved_next_opponent_player_id()
+        if controller != self.bob_controller and controller != next_opponent_player_id:
             return
         self._capture_observed_opponent_board()
 
@@ -1340,7 +1777,7 @@ class PowerLogParser:
             for entity in self.entities.values()
             if self._controller(entity) == self.bob_controller
             and entity.zone == "PLAY"
-            and self._is_minion(entity)
+            and self._is_battlegrounds_minion(entity)
             and self._is_battlegrounds_gameplay_entity(entity)
         }
         return True
@@ -1449,10 +1886,21 @@ class PowerLogParser:
     def _is_local_battlegrounds_entity(self, entity: Entity) -> bool:
         if self.local_controller is None:
             return False
-        return self._controller(entity) == self.local_controller or entity.tag_int("PLAYER_ID") == self.local_controller
+        player_id = entity.tag_int("PLAYER_ID")
+        if player_id > 0:
+            return player_id == self.local_controller
+        return self._controller(entity) == self.local_controller
 
     def _battlegrounds_player_id(self, entity: Entity) -> int:
         return entity.tag_int("PLAYER_ID") or self._controller(entity) or 0
+
+    def _resolved_next_opponent_player_id(self) -> int:
+        if self.next_opponent_player_id > 0:
+            return self.next_opponent_player_id
+        local_player = self.entities.get(
+            self.player_entities.get(self.local_controller or -1, -1)
+        )
+        return local_player.tag_int("NEXT_OPPONENT_PLAYER_ID") if local_player else 0
 
     def _observe_battlegrounds_counter(self, entity: Entity, tag: str, current: int) -> bool:
         player_id = self._battlegrounds_player_id(entity)
@@ -1502,7 +1950,7 @@ class PowerLogParser:
     def _infer_local_controller_from_show(self, entity: Entity) -> None:
         if self.local_controller is not None or self.spectating or entity.zone != "HAND":
             return
-        self.local_controller = self._controller(entity)
+        self._set_local_controller(self._controller(entity))
 
     def _controller(self, entity: Entity | None, fallback: int | None = None) -> int | None:
         if entity is None:
@@ -1527,11 +1975,40 @@ class PowerLogParser:
 
     @staticmethod
     def _is_hero(entity: Entity) -> bool:
-        return entity.card_type == "HERO" or entity.card_id.startswith("HERO_")
+        card_id = entity.card_id.upper()
+        return bool(
+            entity.card_type == "HERO"
+            or card_id.startswith(("HERO_", "TB_BACONSHOP_HERO_"))
+            or entity.tag_int("BACON_HERO_CAN_BE_DRAFTED") > 0
+            or entity.tag_int("BACON_SKIN") > 0
+        )
 
     @staticmethod
     def _is_minion(entity: Entity) -> bool:
         return entity.card_type == "MINION"
+
+    def _is_battlegrounds_minion(self, entity: Entity) -> bool:
+        if self._is_minion(entity):
+            return True
+        if self.mode != "battlegrounds" or not entity.card_id or self._is_hero(entity):
+            return False
+        if entity.card_type in {
+            "GAME",
+            "PLAYER",
+            "HERO_POWER",
+            "SPELL",
+            "BATTLEGROUND_SPELL",
+            "ENCHANTMENT",
+            "WEAPON",
+            "LOCATION",
+        }:
+            return False
+        if entity.card_type:
+            return "ATK" in entity.tags and "HEALTH" in entity.tags
+        position = entity.tag_int("ZONE_POSITION")
+        return (1 <= position <= 7) or (
+            "ATK" in entity.tags and "HEALTH" in entity.tags
+        )
 
     def _side_name(self, controller: int | None) -> str:
         if controller is None or self.local_controller is None:

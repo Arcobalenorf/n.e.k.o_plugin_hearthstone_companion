@@ -32,7 +32,7 @@ def _strict_bool(data: Mapping[str, Any], key: str, default: bool) -> bool:
 class CompanionConfig:
     monitor_on_start: bool = True
     log_path: str = ""
-    poll_interval_seconds: float = 0.4
+    poll_interval_seconds: float = 0.1
     initial_read_max_bytes: int = 64 * 1024 * 1024
     llm_commentary_enabled: bool = False
     llm_data_consent: bool = False
@@ -57,7 +57,7 @@ class CompanionConfig:
         return cls(
             monitor_on_start=_strict_bool(data, "monitor_on_start", True),
             log_path=str(data.get("log_path") or "").strip(),
-            poll_interval_seconds=_bounded_float(data.get("poll_interval_seconds"), 0.4, 0.1, 5.0),
+            poll_interval_seconds=_bounded_float(data.get("poll_interval_seconds"), 0.1, 0.1, 5.0),
             initial_read_max_bytes=_bounded_int(
                 data.get("initial_read_max_bytes"), 64 * 1024 * 1024, 1024 * 1024, 64 * 1024 * 1024
             ),

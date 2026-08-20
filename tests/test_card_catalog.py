@@ -516,7 +516,16 @@ def test_observed_facts_are_deduplicated_and_keep_zone_order(tmp_path: Path) -> 
         shop=(BattlegroundsCardSnapshot(card_id="BG_TID_713", attack=9, health=8),),
         hand=(BattlegroundsCardSnapshot(card_id="BG_TID_713"),),
         warband=(BattlegroundsCardSnapshot(card_id="BG_TID_713_G", attack=20, health=20),),
-        lobby=(BattlegroundsPlayerSnapshot(player_id=1, hero_card_id="BG_HERO"),),
+        lobby=(
+            BattlegroundsPlayerSnapshot(player_id=1, hero_card_id="BG_HERO"),
+            BattlegroundsPlayerSnapshot(
+                player_id=2,
+                last_seen_round=3,
+                board_minions=(
+                    BattlegroundsCardSnapshot(card_id="BG_TID_713"),
+                ),
+            ),
+        ),
     )
 
     result = catalog.facts_for(snapshot)
@@ -527,6 +536,7 @@ def test_observed_facts_are_deduplicated_and_keep_zone_order(tmp_path: Path) -> 
         "hand": ["BG_TID_713"],
         "warband": ["BG_TID_713_G"],
         "heroes": ["BG_HERO"],
+        "observed_opponent_boards": ["BG_TID_713"],
     }
     assert result["coverage"]["unique_observed_count"] == 4
     assert result["coverage"]["resolved_count"] == 4

@@ -167,6 +167,9 @@ def _compact_battlegrounds(value: Any) -> dict[str, Any] | None:
             "tavern_tier": player.get("tavern_tier"),
             "placement": player.get("placement"),
             "last_seen_round": player.get("last_seen_round"),
+            "board": _bounded_json_value(
+                player.get("board") or {}, string_limit=40, list_limit=7
+            ),
         }
 
     return {
@@ -178,6 +181,14 @@ def _compact_battlegrounds(value: Any) -> dict[str, Any] | None:
         "tavern_tier": value.get("tavern_tier"),
         "frozen": value.get("frozen"),
         "placement": value.get("placement"),
+        "hero_choices": [
+            {
+                "id": str(choice.get("card_id") or "")[:40],
+                "name": str(choice.get("name") or "")[:40],
+            }
+            for choice in list(value.get("hero_choices") or [])[:8]
+            if isinstance(choice, Mapping)
+        ],
         "local": compact_player(local),
         "next_opponent": compact_player(opponent),
         "shop": [_compact_card(card) for card in list(value.get("shop") or [])[:3]],

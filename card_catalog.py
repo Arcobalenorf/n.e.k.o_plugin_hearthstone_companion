@@ -28,7 +28,7 @@ _MAX_CARDS = 5_000
 _MAX_CHILD_RELATIONSHIPS = 32
 _PAGE_SIZE = 100
 _USER_AGENT = (
-    "NEKO-Hearthstone-Companion/0.1.5 "
+    "NEKO-Hearthstone-Companion/0.2.0 "
     "(+https://github.com/Arcobalenorf/n.e.k.o_plugin_hearthstone_companion)"
 )
 
@@ -838,6 +838,13 @@ class BattlegroundsCardCatalog:
             "hand": [card.card_id for card in battlegrounds.hand if card.card_id],
             "warband": [card.card_id for card in battlegrounds.warband if card.card_id],
             "heroes": [player.hero_card_id for player in battlegrounds.lobby if player.hero_card_id],
+            "observed_opponent_boards": [
+                card.card_id
+                for player in battlegrounds.lobby
+                if not player.is_local and player.last_seen_round > 0
+                for card in player.board_minions
+                if card.card_id
+            ],
         }
         ordered_ids: list[str] = []
         for values in zone_ids.values():

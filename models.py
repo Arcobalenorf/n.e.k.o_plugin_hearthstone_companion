@@ -23,6 +23,7 @@ class Entity:
     revealed: bool = False
     hidden: bool = False
     visibility_revoked: bool = False
+    realtime_fields: set[str] = field(default_factory=set)
 
     def tag_int(self, name: str, default: int = 0) -> int:
         value = _as_int(self.tags.get(name.upper()))
@@ -155,6 +156,7 @@ class BattlegroundsPlayerSnapshot:
     board_attack: int = 0
     board_health: int = 0
     board_cards: tuple[str, ...] = ()
+    board_minions: tuple[BattlegroundsCardSnapshot, ...] = ()
 
     @property
     def effective_health(self) -> int | None:
@@ -181,6 +183,7 @@ class BattlegroundsPlayerSnapshot:
                 "attack": self.board_attack,
                 "health": self.board_health,
                 "cards": list(self.board_cards),
+                "minions": [card.to_public_dict() for card in self.board_minions],
                 "is_last_observed": not self.is_local and self.last_seen_round > 0,
             },
         }
