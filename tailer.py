@@ -11,6 +11,7 @@ from typing import Callable, Iterable
 from .process_discovery import hearthstone_executable_paths
 
 MAX_LINE_BYTES = 256 * 1024
+_CURSOR_GUARD_BYTES = 256
 _SPECTATOR_START_MARKERS = (b"Start Spectator Game", b"Begin Spectating 1st player", b"Begin Spectating 2nd player")
 _SPECTATOR_END_MARKERS = (b"End Spectator Mode", b"End Spectator Game")
 _GAMESTATE_CREATE_RE = re.compile(
@@ -117,6 +118,7 @@ class TailBatch:
     bootstrap: bool = False
     source_reset: bool = False
     bootstrap_complete: bool = True
+    modified_at: float | None = None
 
 
 class PowerLogTailer:
@@ -129,6 +131,7 @@ class PowerLogTailer:
         self._identity: tuple[int, int] | None = None
         self._discarding_long_line = False
         self._bootstrap_complete = False
+        self._cursor_guard = b""
 
     def reset(self) -> None:
         self.path = None
@@ -137,6 +140,7 @@ class PowerLogTailer:
         self._identity = None
         self._discarding_long_line = False
         self._bootstrap_complete = False
+        self._cursor_guard = b""
 
     def poll(self, *, max_bytes: int = 2 * 1024 * 1024) -> TailBatch:
         path = self.locator.resolve()
@@ -150,6 +154,7 @@ class PowerLogTailer:
             self.offset = 0
             self._partial = b""
             self._discarding_long_line = False
+            self._cursor_guard = b""
             return self._bootstrap(path)
 
         try:
@@ -164,6 +169,7 @@ class PowerLogTailer:
             self.offset = 0
             self._partial = b""
             self._discarding_long_line = False
+            self._cursor_guard = b""
             return self._bootstrap(path, source_reset=True)
 
         size = stat.st_size
@@ -172,9 +178,29 @@ class PowerLogTailer:
             self.offset = 0
             self._partial = b""
             self._discarding_long_line = False
+            self._cursor_guard = b""
             return self._bootstrap(path, source_reset=True)
+        guard_matches = self._cursor_guard_matches(path)
+        if guard_matches is False:
+            self.offset = 0
+            self._partial = b""
+            self._discarding_long_line = False
+            self._cursor_guard = b""
+            return self._bootstrap(path, source_reset=True)
+        if guard_matches is None:
+            return TailBatch(
+                (),
+                path,
+                bootstrap_complete=self._bootstrap_complete,
+                modified_at=float(stat.st_mtime),
+            )
         if size == self.offset:
-            return TailBatch((), path, bootstrap_complete=self._bootstrap_complete)
+            return TailBatch(
+                (),
+                path,
+                bootstrap_complete=self._bootstrap_complete,
+                modified_at=float(stat.st_mtime),
+            )
 
         try:
             with path.open("rb") as handle:
@@ -182,11 +208,19 @@ class PowerLogTailer:
                 data = handle.read(max(1, int(max_bytes)))
                 self.offset = handle.tell()
         except OSError:
-            return TailBatch((), path, bootstrap_complete=self._bootstrap_complete)
+            return TailBatch(
+                (),
+                path,
+                bootstrap_complete=self._bootstrap_complete,
+                modified_at=float(stat.st_mtime),
+            )
+        if data:
+            self._cursor_guard = (self._cursor_guard + data)[-_CURSOR_GUARD_BYTES:]
         return TailBatch(
             self._decode_complete_lines(data),
             path,
             bootstrap_complete=self._bootstrap_complete,
+            modified_at=float(stat.st_mtime),
         )
 
     def _bootstrap(self, path: Path, *, source_reset: bool = True) -> TailBatch:
@@ -199,6 +233,7 @@ class PowerLogTailer:
                 data = handle.read()
                 self.offset = handle.tell()
                 self._identity = self._file_identity(stat)
+                self._cursor_guard = data[-_CURSOR_GUARD_BYTES:]
         except OSError:
             self.reset()
             return TailBatch((), None, bootstrap_complete=False)
@@ -225,7 +260,22 @@ class PowerLogTailer:
             bootstrap=True,
             source_reset=source_reset,
             bootstrap_complete=self._bootstrap_complete,
+            modified_at=float(stat.st_mtime),
         )
+
+    def _cursor_guard_matches(self, path: Path) -> bool | None:
+        if not self._cursor_guard:
+            return True
+        start = self.offset - len(self._cursor_guard)
+        if start < 0:
+            return False
+        try:
+            with path.open("rb") as handle:
+                handle.seek(start)
+                current = handle.read(len(self._cursor_guard))
+        except OSError:
+            return None
+        return current == self._cursor_guard
 
     @staticmethod
     def _file_identity(stat: os.stat_result) -> tuple[int, int]:

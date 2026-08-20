@@ -18,6 +18,7 @@ from hearthstone_companion_under_test.card_catalog import (
 )
 from hearthstone_companion_under_test.models import (
     BattlegroundsCardSnapshot,
+    BattlegroundsHeroChoiceSnapshot,
     BattlegroundsPlayerSnapshot,
     BattlegroundsSnapshot,
 )
@@ -201,12 +202,14 @@ def test_observed_facts_are_deduplicated_and_keep_zone_order(tmp_path: Path) -> 
             [
                 _raw_card(1, "BG_TID_713", "A", tribes=["Mech"], golden_id=101),
                 _raw_card(2, "BG_HERO", "Hero", card_type="hero", tier=0),
+                _raw_card(3, "BG_HERO_CHOICE", "Choice", card_type="hero", tier=0),
             ],
             fetched_at=1000.0,
         ),
     )
     catalog = BattlegroundsCardCatalog(cache, _logger(), network_enabled=False, now=lambda: 1001.0)
     snapshot = BattlegroundsSnapshot(
+        hero_choices=(BattlegroundsHeroChoiceSnapshot(card_id="BG_HERO_CHOICE"),),
         shop=(BattlegroundsCardSnapshot(card_id="BG_TID_713", attack=9, health=8),),
         hand=(BattlegroundsCardSnapshot(card_id="BG_TID_713"),),
         warband=(BattlegroundsCardSnapshot(card_id="BG_TID_713_G", attack=20, health=20),),
@@ -216,13 +219,15 @@ def test_observed_facts_are_deduplicated_and_keep_zone_order(tmp_path: Path) -> 
     result = catalog.facts_for(snapshot)
 
     assert result["coverage"]["zone_ids"] == {
+        "hero_choices": ["BG_HERO_CHOICE"],
         "shop": ["BG_TID_713"],
         "hand": ["BG_TID_713"],
         "warband": ["BG_TID_713_G"],
         "heroes": ["BG_HERO"],
     }
-    assert result["coverage"]["unique_observed_count"] == 3
-    assert result["coverage"]["resolved_count"] == 3
+    assert result["coverage"]["unique_observed_count"] == 4
+    assert result["coverage"]["resolved_count"] == 4
+    assert result["observed_card_facts"]["BG_HERO_CHOICE"]["card_type"] == "hero"
     assert result["observed_card_facts"]["BG_TID_713"]["golden_observation"] is False
     assert result["observed_card_facts"]["BG_TID_713_G"]["golden_observation"] is True
     assert result["observed_card_facts"]["BG_TID_713_G"]["normal_rules_text"]

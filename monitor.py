@@ -15,6 +15,7 @@ OutputCallback = Callable[[str, GameEvent, GameSnapshot], bool]
 StatusCallback = Callable[[dict[str, Any]], None]
 ResultCallback = Callable[[GameEvent, GameSnapshot], None]
 EventCallback = Callable[[GameEvent, GameSnapshot], None]
+LIVE_STATE_MAX_AGE_SECONDS = 300.0
 
 
 class CompanionMonitor:
@@ -52,8 +53,28 @@ class CompanionMonitor:
         self._lifecycle_lock = threading.RLock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._start_count = 0
+        self._source_generation = 0
+        self._live_context_generation: int | None = None
         self._bootstrap_complete = False
         self._state_ready_notified = False
+        self._state_stale_notified = False
+
+    def _begin_source_generation_locked(self) -> None:
+        self._source_generation += 1
+        self._live_context_generation = None
+        self._bootstrap_complete = False
+        self._state_ready_notified = False
+        self._state_stale_notified = False
+        self._status.source_state = (
+            "waiting_for_log" if self._status.monitor_running else "waiting"
+        )
+        self._status.resolved_log_path = ""
+        self._status.source_modified_at = 0.0
+        self._status.last_line_at = 0.0
+        self._status.last_event_at = 0.0
+        self._status.last_event_kind = ""
+        self._status.last_error_code = ""
 
     def _reset_reader_locked(self) -> None:
         self._parser = PowerLogParser()
@@ -62,13 +83,16 @@ class CompanionMonitor:
             initial_read_max_bytes=self.config.initial_read_max_bytes,
         )
         self._snapshot = self._parser.snapshot()
-        self._bootstrap_complete = False
-        self._state_ready_notified = False
+        self._begin_source_generation_locked()
 
     def start(self) -> bool:
         with self._lifecycle_lock:
             if self._thread is not None and self._thread.is_alive():
                 return False
+            with self._lock:
+                if self._start_count:
+                    self._reset_reader_locked()
+                self._start_count += 1
             stop_event = threading.Event()
             self._stop = stop_event
             self._thread = threading.Thread(
@@ -125,17 +149,19 @@ class CompanionMonitor:
         while not stop_event.is_set():
             batch = None
             state_ready = False
+            state_stale = False
+            state_resumed = False
             try:
                 now = time.time()
                 with self._lock:
                     batch = self._tailer.poll()
-                    self._status.resolved_log_path = str(batch.path or "")
                     self._status.last_error_code = ""
                     if batch.source_reset:
                         self._parser.reset_source()
-                        self._state_ready_notified = False
+                        self._begin_source_generation_locked()
                     if batch.bootstrap:
                         self._bootstrap_complete = batch.bootstrap_complete
+                    was_stale = self._state_stale_notified
                     emissions: list[tuple[GameEvent, GameSnapshot]] = []
                     processed_lines = 0
                     interrupted = False
@@ -149,6 +175,7 @@ class CompanionMonitor:
                             and "PowerTaskList.DebugPrintPower" not in line
                         ):
                             self._parser.reset_source()
+                            self._begin_source_generation_locked()
                             self._bootstrap_complete = True
                         line_events = self._parser.feed_line(line, now=now)
                         processed_lines += 1
@@ -164,18 +191,61 @@ class CompanionMonitor:
                     else:
                         snapshot = self._parser.snapshot()
                         self._snapshot = snapshot
+                        active_snapshot = bool(
+                            snapshot.game_number > 0
+                            and snapshot.phase not in {"idle", "ended", "spectator"}
+                        )
+                        if processed_lines:
+                            activity_at = float(batch.modified_at or now)
+                            self._status.last_line_at = min(now, max(0.0, activity_at))
+                            self._state_stale_notified = False
+                        activity_at = max(
+                            self._status.last_line_at,
+                            self._status.last_event_at,
+                        )
+                        live_active_snapshot = bool(
+                            active_snapshot
+                            and activity_at > 0
+                            and now - activity_at <= LIVE_STATE_MAX_AGE_SECONDS
+                        )
                         state_ready = bool(
                             batch.bootstrap
                             and self._bootstrap_complete
                             and not self._state_ready_notified
-                            and snapshot.game_number > 0
-                            and snapshot.phase not in {"idle", "ended", "spectator"}
+                            and live_active_snapshot
                         )
                         if state_ready:
                             self._state_ready_notified = True
+                            self._live_context_generation = self._source_generation
+                        state_resumed = bool(
+                            processed_lines
+                            and not batch.bootstrap
+                            and was_stale
+                            and live_active_snapshot
+                        )
+                        if processed_lines and not batch.bootstrap and live_active_snapshot:
+                            self._live_context_generation = self._source_generation
+                        if not active_snapshot:
+                            self._live_context_generation = None
+                            self._state_stale_notified = False
+                        stale_active_snapshot = bool(
+                            active_snapshot
+                            and activity_at > 0
+                            and now - activity_at > LIVE_STATE_MAX_AGE_SECONDS
+                        )
+                        if (
+                            stale_active_snapshot
+                            and not self._state_stale_notified
+                            and self._live_context_generation == self._source_generation
+                        ):
+                            state_stale = True
+                            self._state_stale_notified = True
+                            self._live_context_generation = None
                         if self._parser.entity_capacity_exceeded:
                             self._status.last_error_code = "parser:entity_capacity_exceeded"
                     self._status.lines_seen += processed_lines
+                    self._status.resolved_log_path = str(batch.path or "")
+                    self._status.source_modified_at = float(batch.modified_at or 0.0)
                     self._status.source_state = (
                         "waiting_for_log"
                         if batch.path is None
@@ -183,9 +253,6 @@ class CompanionMonitor:
                         if self._bootstrap_complete
                         else "bootstrap_incomplete"
                     )
-                    if processed_lines:
-                        self._status.last_line_at = now
-
                 if interrupted:
                     break
                 if batch.source_reset:
@@ -198,6 +265,36 @@ class CompanionMonitor:
                             "state_ready",
                             0,
                             "当前局势已就绪",
+                            now,
+                            {
+                                "mode": snapshot.mode,
+                                "phase": snapshot.phase,
+                                "game_number": snapshot.game_number,
+                            },
+                        ),
+                        snapshot,
+                    )
+                if state_stale:
+                    self._notify_event(
+                        GameEvent(
+                            "state_stale",
+                            0,
+                            "当前日志局势已过期",
+                            now,
+                            {
+                                "mode": snapshot.mode,
+                                "phase": snapshot.phase,
+                                "game_number": snapshot.game_number,
+                            },
+                        ),
+                        snapshot,
+                    )
+                if state_resumed:
+                    self._notify_event(
+                        GameEvent(
+                            "state_resumed",
+                            0,
+                            "当前局势已恢复实时更新",
                             now,
                             {
                                 "mode": snapshot.mode,
@@ -339,4 +436,4 @@ class CompanionMonitor:
             pass
 
 
-__all__ = ["CompanionMonitor"]
+__all__ = ["CompanionMonitor", "LIVE_STATE_MAX_AGE_SECONDS"]

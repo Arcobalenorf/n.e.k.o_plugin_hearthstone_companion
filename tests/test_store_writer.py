@@ -81,6 +81,108 @@ def test_submit_error_makes_flush_and_stop_report_failure() -> None:
     assert writer.is_running() is False
 
 
+def test_successful_write_recovers_from_previous_store_error() -> None:
+    class Err:
+        pass
+
+    attempts = 0
+
+    async def write(_value: dict[str, object]) -> object:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return Err()
+        return True
+
+    writer = AsyncStoreWriter(write, _Logger())
+    writer.start()
+
+    assert writer.write_and_wait({"games": 1}) is False
+    assert writer.last_error_code() == "stats:store_err"
+    assert writer.flush() is False
+
+    assert writer.write_and_wait({"games": 2}) is True
+    assert writer.last_error_code() == ""
+    assert writer.flush() is True
+    assert writer.stop() is True
+
+
+def test_successful_write_recovers_from_unavailable_submission() -> None:
+    async def write(_value: dict[str, object]) -> bool:
+        return True
+
+    writer = AsyncStoreWriter(write, _Logger())
+    writer.start()
+    with writer._lock:
+        writer._accepting = False
+
+    assert writer.submit({"games": 1}) is False
+    assert writer.last_error_code() == "stats:writer_unavailable"
+
+    with writer._lock:
+        writer._accepting = True
+    assert writer.write_and_wait({"games": 2}) is True
+    assert writer.last_error_code() == ""
+    assert writer.stop() is True
+
+
+def test_newer_queued_snapshot_recovers_flush_and_stop_from_older_failure() -> None:
+    class Err:
+        pass
+
+    async def write(value: dict[str, object]) -> object:
+        if value["games"] == 1:
+            return Err()
+        return True
+
+    writer = AsyncStoreWriter(write, _Logger())
+    writer.start()
+    assert writer.submit({"games": 1}) is True
+    assert writer.submit({"games": 2}) is True
+
+    assert writer.flush() is True
+    assert writer.last_error_code() == ""
+    assert writer.stop() is True
+
+
+def test_older_success_does_not_hide_newer_schedule_failure(monkeypatch) -> None:
+    write_started = threading.Event()
+    release_write = threading.Event()
+    fail_next_schedule = False
+    original_schedule = asyncio.run_coroutine_threadsafe
+
+    async def write(value: dict[str, object]) -> bool:
+        if value["games"] == 1:
+            write_started.set()
+            await asyncio.to_thread(release_write.wait)
+        return True
+
+    def controlled_schedule(coroutine, loop):  # type: ignore[no-untyped-def]
+        nonlocal fail_next_schedule
+        if fail_next_schedule:
+            fail_next_schedule = False
+            raise RuntimeError("schedule unavailable")
+        return original_schedule(coroutine, loop)
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", controlled_schedule)
+    writer = AsyncStoreWriter(write, _Logger())
+    writer.start()
+    assert writer.submit({"games": 1}) is True
+    assert write_started.wait(1.0)
+
+    fail_next_schedule = True
+    assert writer.submit({"games": 2}) is False
+    assert writer.last_error_code() == "stats:schedule:RuntimeError"
+    release_write.set()
+
+    assert writer.flush() is False
+    assert writer.last_error_code() == "stats:schedule:RuntimeError"
+
+    assert writer.write_and_wait({"games": 3}) is True
+    assert writer.last_error_code() == ""
+    assert writer.stop() is True
+
+
 def test_timed_out_write_can_be_compensated_in_serial_order() -> None:
     release = threading.Event()
     writes: list[int] = []

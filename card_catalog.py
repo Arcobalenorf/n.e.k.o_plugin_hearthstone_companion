@@ -571,6 +571,9 @@ class BattlegroundsCardCatalog:
                 "observed_card_facts": {},
             }
         zone_ids: dict[str, list[str]] = {
+            "hero_choices": [
+                hero.card_id for hero in battlegrounds.hero_choices if hero.card_id
+            ],
             "shop": [card.card_id for card in battlegrounds.shop if card.card_id],
             "hand": [card.card_id for card in battlegrounds.hand if card.card_id],
             "warband": [card.card_id for card in battlegrounds.warband if card.card_id],

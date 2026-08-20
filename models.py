@@ -22,6 +22,7 @@ class Entity:
     tags: dict[str, str] = field(default_factory=dict)
     revealed: bool = False
     hidden: bool = False
+    visibility_revoked: bool = False
 
     def tag_int(self, name: str, default: int = 0) -> int:
         value = _as_int(self.tags.get(name.upper()))
@@ -124,6 +125,18 @@ class BattlegroundsCardSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class BattlegroundsHeroChoiceSnapshot:
+    card_id: str = ""
+    name: str = ""
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "card_id": self.card_id,
+            "name": self.name,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class BattlegroundsPlayerSnapshot:
     player_id: int
     is_local: bool = False
@@ -136,6 +149,7 @@ class BattlegroundsPlayerSnapshot:
     placement: int = 0
     eliminated: bool = False
     next_opponent: bool = False
+    is_teammate: bool = False
     last_seen_round: int = 0
     board_count: int = 0
     board_attack: int = 0
@@ -160,6 +174,7 @@ class BattlegroundsPlayerSnapshot:
             "placement": self.placement,
             "eliminated": self.eliminated,
             "next_opponent": self.next_opponent,
+            "is_teammate": self.is_teammate,
             "last_seen_round": self.last_seen_round,
             "board": {
                 "count": self.board_count,
@@ -182,6 +197,7 @@ class BattlegroundsSnapshot:
     frozen: bool = False
     next_opponent_player_id: int = 0
     placement: int = 0
+    hero_choices: tuple[BattlegroundsHeroChoiceSnapshot, ...] = ()
     shop: tuple[BattlegroundsCardSnapshot, ...] = ()
     hand: tuple[BattlegroundsCardSnapshot, ...] = ()
     warband: tuple[BattlegroundsCardSnapshot, ...] = ()
@@ -199,6 +215,7 @@ class BattlegroundsSnapshot:
             "frozen": self.frozen,
             "next_opponent_player_id": self.next_opponent_player_id,
             "placement": self.placement,
+            "hero_choices": [choice.to_public_dict() for choice in self.hero_choices],
             "shop": [card.to_public_dict() for card in self.shop],
             "hand": [card.to_public_dict() for card in self.hand],
             "warband": [card.to_public_dict() for card in self.warband],
@@ -244,6 +261,7 @@ class RuntimeStatus:
     lines_seen: int = 0
     events_seen: int = 0
     llm_submissions: int = 0
+    source_modified_at: float = 0.0
     last_line_at: float = 0.0
     last_event_at: float = 0.0
     last_event_kind: str = ""
@@ -257,6 +275,7 @@ class RuntimeStatus:
             "lines_seen": self.lines_seen,
             "events_seen": self.events_seen,
             "llm_submissions": self.llm_submissions,
+            "source_modified_at": self.source_modified_at,
             "last_line_at": self.last_line_at,
             "last_event_at": self.last_event_at,
             "last_event_kind": self.last_event_kind,

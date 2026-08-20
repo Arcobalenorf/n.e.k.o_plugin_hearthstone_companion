@@ -33,7 +33,8 @@
 
 - 单排/双排、招募/战斗阶段和回合；
 - 我方金币、酒馆等级、冻结状态、当前商店、手牌和战团；
-- 八名英雄的临时 player ID、英雄 card ID/名称、生命、护甲、酒馆等级、淘汰和名次；
+- 英雄选择阶段由 `Power.log` 明确归属于本地玩家、未隐藏且未锁定的候选英雄 card ID/名称；不推断未观测选项；
+- 选择完成后大厅英雄的临时 player ID、英雄 card ID/名称、生命、护甲、酒馆等级、淘汰和名次；
 - 当前对手 ID；
 - 对手上次观察的公开战团及观察回合，明确标记为非当前状态；
 - 任务、饰品、畸变、伙伴等已公开的机制 ID/进度；
@@ -73,7 +74,7 @@
 
 默认每 24 小时访问 `https://hsbg.cards/api/v1/patches` 和带 `pool=current`、分页参数的 `/cards`。请求固定为 GET，不携带日志、玩家状态、卡牌 ID、昵称、账号或模型内容；服务端像普通网站一样可见用户 IP、请求时间和插件 User-Agent。可用 `card_catalog_network_enabled=false` 停止新的目录请求，已有缓存仍可离线使用并标记陈旧；关闭瞬间已经发出的单个请求可能正常结束，但不会继续下一页。
 
-缓存只包含公共卡牌元数据，写入 N.E.K.O 分配给插件的 `cache_path()`；不写插件安装目录或 Store。响应体、条目、字段长度和重定向均受限制，更新通过原子替换完成。缓存损坏、超时、限流或服务错误不会影响 Power.log 监听和已有局势。
+缓存只包含公共卡牌元数据，写入 N.E.K.O 分配给插件的 `data_path()`；不写插件安装目录或 Store。响应体、条目、字段长度和重定向均受限制，更新通过原子替换完成。缓存损坏、超时、限流或服务错误不会影响 Power.log 监听和已有局势。
 
 插件包不镜像或再分发 hsbg.cards 数据库。Card data: [hsbg.cards](https://hsbg.cards/about), subject to its [terms](https://hsbg.cards/terms). 卡牌名称、规则与其他 Hearthstone 游戏数据归 Blizzard Entertainment 所有。本项目与 hsbg.cards、Blizzard、网易均无隶属或背书关系。
 

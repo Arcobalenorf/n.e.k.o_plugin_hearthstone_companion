@@ -16,15 +16,17 @@
 
 ## 酒馆战棋支持
 
-v0.1.5 支持单排和双排的可验证公开状态：
+当前 `dev` 分支支持单排和双排的可验证公开状态：
 
 - 战棋模式、Bob、本地玩家与最多八名英雄；
-- 英雄选择、招募/战斗阶段、逐轮胜负、回合、当前对手；
+- 英雄选择阶段实际观测到的本地候选、选择完成后的我方英雄、招募/战斗阶段、逐轮胜负、回合、当前对手；
 - 金币、酒馆等级、冻结、商店、手牌与战团；
 - 英雄血量/护甲、淘汰、最终名次；
 - 对手阵容仅标记为“上次观察，第 N 回合，非当前阵容”；
 - 任务、饰品、畸变、伙伴等赛季机制的公开 ID/进度；
 - 单排 Top 4、双排 Top 2、第一名率、平均名次和英雄维度的本机聚合统计。
+
+当前能力有三条明确边界：候选英雄只来自 `Power.log` 为本地玩家实际公开的可选英雄，不推断未观测或已锁定的选项；具体购买建议只适用于正在更新的招募阶段和当前可见商店，战斗阶段或缓存状态不会被当作可执行购买依据；普通构筑模式只提供我方手牌数量，不提供具体手牌身份，因此角色可以点评公开场面和资源，但不能可靠回答“手里具体出哪一张牌”。
 
 随包赛季资料当前固定为战棋第 14 赛季、补丁 36.2.2、`Dark Gifts of Dalaran`，来源链包含 Blizzard 36.2 赛季说明和 36.2.2 平衡补丁，验证日期为 2026-08-19。它是版本化规则资料，不是胜率数据。
 
@@ -95,7 +97,7 @@ uv run python -m plugin.neko_plugin_cli.cli verify "<plugin-repo>\dist\hearthsto
 
 ## English summary
 
-Hearthstone Catgirl Companion is a read-only N.E.K.O plugin for constructed Hearthstone and Battlegrounds. It turns privacy-filtered public state into emotion cues and sparse speaking opportunities for the active N.E.K.O character. It supports solo and Duos Battlegrounds state, per-combat outcomes, aggregate-only local results, versioned official season rules, and a read-only advice tool. N.E.K.O owns the actual character response; the separate transparent overlay is diagnostic-only because the public SDK does not return generated reply text. The plugin never claims access to unlicensed global win-rate telemetry.
+Hearthstone Catgirl Companion is a read-only N.E.K.O plugin for constructed Hearthstone and Battlegrounds. It turns privacy-filtered public state into emotion cues and sparse speaking opportunities for the active N.E.K.O character. It supports Power.log-observed local hero choices, solo and Duos Battlegrounds state, per-combat outcomes, aggregate-only local results, versioned official season rules, and a read-only advice tool. N.E.K.O owns the actual character response; the separate transparent overlay is diagnostic-only because the public SDK does not return generated reply text. The plugin never claims access to unlicensed global win-rate telemetry.
 
 ## 许可证
 

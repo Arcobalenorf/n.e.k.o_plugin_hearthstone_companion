@@ -137,6 +137,38 @@ def test_truncation_reboots_source_and_marks_reset(tmp_path: Path) -> None:
     assert batch.lines == ("CREATE_GAME",)
 
 
+def test_same_inode_truncate_and_regrow_reboots_source(tmp_path: Path) -> None:
+    path = tmp_path / "Power.log"
+    path.write_text("CREATE_GAME\nold session\n" + "x" * 256 + "\n", encoding="utf-8")
+    tailer = PowerLogTailer(PowerLogLocator(str(path)))
+    tailer.poll()
+    old_offset = tailer.offset
+    old_identity = tailer._identity
+
+    path.write_text(
+        "CREATE_GAME\nnew session\n" + "y" * (old_offset + 256) + "\n",
+        encoding="utf-8",
+    )
+    batch = tailer.poll()
+
+    assert tailer._identity == old_identity
+    assert batch.bootstrap is True
+    assert batch.source_reset is True
+    assert batch.lines[0] == "CREATE_GAME"
+    assert batch.lines[1] == "new session"
+
+
+def test_bootstrap_reports_source_modified_time(tmp_path: Path) -> None:
+    path = tmp_path / "Power.log"
+    path.write_text("CREATE_GAME\n", encoding="utf-8")
+    expected = 1_700_000_000.0
+    os.utime(path, (expected, expected))
+
+    batch = PowerLogTailer(PowerLogLocator(str(path))).poll()
+
+    assert batch.modified_at == expected
+
+
 def test_same_path_file_replacement_reboots_source(tmp_path: Path) -> None:
     path = tmp_path / "Power.log"
     path.write_text("CREATE_GAME\nold\n", encoding="utf-8")

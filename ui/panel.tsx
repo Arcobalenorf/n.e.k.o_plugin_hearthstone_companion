@@ -95,6 +95,11 @@ type BattlegroundsCard = {
   frozen?: boolean
 }
 
+type BattlegroundsHeroChoice = {
+  card_id?: string
+  name?: string
+}
+
 type BattlegroundsLobbyPlayer = {
   player_id?: number
   is_local?: boolean
@@ -108,6 +113,7 @@ type BattlegroundsLobbyPlayer = {
   placement?: number
   eliminated?: boolean
   next_opponent?: boolean
+  is_teammate?: boolean
   last_seen_round?: number
   board?: BoardState & { is_last_observed?: boolean }
 }
@@ -122,6 +128,7 @@ type BattlegroundsState = {
   frozen?: boolean
   next_opponent_player_id?: number
   placement?: number
+  hero_choices?: BattlegroundsHeroChoice[]
   shop?: BattlegroundsCard[]
   hand?: BattlegroundsCard[]
   warband?: BattlegroundsCard[]
@@ -375,6 +382,13 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
       _key: String(player.player_id || 0),
     })),
     [battlegrounds.lobby],
+  )
+  const heroChoiceRows = useMemo(
+    () => (battlegrounds.hero_choices || []).map((hero, index) => ({
+      ...hero,
+      _key: `${hero.card_id || hero.name || "hero-choice"}:${index}`,
+    })),
+    [battlegrounds.hero_choices],
   )
   const shopRows = useMemo(
     () => (battlegrounds.shop || []).map((card, index) => ({
@@ -689,6 +703,28 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
               </Stack>
             </Card>
 
+            {(battlegrounds.phase || phase) === "hero_select" || heroChoiceRows.length > 0 ? (
+              <Card title={t("sections.battlegroundsHeroChoices.title")}>
+                <Stack>
+                  <Text>{t("battlegroundsHeroChoices.observedHelp")}</Text>
+                  {heroChoiceRows.length ? (
+                    <DataTable
+                      data={heroChoiceRows}
+                      rowKey="_key"
+                      maxRows={8}
+                      emptyText={t("battlegroundsHeroChoices.empty")}
+                      columns={[
+                        { key: "name", label: t("battlegroundsHeroChoices.hero"), render: (row) => row.name || row.card_id || t("common.unknown") },
+                        { key: "card_id", label: t("battlegroundsHeroChoices.cardId"), render: (row) => row.card_id || t("common.unknown") },
+                      ]}
+                    />
+                  ) : (
+                    <EmptyState title={t("battlegroundsHeroChoices.empty")} description={t("battlegroundsHeroChoices.emptyHelp")} />
+                  )}
+                </Stack>
+              </Card>
+            ) : null}
+
             <Card title={t("sections.battlegroundsLobby.title")}>
               {lobbyRows.length ? (
                 <DataTable
@@ -702,7 +738,7 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
                     { key: "health", label: t("battlegroundsLobby.health"), render: (row) => row.health == null ? t("common.unknown") : `${row.health}+${row.armor ?? 0}` },
                     { key: "tavern_tier", label: t("battlegroundsLobby.tier") },
                     { key: "placement", label: t("battlegroundsLobby.place"), render: (row) => row.placement || t("common.unknown") },
-                    { key: "next_opponent", label: t("battlegroundsLobby.status"), render: (row) => row.is_local ? t("battlegroundsLobby.local") : row.next_opponent ? t("battlegroundsLobby.next") : row.eliminated ? t("battlegroundsLobby.eliminated") : t("battlegroundsLobby.alive") },
+                    { key: "next_opponent", label: t("battlegroundsLobby.status"), render: (row) => row.is_local ? t("battlegroundsLobby.local") : row.is_teammate ? t("battlegroundsLobby.teammate") : row.next_opponent ? t("battlegroundsLobby.next") : row.eliminated ? t("battlegroundsLobby.eliminated") : t("battlegroundsLobby.alive") },
                     { key: "last_seen_round", label: t("battlegroundsLobby.observed"), render: (row) => row.last_seen_round ? t("battlegroundsLobby.observedRound", { value: row.last_seen_round }) : t("common.none") },
                   ]}
                 />

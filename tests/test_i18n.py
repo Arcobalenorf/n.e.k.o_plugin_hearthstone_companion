@@ -111,6 +111,15 @@ def test_panel_auto_refresh_is_serial_silent_and_preserves_dirty_drafts() -> Non
     assert "if (logPathDirty) return" in panel_source
 
 
+def test_panel_surfaces_observed_hero_choices_and_duos_teammate() -> None:
+    panel_source = (ROOT / "ui" / "panel.tsx").read_text(encoding="utf-8")
+
+    assert "hero_choices?: BattlegroundsHeroChoice[]" in panel_source
+    assert '(battlegrounds.phase || phase) === "hero_select" || heroChoiceRows.length > 0' in panel_source
+    assert 't("battlegroundsHeroChoices.observedHelp")' in panel_source
+    assert 'row.is_teammate ? t("battlegroundsLobby.teammate")' in panel_source
+
+
 def test_custom_log_path_has_an_independent_save_action_in_diagnostics() -> None:
     panel_source = (ROOT / "ui" / "panel.tsx").read_text(encoding="utf-8")
 

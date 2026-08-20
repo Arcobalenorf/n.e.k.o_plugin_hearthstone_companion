@@ -27,6 +27,7 @@ exclude_dirs = [
 exclude_files = [
     ".gitattributes",
     ".gitignore",
+    "AGENTS.md",
     "README.md",
     "uv.lock",
 ]

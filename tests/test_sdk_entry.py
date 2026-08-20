@@ -12,6 +12,9 @@ from typing import Any
 import pytest
 from hearthstone_companion_under_test.config import CompanionConfig
 from hearthstone_companion_under_test.models import (
+    BattlegroundsCardSnapshot,
+    BattlegroundsHeroChoiceSnapshot,
+    BattlegroundsPlayerSnapshot,
     BattlegroundsSnapshot,
     GameEvent,
     GameSnapshot,
@@ -280,12 +283,20 @@ def test_llm_state_tool_does_not_read_state_without_data_consent(monkeypatch) ->
 
     result = asyncio.run(entry.HearthstoneCompanionPlugin.hearthstone_current_state(fake_plugin))
 
-    assert result == {
-        "available": False,
-        "state": {},
-        "privacy_scope": "public_game_state_only",
-        "reason": "llm_data_sharing_not_authorized",
-    }
+    assert result["available"] is False
+    assert result["state"] == {}
+    assert result["privacy_scope"] == "public_game_state_only"
+    assert result["reason"] == "llm_data_sharing_not_authorized"
+    assert result["answer_contract"]["own_hand_card_identities_available"] is False
+    assert result["answer_contract"]["specific_card_play_available"] is False
+
+
+def test_status_entry_never_routes_game_snapshot_through_llm_result_fields(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    metadata = entry.HearthstoneCompanionPlugin.get_status.__neko_test_decorator_kwargs__
+
+    assert "game" not in metadata["llm_result_fields"]
+    assert set(metadata["llm_result_fields"]) == {"summary", "runtime", "overlay", "privacy"}
 
 
 def test_llm_state_tool_returns_public_state_with_consent_even_when_proactive_is_off(
@@ -480,6 +491,63 @@ def test_bootstrap_state_ready_respects_data_consent(monkeypatch) -> None:
     )
 
     assert submitted == []
+
+
+def test_stale_state_restores_context_and_resumed_state_reenters_it(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    submitted: list[dict[str, Any]] = []
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(llm_data_consent=True, target_lanlan="lanlan-a")
+    plugin._context_target = "lanlan-a"
+    plugin._ownership_lock = threading.RLock()
+    plugin._started = True
+    plugin._monitor_dispatch_enabled = True
+    plugin._settings_transition = False
+    plugin.push_message = lambda **kwargs: submitted.append(kwargs) or {"submitted": True}
+    snapshot = GameSnapshot(mode="battlegrounds", phase="recruit", game_number=3)
+
+    plugin._observe_game_event(
+        GameEvent("state_stale", 0, "stale", 100.0, {}),
+        snapshot,
+    )
+    plugin._observe_game_event(
+        GameEvent("state_resumed", 0, "resumed", 101.0, {}),
+        snapshot,
+    )
+
+    assert [item["metadata"]["context_expired"] for item in submitted] == [True, False]
+    assert plugin._context_target == "lanlan-a"
+
+
+def test_sync_active_context_rejects_stale_snapshot(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    submitted: list[dict[str, Any]] = []
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(llm_data_consent=True, target_lanlan="lanlan-a")
+    plugin._context_target = "lanlan-a"
+    plugin._ownership_lock = threading.RLock()
+    plugin._started = True
+    plugin._monitor_dispatch_enabled = True
+    plugin._settings_transition = False
+    plugin.push_message = lambda **kwargs: submitted.append(kwargs) or {"submitted": True}
+    snapshot = GameSnapshot(mode="battlegrounds", phase="recruit", game_number=3)
+    stale_at = time.time() - 3600.0
+    plugin._monitor = types.SimpleNamespace(
+        snapshot=lambda: snapshot,
+        status=lambda: types.SimpleNamespace(
+            source_state="watching",
+            monitor_running=True,
+            last_line_at=stale_at,
+            last_event_at=0.0,
+            source_modified_at=stale_at,
+        ),
+    )
+
+    plugin._sync_active_game_context()
+
+    assert len(submitted) == 1
+    assert submitted[0]["metadata"]["context_expired"] is True
+    assert plugin._context_target is None
     assert plugin._context_target is None
 
 
@@ -798,6 +866,260 @@ def test_reload_config_failure_preserves_current_runtime_config(monkeypatch) -> 
     assert monitor_updates == []
 
 
+def test_config_change_applies_host_effective_config_without_redumping(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    monitor_updates: list[CompanionConfig] = []
+
+    class Config:
+        async def dump(self, **_kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("config_change must use the host-provided effective config")
+
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(llm_data_consent=True, target_lanlan="lanlan-a")
+    plugin._context_target = None
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._settings_transition = False
+    plugin.config = Config()
+    plugin._monitor = types.SimpleNamespace(update_config=lambda cfg: monitor_updates.append(cfg))
+    plugin._catalog = types.SimpleNamespace(configure=lambda **_kwargs: None)
+    plugin._overlay = types.SimpleNamespace(
+        status=lambda: {"running": False},
+        configure=lambda _config: None,
+    )
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
+    updated = CompanionConfig(
+        llm_data_consent=False,
+        llm_commentary_enabled=False,
+        overlay_font_size=35,
+    )
+
+    result = asyncio.run(
+        plugin.config_change(new_config={entry._CONFIG_SECTION: updated.to_dict()})
+    )
+
+    assert result["status"] == "reloaded"
+    assert result["context_restored"] is True
+    assert plugin.cfg.llm_data_consent is False
+    assert plugin.cfg.overlay_font_size == 35
+    assert monitor_updates[-1].llm_data_consent is False
+
+
+def test_config_change_raises_when_effective_config_cannot_be_loaded(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+
+    class Config:
+        async def dump(self, **_kwargs: Any) -> dict[str, Any]:
+            raise TimeoutError("config IPC timed out")
+
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(llm_data_consent=True)
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin.config = Config()
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
+
+    with pytest.raises(RuntimeError, match="could not be loaded"):
+        asyncio.run(plugin.config_change())
+
+    assert plugin.cfg.llm_data_consent is True
+
+
+def test_config_change_revocation_stays_fail_closed_when_context_restore_is_rejected(
+    monkeypatch,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    monitor_updates: list[CompanionConfig] = []
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(llm_data_consent=True, target_lanlan="lanlan-a")
+    plugin._context_target = "lanlan-a"
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._settings_transition = False
+    plugin._monitor = types.SimpleNamespace(update_config=lambda cfg: monitor_updates.append(cfg))
+    plugin._catalog = types.SimpleNamespace(configure=lambda **_kwargs: None)
+    plugin._overlay = types.SimpleNamespace(
+        status=lambda: {"running": False},
+        configure=lambda _config: None,
+    )
+    plugin.push_message = lambda **_kwargs: {"submitted": False}
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
+    updated = CompanionConfig(llm_data_consent=False, target_lanlan="lanlan-a")
+
+    result = asyncio.run(
+        plugin.config_change(new_config={entry._CONFIG_SECTION: updated.to_dict()})
+    )
+
+    assert result["context_restored"] is False
+    assert plugin.cfg.llm_data_consent is False
+    assert plugin.cfg.llm_commentary_enabled is False
+    assert monitor_updates
+    assert all(config.llm_data_consent is False for config in monitor_updates)
+    assert plugin._context_target == "lanlan-a"
+
+
+def test_config_change_revocation_restores_context_and_resets_transition_when_monitor_raises(
+    monkeypatch,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    submitted: list[dict[str, Any]] = []
+
+    def fail_update(_config: CompanionConfig) -> None:
+        raise RuntimeError("monitor apply failed")
+
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(llm_data_consent=True, target_lanlan="lanlan-a")
+    plugin._context_target = "lanlan-a"
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._settings_transition = False
+    plugin._monitor = types.SimpleNamespace(update_config=fail_update)
+    plugin._catalog = types.SimpleNamespace(configure=lambda **_kwargs: None)
+    plugin._overlay = types.SimpleNamespace(
+        status=lambda: {"running": False},
+        configure=lambda _config: None,
+    )
+    plugin.push_message = lambda **kwargs: submitted.append(kwargs) or {"submitted": True}
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
+    updated = CompanionConfig(llm_data_consent=False, target_lanlan="lanlan-a")
+
+    with pytest.raises(RuntimeError, match="monitor apply failed"):
+        asyncio.run(
+            plugin.config_change(new_config={entry._CONFIG_SECTION: updated.to_dict()})
+        )
+
+    assert plugin.cfg.llm_data_consent is False
+    assert plugin.cfg.llm_commentary_enabled is False
+    assert plugin._settings_transition is False
+    assert plugin._context_target is None
+    assert len(submitted) == 1
+    assert submitted[0]["metadata"]["context_expired"] is True
+
+
+def test_config_change_rolls_back_non_privacy_runtime_apply_failure(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    previous = CompanionConfig(overlay_font_size=24)
+    applied_sizes: list[int] = []
+    fail_once = True
+
+    def update_monitor(config: CompanionConfig) -> None:
+        nonlocal fail_once
+        applied_sizes.append(config.overlay_font_size)
+        if fail_once:
+            fail_once = False
+            raise RuntimeError("monitor apply failed")
+
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = previous
+    plugin._context_target = None
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._settings_transition = False
+    plugin._monitor = types.SimpleNamespace(update_config=update_monitor)
+    plugin._catalog = types.SimpleNamespace(configure=lambda **_kwargs: None)
+    plugin._overlay = types.SimpleNamespace(
+        status=lambda: {"running": False},
+        configure=lambda _config: None,
+    )
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
+    updated = CompanionConfig(overlay_font_size=39)
+
+    with pytest.raises(RuntimeError, match="monitor apply failed"):
+        asyncio.run(
+            plugin.config_change(new_config={entry._CONFIG_SECTION: updated.to_dict()})
+        )
+
+    assert plugin.cfg.overlay_font_size == 24
+    assert applied_sizes == [39, 24]
+    assert plugin._settings_transition is False
+
+
+def test_config_change_does_not_restart_running_overlay_for_non_runtime_fields(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+
+    class Overlay:
+        def __init__(self) -> None:
+            self.config = CompanionConfig(overlay_font_size=24)
+
+        def status(self) -> dict[str, Any]:
+            return {"running": True}
+
+        def configure(self, config: CompanionConfig) -> None:
+            self.config = config
+
+        def stop(self) -> dict[str, Any]:
+            raise AssertionError("unchanged overlay runtime must not restart")
+
+        def start(self) -> dict[str, Any]:
+            raise AssertionError("unchanged overlay runtime must not restart")
+
+    overlay = Overlay()
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(overlay_font_size=24, llm_min_priority=5)
+    plugin._context_target = None
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._settings_transition = False
+    plugin._monitor = types.SimpleNamespace(update_config=lambda _config: None)
+    plugin._catalog = types.SimpleNamespace(configure=lambda **_kwargs: None)
+    plugin._overlay = overlay
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
+    updated = CompanionConfig(overlay_font_size=24, llm_min_priority=7)
+
+    result = asyncio.run(
+        plugin.config_change(new_config={entry._CONFIG_SECTION: updated.to_dict()})
+    )
+
+    assert result["status"] == "reloaded"
+    assert plugin.cfg.llm_min_priority == 7
+    assert overlay.config.llm_min_priority == 7
+
+
+def test_config_change_rejects_inconsistent_overlay_stop_and_rolls_back(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+
+    class Overlay:
+        def __init__(self) -> None:
+            self.config = CompanionConfig(overlay_font_size=24)
+            self.start_calls = 0
+
+        def status(self) -> dict[str, Any]:
+            return {"running": True}
+
+        def configure(self, config: CompanionConfig) -> None:
+            self.config = config
+
+        def stop(self) -> dict[str, Any]:
+            return {"ok": True, "running": True}
+
+        def start(self) -> dict[str, Any]:
+            self.start_calls += 1
+            return {"ok": True, "running": True}
+
+    overlay = Overlay()
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(overlay_font_size=24)
+    plugin._context_target = None
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._settings_transition = False
+    plugin._monitor = types.SimpleNamespace(update_config=lambda _config: None)
+    plugin._catalog = types.SimpleNamespace(configure=lambda **_kwargs: None)
+    plugin._overlay = overlay
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
+    updated = CompanionConfig(overlay_font_size=31)
+
+    with pytest.raises(RuntimeError, match="inconsistent running state"):
+        asyncio.run(
+            plugin.config_change(new_config={entry._CONFIG_SECTION: updated.to_dict()})
+        )
+
+    assert plugin.cfg.overlay_font_size == 24
+    assert overlay.config.overlay_font_size == 24
+    assert overlay.start_calls == 0
+    assert plugin._settings_transition is False
+
+
 def test_save_settings_patches_only_explicit_fields(monkeypatch) -> None:
     entry = _load_sdk_entry(monkeypatch)
     patches: list[dict[str, Any]] = []
@@ -875,6 +1197,13 @@ def test_settings_transition_resyncs_active_game_context(monkeypatch) -> None:
     plugin._monitor = types.SimpleNamespace(
         update_config=update_config,
         snapshot=lambda: snapshot,
+        status=lambda: types.SimpleNamespace(
+            source_state="watching",
+            monitor_running=True,
+            last_line_at=time.time(),
+            last_event_at=time.time(),
+            source_modified_at=time.time(),
+        ),
     )
     plugin._catalog = types.SimpleNamespace(configure=lambda **_kwargs: None)
     plugin._overlay = types.SimpleNamespace(
@@ -1501,10 +1830,180 @@ def test_save_settings_serializes_with_overlay_start(monkeypatch) -> None:
     assert overlay.start_calls == 1
 
 
+def test_save_settings_does_not_restart_running_overlay_for_unrelated_fields(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+
+    class Config:
+        async def update(self, patch: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+            merged = CompanionConfig(overlay_enabled=True, overlay_font_size=24).to_dict()
+            merged.update(patch[entry._CONFIG_SECTION])
+            return {entry._CONFIG_SECTION: merged}
+
+    class Overlay:
+        def __init__(self) -> None:
+            self.config = CompanionConfig(overlay_enabled=True, overlay_font_size=24)
+
+        def status(self) -> dict[str, Any]:
+            return {"running": True}
+
+        def configure(self, config: CompanionConfig) -> None:
+            self.config = config
+
+        def stop(self) -> dict[str, Any]:
+            raise AssertionError("unrelated settings must not restart the overlay")
+
+        def start(self) -> dict[str, Any]:
+            raise AssertionError("unrelated settings must not restart the overlay")
+
+    overlay = Overlay()
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(overlay_enabled=True, overlay_font_size=24)
+    plugin._context_target = None
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._settings_transition = False
+    plugin._started = True
+    plugin.config = Config()
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
+    plugin._overlay = overlay
+    plugin._ensure_monitor = lambda: types.SimpleNamespace(update_config=lambda _config: None)
+
+    result = asyncio.run(plugin.save_settings(log_path="new.log"))
+
+    assert result["summary"] == "炉石陪玩设置已保存。"
+    assert plugin.cfg.log_path == "new.log"
+    assert overlay.config.log_path == "new.log"
+
+
+def test_save_settings_reports_overlay_stop_failure_after_persisting(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+
+    class FakeErr:
+        def __init__(self, value: Any) -> None:
+            self.value = value
+
+    entry.Err = FakeErr
+
+    class Config:
+        async def update(self, patch: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+            merged = CompanionConfig(overlay_enabled=True, overlay_font_size=24).to_dict()
+            merged.update(patch[entry._CONFIG_SECTION])
+            return {entry._CONFIG_SECTION: merged}
+
+    class Overlay:
+        def __init__(self) -> None:
+            self.config = CompanionConfig(overlay_enabled=True, overlay_font_size=24)
+            self.running = True
+
+        def status(self) -> dict[str, Any]:
+            return {"running": self.running}
+
+        def configure(self, config: CompanionConfig) -> None:
+            self.config = config
+
+        def stop(self) -> dict[str, Any]:
+            return {"ok": False, "running": True, "error_code": "overlay_stop_failed"}
+
+        def start(self) -> dict[str, Any]:
+            raise AssertionError("start must not run after a failed stop")
+
+    overlay = Overlay()
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(overlay_enabled=True, overlay_font_size=24)
+    plugin._context_target = None
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._settings_transition = False
+    plugin._started = True
+    plugin.config = Config()
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
+    plugin._overlay = overlay
+    plugin._ensure_monitor = lambda: types.SimpleNamespace(update_config=lambda _config: None)
+
+    result = asyncio.run(plugin.save_settings(overlay_font_size=31))
+
+    assert isinstance(result, FakeErr)
+    assert "settings were saved" in str(result.value)
+    assert "overlay_stop_failed" in str(result.value)
+    assert plugin.cfg.overlay_font_size == 31
+    assert overlay.config.overlay_font_size == 24
+    assert overlay.running is True
+
+
+def test_save_settings_restores_previous_running_overlay_when_new_start_fails(
+    monkeypatch,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+
+    class FakeErr:
+        def __init__(self, value: Any) -> None:
+            self.value = value
+
+    entry.Err = FakeErr
+
+    class Config:
+        async def update(self, patch: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+            merged = CompanionConfig(overlay_enabled=True, overlay_font_size=24).to_dict()
+            merged.update(patch[entry._CONFIG_SECTION])
+            return {entry._CONFIG_SECTION: merged}
+
+    class Overlay:
+        def __init__(self) -> None:
+            self.config = CompanionConfig(overlay_enabled=True, overlay_font_size=24)
+            self.running = True
+            self.start_calls = 0
+
+        def status(self) -> dict[str, Any]:
+            return {"running": self.running}
+
+        def configure(self, config: CompanionConfig) -> None:
+            self.config = config
+
+        def stop(self) -> dict[str, Any]:
+            self.running = False
+            return {"ok": True, "running": False}
+
+        def start(self) -> dict[str, Any]:
+            self.start_calls += 1
+            if self.config.overlay_font_size == 31:
+                return {"ok": False, "running": False, "error_code": "new_overlay_failed"}
+            self.running = True
+            return {"ok": True, "running": True}
+
+    overlay = Overlay()
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(overlay_enabled=True, overlay_font_size=24)
+    plugin._context_target = None
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._settings_transition = False
+    plugin._started = True
+    plugin.config = Config()
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
+    plugin._overlay = overlay
+    plugin._ensure_monitor = lambda: types.SimpleNamespace(update_config=lambda _config: None)
+
+    result = asyncio.run(plugin.save_settings(overlay_font_size=31))
+
+    assert isinstance(result, FakeErr)
+    assert "new_overlay_failed" in str(result.value)
+    assert "previous overlay was restored" in str(result.value)
+    assert plugin.cfg.overlay_font_size == 31
+    assert overlay.config.overlay_font_size == 24
+    assert overlay.running is True
+    assert overlay.start_calls == 2
+
+
 def test_settings_transition_resets_when_runtime_apply_raises(monkeypatch) -> None:
     entry = _load_sdk_entry(monkeypatch)
 
-    async def scenario() -> Any:
+    class FakeErr:
+        def __init__(self, value: Any) -> None:
+            self.value = value
+
+    entry.Err = FakeErr
+
+    async def scenario() -> tuple[Any, Any]:
         class Config:
             async def update(self, patch: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
                 merged = CompanionConfig().to_dict()
@@ -1522,18 +2021,121 @@ def test_settings_transition_resets_when_runtime_apply_raises(monkeypatch) -> No
         plugin._settings_transition = False
         plugin.ctx = types.SimpleNamespace(_current_lanlan="兰兰A")
         plugin.config = Config()
+        plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
         plugin._overlay = types.SimpleNamespace(
             status=lambda: {"running": False},
             configure=lambda _config: None,
         )
         plugin._ensure_monitor = lambda: types.SimpleNamespace(update_config=fail_update)
-        with pytest.raises(RuntimeError, match="apply failed"):
-            await plugin.save_settings(llm_commentary_enabled=False, llm_data_consent=False)
-        return plugin
+        result = await plugin.save_settings(log_path="new.log")
+        return result, plugin
 
-    plugin = asyncio.run(scenario())
+    result, plugin = asyncio.run(scenario())
 
+    assert isinstance(result, FakeErr)
+    assert "settings were saved" in str(result.value)
+    assert "restart the plugin" in str(result.value)
+    assert plugin.cfg.log_path == "new.log"
     assert plugin._settings_transition is False
+
+
+def test_save_settings_best_effort_applies_other_components_after_catalog_failure(
+    monkeypatch,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+
+    class FakeErr:
+        def __init__(self, value: Any) -> None:
+            self.value = value
+
+    entry.Err = FakeErr
+    monitor_configs: list[CompanionConfig] = []
+    overlay_configs: list[CompanionConfig] = []
+
+    class Config:
+        async def update(self, patch: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+            merged = CompanionConfig().to_dict()
+            merged.update(patch[entry._CONFIG_SECTION])
+            return {entry._CONFIG_SECTION: merged}
+
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(card_catalog_network_enabled=True)
+    plugin._context_target = None
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._settings_transition = False
+    plugin._started = True
+    plugin.config = Config()
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
+    plugin._monitor = types.SimpleNamespace(
+        update_config=lambda config: monitor_configs.append(config)
+    )
+    plugin._catalog = types.SimpleNamespace(
+        configure=lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("catalog failed"))
+    )
+    plugin._overlay = types.SimpleNamespace(
+        status=lambda: {"running": False},
+        configure=lambda config: overlay_configs.append(config),
+    )
+    plugin._ensure_monitor = lambda: plugin._monitor
+
+    result = asyncio.run(plugin.save_settings(card_catalog_network_enabled=False))
+
+    assert isinstance(result, FakeErr)
+    assert "catalog:RuntimeError" in str(result.value)
+    assert plugin.cfg.card_catalog_network_enabled is False
+    assert monitor_configs[-1].card_catalog_network_enabled is False
+    assert overlay_configs[-1].card_catalog_network_enabled is False
+    assert plugin._settings_transition is False
+
+
+def test_settings_transition_resets_when_fail_closed_update_raises(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+
+    class FakeErr:
+        def __init__(self, value: Any) -> None:
+            self.value = value
+
+    entry.Err = FakeErr
+    persisted: list[dict[str, Any]] = []
+
+    class Config:
+        async def update(self, patch: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+            persisted.append(patch)
+            merged = CompanionConfig().to_dict()
+            merged.update(patch[entry._CONFIG_SECTION])
+            return {entry._CONFIG_SECTION: merged}
+
+    def fail_update(_config: CompanionConfig) -> None:
+        raise RuntimeError("fail-closed apply failed")
+
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(
+        llm_commentary_enabled=True,
+        llm_data_consent=True,
+    )
+    plugin._context_target = None
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._settings_transition = False
+    plugin._started = True
+    plugin.config = Config()
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
+    plugin._overlay = types.SimpleNamespace(
+        status=lambda: {"running": False},
+        configure=lambda _config: None,
+    )
+    plugin._monitor = types.SimpleNamespace(update_config=fail_update)
+    plugin._ensure_monitor = lambda: plugin._monitor
+
+    result = asyncio.run(plugin.save_settings(llm_data_consent=False))
+
+    assert isinstance(result, FakeErr)
+    assert "settings were saved" in str(result.value)
+    assert persisted[0][entry._CONFIG_SECTION]["llm_data_consent"] is False
+    assert plugin._settings_transition is False
+    assert plugin.cfg.llm_data_consent is False
+    assert plugin.cfg.llm_commentary_enabled is False
 
 
 def test_clear_stats_timeout_confirms_serial_compensation(monkeypatch) -> None:
@@ -1737,7 +2339,7 @@ def test_result_submit_failure_is_exposed_in_dashboard_storage_status(monkeypatc
             return False
 
         def last_error_code(self) -> str:
-            return ""
+            return "stats:writer_unavailable"
 
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
     plugin.cfg = CompanionConfig()
@@ -1767,6 +2369,7 @@ def test_result_submit_failure_is_exposed_in_dashboard_storage_status(monkeypatc
     )
     state = plugin._dashboard_state()
 
+    assert plugin._stats_store_error_code == ""
     assert state["battlegrounds_stats_storage"] == {
         "degraded": True,
         "error_code": "stats:writer_unavailable",
@@ -2065,6 +2668,16 @@ def test_start_monitoring_opens_dispatch_gate_before_state_ready(monkeypatch) ->
         def snapshot(self) -> GameSnapshot:
             return snapshot
 
+        def status(self) -> types.SimpleNamespace:
+            now = time.time()
+            return types.SimpleNamespace(
+                source_state="watching",
+                monitor_running=True,
+                last_line_at=now,
+                last_event_at=now,
+                source_modified_at=now,
+            )
+
     monitor = Monitor()
     plugin._monitor = monitor
     plugin._ensure_monitor = lambda: monitor
@@ -2116,9 +2729,10 @@ def test_current_state_marks_stopped_monitor_snapshot_as_cached(monkeypatch) -> 
     result = asyncio.run(entry.HearthstoneCompanionPlugin.hearthstone_current_state(plugin))
 
     assert result["available"] is False
-    assert result["state"]["game_number"] == 9
+    assert result["state"] == {}
     assert result["freshness"]["source"] == "cached"
     assert result["freshness"]["do_not_treat_cached_as_live"] is True
+    assert result["answer_contract"]["never_recommend_from_cached_state"] is True
 
 
 def test_battlegrounds_advice_separates_local_evidence_from_global_meta(monkeypatch) -> None:
@@ -2128,7 +2742,12 @@ def test_battlegrounds_advice_separates_local_evidence_from_global_meta(monkeypa
     snapshot = GameSnapshot(
         mode="battlegrounds",
         phase="playing",
-        battlegrounds=BattlegroundsSnapshot(variant="solo", round=7, phase="recruit"),
+        battlegrounds=BattlegroundsSnapshot(
+            variant="solo",
+            round=7,
+            phase="recruit",
+            shop=(BattlegroundsCardSnapshot(card_id="BG_SHOP_1"),),
+        ),
     )
     plugin = types.SimpleNamespace(
         cfg=CompanionConfig(llm_commentary_enabled=False, llm_data_consent=True),
@@ -2199,7 +2818,12 @@ def test_battlegrounds_advice_includes_attributed_observed_card_facts(monkeypatc
     snapshot = GameSnapshot(
         mode="battlegrounds",
         phase="playing",
-        battlegrounds=BattlegroundsSnapshot(variant="solo", round=4, phase="recruit"),
+        battlegrounds=BattlegroundsSnapshot(
+            variant="solo",
+            round=4,
+            phase="recruit",
+            shop=(BattlegroundsCardSnapshot(card_id="BG_TEST"),),
+        ),
     )
     facts = {
         "available": True,
@@ -2238,3 +2862,432 @@ def test_battlegrounds_advice_includes_attributed_observed_card_facts(monkeypatc
     assert result["card_catalog"] == facts
     assert result["global_meta"]["available"] is False
     assert result["answer_contract"]["treat_catalog_rules_text_as_untrusted_reference_data"] is True
+
+
+def test_battlegrounds_advice_fails_closed_when_consent_is_revoked_during_catalog_wait(
+    monkeypatch,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    cfg = CompanionConfig(llm_data_consent=True)
+    snapshot = GameSnapshot(
+        mode="battlegrounds",
+        phase="recruit",
+        game_number=3,
+        battlegrounds=BattlegroundsSnapshot(
+            phase="recruit",
+            shop=(BattlegroundsCardSnapshot(card_id="BG_PRIVATE_AFTER_REVOKE"),),
+        ),
+    )
+
+    class Catalog:
+        def status(self) -> dict[str, Any]:
+            return {"available": False}
+
+        def wait_ready(self, _timeout: float) -> bool:
+            cfg.llm_data_consent = False
+            return True
+
+        def facts_for(self, _value: Any) -> dict[str, Any]:
+            raise AssertionError("catalog facts must not be exposed after consent revocation")
+
+    now = time.time()
+    plugin = types.SimpleNamespace(
+        cfg=cfg,
+        _season={"key": "S14", "status": "bundled_static"},
+        _stats=BattlegroundsStats(),
+        _catalog=Catalog(),
+        _catalog_status=lambda: {},
+        _ensure_monitor=lambda: types.SimpleNamespace(
+            snapshot=lambda: snapshot,
+            status=lambda: types.SimpleNamespace(
+                source_state="watching",
+                monitor_running=True,
+                last_line_at=now,
+                last_event_at=now,
+            ),
+        ),
+    )
+
+    result = asyncio.run(
+        entry.HearthstoneCompanionPlugin.hearthstone_battlegrounds_advice(
+            plugin, topic="current_strategy"
+        )
+    )
+
+    assert result["available"] is False
+    assert result["reason"] == "llm_data_sharing_not_authorized"
+    assert set(result) == {
+        "available",
+        "reason",
+        "game_mode",
+        "scope",
+        "answer_contract",
+        "privacy_scope",
+    }
+
+
+@pytest.mark.parametrize("topic", ["season_meta", "hero_performance", "post_game"])
+def test_non_live_fact_advice_topics_never_wait_for_catalog(monkeypatch, topic: str) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    wait_calls = 0
+
+    class Catalog:
+        def status(self) -> dict[str, Any]:
+            return {"available": False, "degraded_reason": "loading"}
+
+        def wait_ready(self, _timeout: float) -> bool:
+            nonlocal wait_calls
+            wait_calls += 1
+            return False
+
+    plugin = types.SimpleNamespace(
+        cfg=CompanionConfig(llm_data_consent=True),
+        _season={"key": "S14", "status": "bundled_static"},
+        _stats=BattlegroundsStats(),
+        _catalog=Catalog(),
+        _catalog_status=lambda: {},
+        _ensure_monitor=lambda: types.SimpleNamespace(
+            snapshot=lambda: GameSnapshot(),
+            status=lambda: types.SimpleNamespace(
+                source_state="waiting",
+                monitor_running=True,
+                last_line_at=0.0,
+                last_event_at=0.0,
+            ),
+        ),
+    )
+
+    asyncio.run(
+        entry.HearthstoneCompanionPlugin.hearthstone_battlegrounds_advice(
+            plugin, topic=topic
+        )
+    )
+
+    assert wait_calls == 0
+
+
+def test_battlegrounds_hero_comparison_requires_live_observed_choices(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    now = time.time()
+
+    def advice_for(choices: tuple[BattlegroundsHeroChoiceSnapshot, ...]) -> dict[str, Any]:
+        snapshot = GameSnapshot(
+            mode="battlegrounds",
+            phase="hero_select",
+            game_number=1,
+            battlegrounds=BattlegroundsSnapshot(
+                phase="hero_select",
+                hero_choices=choices,
+            ),
+        )
+        plugin = types.SimpleNamespace(
+            cfg=CompanionConfig(llm_data_consent=True),
+            _season={"key": "season-14-36.2", "status": "bundled_static"},
+            _stats=BattlegroundsStats(),
+            _ensure_monitor=lambda: types.SimpleNamespace(
+                snapshot=lambda: snapshot,
+                status=lambda: types.SimpleNamespace(
+                    source_state="watching",
+                    monitor_running=True,
+                    last_line_at=now,
+                    last_event_at=now,
+                ),
+            ),
+        )
+        return asyncio.run(
+            entry.HearthstoneCompanionPlugin.hearthstone_battlegrounds_advice(
+                plugin, topic="current_strategy"
+            )
+        )
+
+    unavailable = advice_for(())
+    available = advice_for(
+        (
+            BattlegroundsHeroChoiceSnapshot(card_id="BG_HERO_1", name="Hero One"),
+            BattlegroundsHeroChoiceSnapshot(card_id="BG_HERO_2", name="Hero Two"),
+        )
+    )
+
+    assert unavailable["available"] is False
+    assert unavailable["capabilities"]["hero_choice_comparison"]["available"] is False
+    assert unavailable["current_public_state"]["hero_choices"] == []
+    assert available["available"] is True
+    assert available["capabilities"]["hero_choice_comparison"]["available"] is True
+    assert [choice["card_id"] for choice in available["current_public_state"]["hero_choices"]] == [
+        "BG_HERO_1",
+        "BG_HERO_2",
+    ]
+
+
+def test_battlegrounds_hero_select_includes_candidate_catalog_facts(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    now = time.time()
+    snapshot = GameSnapshot(
+        mode="battlegrounds",
+        phase="hero_select",
+        game_number=1,
+        battlegrounds=BattlegroundsSnapshot(
+            phase="hero_select",
+            hero_choices=(
+                BattlegroundsHeroChoiceSnapshot(card_id="BG_HERO_1", name="Hero One"),
+                BattlegroundsHeroChoiceSnapshot(card_id="BG_HERO_2", name="Hero Two"),
+            ),
+        ),
+    )
+    facts = {
+        "available": True,
+        "coverage": {"zone_ids": {"hero_choices": ["BG_HERO_1", "BG_HERO_2"]}},
+        "observed_card_facts": {
+            "BG_HERO_1": {"name": "Hero One", "rules_text": "Hero power one"},
+            "BG_HERO_2": {"name": "Hero Two", "rules_text": "Hero power two"},
+        },
+    }
+    catalog_calls: list[object] = []
+    catalog = types.SimpleNamespace(
+        status=lambda: {"available": True},
+        facts_for=lambda value: catalog_calls.append(value) or facts,
+    )
+    plugin = types.SimpleNamespace(
+        cfg=CompanionConfig(llm_data_consent=True),
+        _season={"key": "season-14-36.2", "status": "bundled_static"},
+        _stats=BattlegroundsStats(),
+        _catalog=catalog,
+        _ensure_monitor=lambda: types.SimpleNamespace(
+            snapshot=lambda: snapshot,
+            status=lambda: types.SimpleNamespace(
+                source_state="watching",
+                monitor_running=True,
+                last_line_at=now,
+                last_event_at=now,
+            ),
+        ),
+    )
+
+    result = asyncio.run(
+        entry.HearthstoneCompanionPlugin.hearthstone_battlegrounds_advice(
+            plugin, topic="current_strategy"
+        )
+    )
+
+    assert result["capabilities"]["hero_choice_comparison"]["available"] is True
+    assert result["card_catalog"] == facts
+    assert catalog_calls == [snapshot.battlegrounds]
+
+
+def test_battlegrounds_purchase_advice_requires_fresh_recruit_shop(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    now = time.time()
+    snapshot = GameSnapshot(
+        mode="battlegrounds",
+        phase="recruit",
+        game_number=2,
+        battlegrounds=BattlegroundsSnapshot(
+            phase="recruit",
+            shop=(BattlegroundsCardSnapshot(card_id="BG_MINION_1", name="Minion One"),),
+        ),
+    )
+    plugin = types.SimpleNamespace(
+        cfg=CompanionConfig(llm_data_consent=True),
+        _season={"key": "season-14-36.2", "status": "bundled_static"},
+        _stats=BattlegroundsStats(),
+        _ensure_monitor=lambda: types.SimpleNamespace(
+            snapshot=lambda: snapshot,
+            status=lambda: types.SimpleNamespace(
+                source_state="watching",
+                monitor_running=True,
+                last_line_at=now,
+                last_event_at=now,
+            ),
+        ),
+    )
+
+    result = asyncio.run(
+        entry.HearthstoneCompanionPlugin.hearthstone_battlegrounds_advice(
+            plugin, topic="current_strategy"
+        )
+    )
+
+    capability = result["capabilities"]["specific_purchase_advice"]
+    assert capability["available"] is True
+    assert capability["evidence"] == "fresh_recruit_shop"
+    assert result["current_public_state"]["shop"][0]["card_id"] == "BG_MINION_1"
+
+
+def test_battlegrounds_combat_contract_hides_shop_and_allows_only_board_commentary(
+    monkeypatch,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    now = time.time()
+    snapshot = GameSnapshot(
+        mode="battlegrounds",
+        phase="combat",
+        game_number=2,
+        battlegrounds=BattlegroundsSnapshot(
+            phase="combat",
+            shop=(BattlegroundsCardSnapshot(card_id="STALE_SHOP", name="Stale Shop"),),
+            warband=(BattlegroundsCardSnapshot(card_id="PUBLIC_BOARD", name="Board Minion"),),
+        ),
+    )
+    catalog_calls: list[object] = []
+    catalog = types.SimpleNamespace(
+        status=lambda: {"available": True, "provider": "test"},
+        facts_for=lambda value: catalog_calls.append(value) or {"unexpected": True},
+    )
+    plugin = types.SimpleNamespace(
+        cfg=CompanionConfig(llm_data_consent=True),
+        _season={"key": "season-14-36.2", "status": "bundled_static"},
+        _stats=BattlegroundsStats(),
+        _catalog=catalog,
+        _ensure_monitor=lambda: types.SimpleNamespace(
+            snapshot=lambda: snapshot,
+            status=lambda: types.SimpleNamespace(
+                source_state="watching",
+                monitor_running=True,
+                last_line_at=now,
+                last_event_at=now,
+            ),
+        ),
+    )
+
+    result = asyncio.run(
+        entry.HearthstoneCompanionPlugin.hearthstone_battlegrounds_advice(
+            plugin, topic="current_strategy"
+        )
+    )
+
+    assert result["available"] is True
+    assert result["current_public_state"]["shop"] == []
+    assert result["capabilities"]["specific_purchase_advice"]["available"] is False
+    assert result["capabilities"]["combat_commentary"]["available"] is True
+    assert result["answer_contract"]["combat_never_implies_current_shop_visibility"] is True
+    assert catalog_calls == []
+
+
+def test_hero_performance_targets_current_local_hero_sample(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    stats = BattlegroundsStats()
+    stats.record_game(season="season-14-36.2", mode="solo", placement=1, hero_id="BG_OTHER")
+    stats.record_game(season="season-14-36.2", mode="solo", placement=3, hero_id="BG_CURRENT")
+    now = time.time()
+    snapshot = GameSnapshot(
+        mode="battlegrounds",
+        phase="recruit",
+        game_number=4,
+        battlegrounds=BattlegroundsSnapshot(
+            variant="solo",
+            phase="recruit",
+            lobby=(
+                BattlegroundsPlayerSnapshot(
+                    player_id=1,
+                    is_local=True,
+                    hero_card_id="BG_CURRENT",
+                    hero_name="Current Hero",
+                ),
+            ),
+        ),
+    )
+    plugin = types.SimpleNamespace(
+        cfg=CompanionConfig(llm_data_consent=True),
+        _season={"key": "season-14-36.2", "status": "bundled_static"},
+        _stats=stats,
+        _ensure_monitor=lambda: types.SimpleNamespace(
+            snapshot=lambda: snapshot,
+            status=lambda: types.SimpleNamespace(
+                source_state="watching",
+                monitor_running=True,
+                last_line_at=now,
+                last_event_at=now,
+            ),
+        ),
+    )
+
+    result = asyncio.run(
+        entry.HearthstoneCompanionPlugin.hearthstone_battlegrounds_advice(
+            plugin, topic="hero_performance"
+        )
+    )
+
+    assert result["available"] is True
+    assert result["hero_performance"]["hero"] == {
+        "card_id": "BG_CURRENT",
+        "name": "Current Hero",
+    }
+    assert result["hero_performance"]["stats_key"] == "BG_CURRENT"
+    assert result["hero_performance"]["local_sample"]["games"] == 1
+
+
+def test_post_game_does_not_treat_historical_aggregate_as_recent_game(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    stats = BattlegroundsStats()
+    stats.record_game(season="season-14-36.2", mode="solo", placement=2, hero_id="BG_OLD")
+    snapshot = GameSnapshot(mode="unknown", phase="idle")
+    plugin = types.SimpleNamespace(
+        cfg=CompanionConfig(llm_data_consent=True),
+        _season={"key": "season-14-36.2", "status": "bundled_static"},
+        _stats=stats,
+        _ensure_monitor=lambda: types.SimpleNamespace(
+            snapshot=lambda: snapshot,
+            status=lambda: types.SimpleNamespace(
+                source_state="waiting",
+                monitor_running=True,
+                last_line_at=0.0,
+                last_event_at=0.0,
+            ),
+        ),
+    )
+
+    result = asyncio.run(
+        entry.HearthstoneCompanionPlugin.hearthstone_battlegrounds_advice(
+            plugin, topic="post_game"
+        )
+    )
+
+    assert result["available"] is False
+    assert result["reason"] == "no_recent_battlegrounds_post_game"
+    assert result["current_public_state"] is None
+    assert result["local_season_stats"] == {}
+
+
+def test_post_game_requires_a_recent_ended_snapshot(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    snapshot = GameSnapshot(
+        mode="battlegrounds",
+        phase="ended",
+        game_number=5,
+        battlegrounds=BattlegroundsSnapshot(
+            variant="solo",
+            round=11,
+            phase="ended",
+            placement=2,
+        ),
+    )
+
+    def result_at(last_event_at: float) -> dict[str, Any]:
+        plugin = types.SimpleNamespace(
+            cfg=CompanionConfig(llm_data_consent=True),
+            _season={"key": "season-14-36.2", "status": "bundled_static"},
+            _stats=BattlegroundsStats(),
+            _ensure_monitor=lambda: types.SimpleNamespace(
+                snapshot=lambda: snapshot,
+                status=lambda: types.SimpleNamespace(
+                    source_state="watching",
+                    monitor_running=True,
+                    last_line_at=last_event_at,
+                    last_event_at=last_event_at,
+                ),
+            ),
+        )
+        return asyncio.run(
+            entry.HearthstoneCompanionPlugin.hearthstone_battlegrounds_advice(
+                plugin, topic="post_game"
+            )
+        )
+
+    recent = result_at(time.time())
+    stale = result_at(time.time() - 3600.0)
+
+    assert recent["available"] is True
+    assert recent["current_public_state"]["placement"] == 2
+    assert stale["available"] is False
+    assert stale["reason"] == "no_recent_battlegrounds_post_game"
+    assert stale["current_public_state"] is None

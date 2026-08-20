@@ -128,6 +128,105 @@ def test_hide_entity_revokes_visibility_and_llm_payload_does_not_leak() -> None:
     assert "火球术" not in prompt
 
 
+def test_hidden_entity_stays_private_when_stale_reference_moves_to_public_zone() -> None:
+    parser = PowerLogParser()
+    add_entity(parser, 20, "", controller=2, zone="HAND", card_type="MINION")
+    feed(
+        parser,
+        "SHOW_ENTITY - Updating Entity=[entityName=火球术 id=20 zone=HAND zonePos=1 cardId= player=2] CardID=CS2_029",
+        "    tag=ATK value=9",
+        "    tag=HEALTH value=9",
+        "HIDE_ENTITY - Entity=[entityName=火球术 id=20 zone=HAND zonePos=1 cardId=CS2_029 player=2] tag=1068 value=1",
+        "TAG_CHANGE Entity=[entityName=火球术 id=20 zone=HAND zonePos=1 cardId=CS2_029 player=2] tag=ZONE value=PLAY",
+    )
+
+    entity = parser.entities[20]
+    public_json = json.dumps(parser.snapshot().to_public_dict(), ensure_ascii=False)
+
+    assert entity.hidden is True
+    assert entity.revealed is False
+    assert "CS2_029" not in public_json
+    assert "火球术" not in public_json
+
+
+def test_hidden_public_zone_entity_stays_private_when_play_block_ends() -> None:
+    parser = PowerLogParser()
+    feed(
+        parser,
+        "SHOW_ENTITY - Updating Entity=[entityName=幸运币 id=40 zone=HAND zonePos=1 cardId= player=1] CardID=GAME_005",
+    )
+    add_entity(parser, 20, "CS2_029", controller=2, zone="HAND", card_type="MINION")
+    feed(
+        parser,
+        "    tag=ATK value=9",
+        "    tag=HEALTH value=9",
+        "HIDE_ENTITY - Entity=[entityName=火球术 id=20 zone=HAND zonePos=1 cardId=CS2_029 player=2] tag=1068 value=1",
+        "TAG_CHANGE Entity=20 tag=ZONE value=PLAY",
+        "BLOCK_START BlockType=PLAY Entity=[entityName=火球术 id=20 zone=PLAY zonePos=1 cardId=CS2_029 player=2] EffectCardId= EffectIndex=0 Target=0 SubOption=-1",
+    )
+
+    events = feed(parser, "BLOCK_END")
+    encoded = json.dumps(
+        {
+            "events": [event.details for event in events],
+            "snapshot": parser.snapshot().to_public_dict(),
+        },
+        ensure_ascii=False,
+    )
+
+    assert parser.entities[20].hidden is True
+    assert events[0].details["card"] == "一张牌"
+    assert parser.snapshot().recent_cards[-1]["card"] == "一张牌"
+    assert "card_id" not in parser.snapshot().recent_cards[-1]
+    assert "CS2_029" not in encoded
+    assert "火球术" not in encoded
+
+
+def test_explicit_show_can_reveal_an_entity_after_it_was_hidden() -> None:
+    parser = PowerLogParser()
+    add_entity(parser, 20, "CS2_029", controller=2, zone="PLAY", card_type="MINION")
+    feed(
+        parser,
+        "HIDE_ENTITY - Entity=[entityName=火球术 id=20 zone=PLAY zonePos=1 cardId=CS2_029 player=2] tag=1068 value=1",
+        "TAG_CHANGE Entity=20 tag=ZONE value=PLAY",
+        "SHOW_ENTITY - Updating Entity=[entityName=火球术 id=20 zone=PLAY zonePos=1 cardId= player=2] CardID=CS2_029",
+    )
+
+    assert parser.entities[20].hidden is False
+    assert parser.entities[20].public_name() == "火球术"
+
+
+def test_explicit_full_entity_can_reveal_an_entity_after_it_was_hidden() -> None:
+    parser = PowerLogParser()
+    add_entity(parser, 20, "CS2_029", controller=2, zone="PLAY", card_type="MINION")
+    feed(
+        parser,
+        "HIDE_ENTITY - Entity=[entityName=火球术 id=20 zone=PLAY zonePos=1 cardId=CS2_029 player=2] tag=1068 value=1",
+        "FULL_ENTITY - Updating ID=20 CardID=CS2_029",
+    )
+
+    assert parser.entities[20].hidden is False
+    assert parser.entities[20].card_id == "CS2_029"
+
+
+def test_change_entity_cannot_override_visibility_revoked_by_hide_entity() -> None:
+    parser = PowerLogParser()
+    add_entity(parser, 20, "CS2_029", controller=2, zone="PLAY", card_type="MINION")
+    feed(
+        parser,
+        "HIDE_ENTITY - Entity=[entityName=火球术 id=20 zone=PLAY zonePos=1 cardId=CS2_029 player=2] tag=1068 value=1",
+        "CHANGE_ENTITY - Updating Entity=[entityName=变形后 id=20 zone=PLAY zonePos=1 cardId= player=2] CardID=CS2_032",
+    )
+
+    public_json = json.dumps(parser.snapshot().to_public_dict(), ensure_ascii=False)
+
+    assert parser.entities[20].hidden is True
+    assert parser.entities[20].visibility_revoked is True
+    assert "CS2_029" not in public_json
+    assert "CS2_032" not in public_json
+    assert "变形后" not in public_json
+
+
 def test_opponent_secret_never_exposes_known_card_id_in_public_events() -> None:
     parser = PowerLogParser()
     feed(
@@ -414,6 +513,252 @@ def test_battlegrounds_public_snapshot_never_exposes_hidden_shop_entity() -> Non
     assert parser.snapshot().battlegrounds.shop == ()
 
 
+def test_battlegrounds_combat_edge_does_not_record_previous_bob_shop_as_opponent() -> None:
+    parser = PowerLogParser()
+    feed(
+        parser,
+        "CREATE_GAME",
+        "GameEntity EntityID=1",
+        "Player EntityID=8 PlayerID=3 GameAccountId=[hi=0 lo=0]",
+        "Player EntityID=9 PlayerID=11 GameAccountId=[hi=0 lo=0]",
+        "    tag=BACON_DUMMY_PLAYER value=1",
+        "TAG_CHANGE Entity=8 tag=NEXT_OPPONENT_PLAYER_ID value=5",
+        "TAG_CHANGE Entity=8 tag=CURRENT_PLAYER value=1",
+    )
+    add_entity(parser, 105, "TB_BaconShop_HERO_05", controller=5, zone="SETASIDE", card_type="HERO")
+    feed(parser, "    tag=PLAYER_ID value=5", "    tag=HEALTH value=40")
+    add_entity(parser, 300, "BG_SHOP_MINION", controller=11, zone="PLAY", card_type="MINION")
+    feed(parser, "    tag=ATK value=3", "    tag=HEALTH value=4", "    tag=ZONE_POSITION value=1")
+
+    feed(
+        parser,
+        "TAG_CHANGE Entity=GameEntity tag=2022 value=1",
+        "TAG_CHANGE Entity=GameEntity tag=2022 value=0",
+    )
+
+    opponent = next(player for player in parser.snapshot().battlegrounds.lobby if player.player_id == 5)
+    assert opponent.board_count == 0
+    assert opponent.board_cards == ()
+
+
+def test_battlegrounds_observes_new_bob_controlled_combat_proxy_after_phase_edge() -> None:
+    parser = PowerLogParser()
+    feed(
+        parser,
+        "CREATE_GAME",
+        "GameEntity EntityID=1",
+        "Player EntityID=8 PlayerID=3 GameAccountId=[hi=0 lo=0]",
+        "Player EntityID=9 PlayerID=11 GameAccountId=[hi=0 lo=0]",
+        "    tag=BACON_DUMMY_PLAYER value=1",
+        "TAG_CHANGE Entity=8 tag=NEXT_OPPONENT_PLAYER_ID value=5",
+        "TAG_CHANGE Entity=8 tag=CURRENT_PLAYER value=1",
+    )
+    add_entity(parser, 105, "TB_BaconShop_HERO_05", controller=5, zone="SETASIDE", card_type="HERO")
+    feed(parser, "    tag=PLAYER_ID value=5", "    tag=HEALTH value=40")
+    add_entity(parser, 300, "BG_SHOP_MINION", controller=11, zone="PLAY", card_type="MINION")
+    feed(parser, "    tag=ATK value=3", "    tag=HEALTH value=4", "    tag=ZONE_POSITION value=1")
+    feed(
+        parser,
+        "TAG_CHANGE Entity=GameEntity tag=2022 value=1",
+        "TAG_CHANGE Entity=GameEntity tag=2022 value=0",
+    )
+
+    add_entity(parser, 301, "BG_COMBAT_PROXY", controller=11, zone="PLAY", card_type="MINION")
+    feed(parser, "    tag=ATK value=7", "    tag=HEALTH value=8", "    tag=ZONE_POSITION value=1")
+
+    before_marker = next(
+        player for player in parser.snapshot().battlegrounds.lobby if player.player_id == 5
+    )
+    assert before_marker.board_count == 0
+
+    feed(parser, "TAG_CHANGE Entity=301 tag=DEFENDING value=1")
+
+    opponent = next(player for player in parser.snapshot().battlegrounds.lobby if player.player_id == 5)
+    assert opponent.board_count == 1
+    assert opponent.board_cards == ("BG_COMBAT_PROXY",)
+    assert opponent.board_attack == 7
+    assert opponent.board_health == 8
+
+
+def test_battlegrounds_combat_marker_confirms_reused_bob_proxy_cohort() -> None:
+    parser = PowerLogParser()
+    feed(
+        parser,
+        "CREATE_GAME",
+        "GameEntity EntityID=1",
+        "Player EntityID=8 PlayerID=3 GameAccountId=[hi=0 lo=0]",
+        "Player EntityID=9 PlayerID=11 GameAccountId=[hi=0 lo=0]",
+        "    tag=BACON_DUMMY_PLAYER value=1",
+        "TAG_CHANGE Entity=8 tag=NEXT_OPPONENT_PLAYER_ID value=5",
+        "TAG_CHANGE Entity=8 tag=CURRENT_PLAYER value=1",
+    )
+    add_entity(parser, 105, "TB_BaconShop_HERO_05", controller=5, zone="SETASIDE", card_type="HERO")
+    feed(parser, "    tag=PLAYER_ID value=5", "    tag=HEALTH value=40")
+    for entity_id, card_id, attack, health, position in (
+        (300, "BG_REUSED_PROXY_1", 3, 4, 1),
+        (301, "BG_REUSED_PROXY_2", 5, 6, 2),
+    ):
+        add_entity(parser, entity_id, card_id, controller=11, zone="PLAY", card_type="MINION")
+        feed(
+            parser,
+            f"    tag=ATK value={attack}",
+            f"    tag=HEALTH value={health}",
+            f"    tag=ZONE_POSITION value={position}",
+        )
+    feed(
+        parser,
+        "TAG_CHANGE Entity=GameEntity tag=2022 value=1",
+        "TAG_CHANGE Entity=GameEntity tag=2022 value=0",
+    )
+
+    assert parser._observed_boards == {}
+    feed(parser, "TAG_CHANGE Entity=300 tag=ATTACKING value=1")
+
+    assert parser._observed_boards[5][0] == parser.battlegrounds_round
+    opponent = next(player for player in parser.snapshot().battlegrounds.lobby if player.player_id == 5)
+    assert opponent.board_cards == ("BG_REUSED_PROXY_1", "BG_REUSED_PROXY_2")
+    assert opponent.board_attack == 8
+    assert opponent.board_health == 10
+
+
+def test_snapshot_is_pure_for_observed_boards_and_recruit_warband_cache() -> None:
+    parser = PowerLogParser()
+    parser.mode = "battlegrounds"
+    parser.phase = "combat"
+    parser.battlegrounds_round = 2
+    parser.local_controller = 3
+    parser.bob_controller = 11
+    parser.next_opponent_player_id = 5
+    parser.entities[300] = Entity(
+        300,
+        card_id="BG_UNCONFIRMED_PROXY",
+        controller=11,
+        zone="PLAY",
+        card_type="MINION",
+        tags={"ATK": "3", "HEALTH": "4", "ZONE_POSITION": "1"},
+        revealed=True,
+    )
+
+    first = parser.snapshot().to_public_dict()
+    second = parser.snapshot().to_public_dict()
+
+    assert first == second
+    assert parser._observed_boards == {}
+    assert parser._last_recruit_warband == ()
+
+    parser.phase = "recruit"
+    parser.entities[301] = Entity(
+        301,
+        card_id="BG_LOCAL_MINION",
+        controller=3,
+        zone="PLAY",
+        card_type="MINION",
+        tags={"ATK": "5", "HEALTH": "6", "ZONE_POSITION": "1"},
+        revealed=True,
+    )
+    recruit_first = parser.snapshot().to_public_dict()
+    recruit_second = parser.snapshot().to_public_dict()
+
+    assert recruit_first == recruit_second
+    assert parser._observed_boards == {}
+    assert parser._last_recruit_warband == ()
+
+
+def test_battlegrounds_hero_choices_include_local_skin_but_exclude_locked_and_remote() -> None:
+    parser = PowerLogParser()
+    feed(
+        parser,
+        "CREATE_GAME",
+        "Player EntityID=8 PlayerID=3 GameAccountId=[hi=0 lo=0]",
+        "Player EntityID=9 PlayerID=11 GameAccountId=[hi=0 lo=0]",
+        "    tag=BACON_DUMMY_PLAYER value=1",
+    )
+    add_entity(parser, 91, "BG_HERO_CHOICE", controller=3, zone="HAND", card_type="HERO")
+    feed(parser, "    tag=BACON_HERO_CAN_BE_DRAFTED value=1")
+    add_entity(parser, 92, "BG_HERO_LOCKED", controller=3, zone="HAND", card_type="HERO")
+    feed(
+        parser,
+        "    tag=BACON_HERO_CAN_BE_DRAFTED value=1",
+        "    tag=BACON_LOCKED_MULLIGAN_HERO value=1",
+    )
+    add_entity(parser, 93, "BG_HERO_SKIN", controller=3, zone="PLAY", card_type="HERO")
+    feed(parser, "    tag=BACON_SKIN value=1", "    tag=PLAYER_ID value=3")
+    add_entity(parser, 105, "BG_ASSIGNED_HERO", controller=11, zone="SETASIDE", card_type="HERO")
+    feed(parser, "    tag=BACON_HERO_CAN_BE_DRAFTED value=1", "    tag=PLAYER_ID value=5")
+
+    battlegrounds = parser.snapshot().battlegrounds
+
+    assert battlegrounds is not None
+    assert [choice.card_id for choice in battlegrounds.hero_choices] == [
+        "BG_HERO_CHOICE",
+        "BG_HERO_SKIN",
+    ]
+    assert battlegrounds.to_public_dict()["hero_choices"] == [
+        {"card_id": "BG_HERO_CHOICE", "name": "BG_HERO_CHOICE"},
+        {"card_id": "BG_HERO_SKIN", "name": "BG_HERO_SKIN"},
+    ]
+    assert [player.hero_card_id for player in battlegrounds.lobby] == ["BG_ASSIGNED_HERO"]
+
+    parser.phase = "recruit"
+    recruit = parser.snapshot().battlegrounds
+
+    assert recruit.hero_choices == ()
+    assert [player.hero_card_id for player in recruit.lobby] == [
+        "BG_HERO_SKIN",
+        "BG_ASSIGNED_HERO",
+    ]
+
+
+def test_battlegrounds_duos_marks_only_same_explicit_team_id_as_teammate() -> None:
+    parser = PowerLogParser()
+    feed(
+        parser,
+        "CREATE_GAME",
+        "Player EntityID=8 PlayerID=3 GameAccountId=[hi=0 lo=0]",
+        "Player EntityID=9 PlayerID=11 GameAccountId=[hi=0 lo=0]",
+        "    tag=BACON_DUMMY_PLAYER value=1",
+        "GameState.DebugPrintGame() - GameType=GT_BATTLEGROUNDS_DUO",
+        "TAG_CHANGE Entity=8 tag=BACON_DUO_TEAM_ID value=7",
+    )
+    for player_id, team_id in ((3, 7), (4, 7), (5, 8), (6, 0)):
+        add_entity(
+            parser,
+            100 + player_id,
+            f"BG_DUO_HERO_{player_id}",
+            controller=player_id,
+            zone="SETASIDE",
+            card_type="HERO",
+        )
+        feed(
+            parser,
+            f"    tag=PLAYER_ID value={player_id}",
+            f"    tag=BACON_DUO_TEAM_ID value={team_id}",
+        )
+
+    lobby = {player.player_id: player for player in parser.snapshot().battlegrounds.lobby}
+
+    assert lobby[3].is_local is True
+    assert lobby[3].is_teammate is False
+    assert lobby[4].is_teammate is True
+    assert lobby[5].is_teammate is False
+    assert lobby[6].is_teammate is False
+    public_lobby = {
+        player["player_id"]: player for player in parser.snapshot().battlegrounds.to_public_dict()["lobby"]
+    }
+    assert public_lobby[4]["is_teammate"] is True
+    assert public_lobby[5]["is_teammate"] is False
+
+
+def test_battlegrounds_does_not_guess_hero_choices_without_local_controller() -> None:
+    parser = PowerLogParser()
+    parser.mode = "battlegrounds"
+    parser.phase = "hero_select"
+    add_entity(parser, 91, "BG_HERO_CHOICE", controller=7, zone="HAND", card_type="HERO")
+    feed(parser, "    tag=BACON_HERO_CAN_BE_DRAFTED value=1")
+
+    assert parser.snapshot().battlegrounds.hero_choices == ()
+
+
 def test_battlegrounds_rehidden_known_card_never_exposes_card_id_or_stats() -> None:
     parser = PowerLogParser()
     feed(
@@ -536,6 +881,30 @@ def test_battlegrounds_round_event_is_emitted_once_per_computed_round() -> None:
     rounds = [event.details["round"] for event in events if event.kind == "battlegrounds_round"]
     assert rounds == [1, 2]
     assert parser.snapshot().battlegrounds.round == 2
+
+
+@pytest.mark.parametrize(
+    ("variant", "phase_tag"),
+    [("solo", "2022"), ("duos", "3533")],
+)
+def test_first_active_battlegrounds_phase_signal_recovers_recruit_then_transitions_to_combat(
+    variant: str,
+    phase_tag: str,
+) -> None:
+    parser = PowerLogParser()
+    feed(parser, "CREATE_GAME", "GameEntity EntityID=1")
+    parser.mode = "battlegrounds"
+    parser.battlegrounds_variant = variant
+    parser.phase = "hero_select"
+
+    first = feed(parser, f"TAG_CHANGE Entity=GameEntity tag={phase_tag} value=1")
+    phase_after_first = parser.snapshot().phase
+    second = feed(parser, f"TAG_CHANGE Entity=GameEntity tag={phase_tag} value=0")
+
+    assert first == []
+    assert phase_after_first == "recruit"
+    assert parser.snapshot().phase == "combat"
+    assert [event.kind for event in second] == ["battlegrounds_combat_started"]
 
 
 def test_battlegrounds_caches_authoritative_recruit_board_and_filters_ui_helpers() -> None:

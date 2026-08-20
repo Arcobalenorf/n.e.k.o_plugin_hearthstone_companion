@@ -41,9 +41,13 @@ hsbg.cards public API --> fixed-origin background GET --> atomic cache --> obser
 
 `PowerLogTailer` 增量跟随最新 `Power.log`，处理轮换、截断和首次接入上限。首次恢复默认且最多读取末尾 64 MiB；恢复字节只在本机逐行解析，不会进入模型请求。`PowerLogParser` 解析实体和 tag 变化，`CompanionMonitor` 是状态唯一写入者；UI、工具和统计只取得不可变快照。
 
+每次日志换源、读取器重建或停止后重启都会进入新的 source generation，并清空上一代的行/事件时间。bootstrap 只恢复当前公开状态，不重放主动解说、终局事件或统计；日志超过实时窗口后会退出角色场景，只有同一代来源重新出现新数据才恢复。工具可用性与场景 context 使用同一套新鲜度判定，旧来源时间不能让历史快照冒充实时局势。
+
 战棋实现不假设本地 `PlayerID=1`。Bob 通过 `BACON_DUMMY_PLAYER` 识别；大厅由带 `PLAYER_ID` 的英雄实体组成；单排和双排分别使用可验证的战斗状态 tag；最终名次来自本地英雄的 `PLAYER_LEADERBOARD_PLACE`。
 
-对手战团是过去战斗中看到的公开信息，快照始终携带 `last_seen_round` 和 `is_last_observed`，禁止把它描述成当前阵容。
+对手战团是过去战斗中看到的公开信息，快照始终携带 `last_seen_round` 和 `is_last_observed`，禁止把它描述成当前阵容。战斗边沿只隔离上一轮 Bob 商店；只有实体出现明确的 `ATTACKING/DEFENDING` 战斗标记后才确认公开战斗代理，从而同时避免商店污染和无依据补猜。`snapshot()` 与 `to_public_dict()` 必须保持纯读，UI 刷新或工具查询频率不能改变解析结果。
+
+英雄选择快照只收集 `Power.log` 明确归属于本地 controller、未隐藏、未锁定且带可选/皮肤标记的英雄，进入招募后立即清空。它不根据卡池、远端玩家或缺失日志补猜候选；选择完成后的我方英雄仍由大厅实体识别。普通构筑快照只公开我方手牌数量，不包含具体手牌身份；因此它适合公开场面、生命和法力层面的陪伴，不支持可靠的逐张手牌出牌建议。
 
 ## 陪伴调度
 
@@ -74,6 +78,8 @@ hsbg.cards public API --> fixed-origin background GET --> atomic cache --> obser
 
 数据同意开启后工具即可使用，不要求同时开启主动解说。这让用户可以安静游玩，只在主动提问时获得角色回答。
 
+`current_strategy` 在新鲜的英雄选择阶段可以依据实际观测候选和带来源的英雄规则回答“这几个英雄选哪个”，但必须说明没有授权的全局胜率。只有新鲜招募阶段才允许把当前商店用于具体购买、刷新、冻结或升本建议；战斗阶段没有当前商店决策，缓存状态也只能用于说明最近观察，均不得输出成可执行的即时购买建议。赛季规则、本机英雄聚合表现和对局复盘使用各自独立的可用性条件，不能用其他历史样本冒充当前英雄或刚结束的一局。
+
 卡牌目录不做流派评分、胜率排序或本地推荐。远端 `rules_text` 经过 HTML 清洗和长度限制，仍被标记为不可信参考数据；角色必须核对 provider、patch、checked_at、stale 和覆盖率。常规 `*_G` 金卡会映射到金色规则，少量旧式或不规则 CardID 会进入 `missing_ids`，角色不得猜测缺失元数据。目录不可用不会令实时局势整体不可用。
 
 ## 持久化与线程
@@ -84,7 +90,7 @@ Plugin Store 长期只保存赛季/模式/英雄维度的聚合计数。N.E.K.O 
 
 统计初始读取只有明确成功后才开放后续写入。Store 返回 `Err`、抛异常或已有数据校验失败时，核心日志监听和陪伴仍会启动，但统计保持降级且禁止记录、清空或覆盖未知的历史值，等待插件重启后重新加载。
 
-`BattlegroundsCardCatalog` 使用独立后台线程，固定访问 `https://hsbg.cards/api/v1`，限制响应、条目和字段长度，并以临时文件加 `os.replace()` 写入 N.E.K.O `cache_path()`。网络、JSON 或磁盘失败时保留已有快照并公开错误码；Power.log 监听线程从不联网。
+`BattlegroundsCardCatalog` 使用独立后台线程，固定访问 `https://hsbg.cards/api/v1`，限制响应、条目和字段长度，并以临时文件加 `os.replace()` 写入 N.E.K.O `data_path()`。网络、JSON 或磁盘失败时保留已有快照并公开错误码；Power.log 监听线程从不联网。
 
 ## 主要配置
 

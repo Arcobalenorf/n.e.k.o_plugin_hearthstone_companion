@@ -35,6 +35,8 @@ class AsyncStoreWriter:
         self._accepting = False
         self._write_failed = False
         self._last_error_code = ""
+        self._next_write_sequence = 0
+        self._health_sequence = 0
 
     def start(self) -> bool:
         with self._lock:
@@ -43,6 +45,8 @@ class AsyncStoreWriter:
             self._ready = threading.Event()
             self._write_failed = False
             self._last_error_code = ""
+            self._next_write_sequence = 0
+            self._health_sequence = 0
             self._thread = threading.Thread(target=self._run, name="hearthstone-store", daemon=True)
             self._thread.start()
         if not self._ready.wait(3.0):
@@ -70,14 +74,20 @@ class AsyncStoreWriter:
             loop = self._loop
             thread = self._thread
             if not self._accepting or loop is None or thread is None or not thread.is_alive():
+                self._next_write_sequence += 1
+                self._record_failure_locked(
+                    self._next_write_sequence,
+                    "stats:writer_unavailable",
+                )
                 return None
-            coroutine = self._write_serial(copied)
+            self._next_write_sequence += 1
+            sequence = self._next_write_sequence
+            coroutine = self._write_serial(copied, sequence)
             try:
                 future = asyncio.run_coroutine_threadsafe(coroutine, loop)
             except Exception as exc:
                 coroutine.close()
-                self._write_failed = True
-                self._last_error_code = f"stats:schedule:{type(exc).__name__}"
+                self._record_failure_locked(sequence, f"stats:schedule:{type(exc).__name__}")
                 return None
             self._pending.add(future)
         future.add_done_callback(self._completed)
@@ -139,28 +149,43 @@ class AsyncStoreWriter:
                 loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
             loop.close()
 
-    async def _write_serial(self, value: dict[str, Any]) -> Any:
+    async def _write_serial(self, value: dict[str, Any], sequence: int) -> Any:
         lock = self._write_lock
         if lock is None:
             raise RuntimeError("statistics store lock is unavailable")
         async with lock:
-            return await self._write(value)
+            try:
+                result = await self._write(value)
+            except Exception as exc:
+                with self._lock:
+                    self._record_failure_locked(sequence, f"stats:{type(exc).__name__}")
+                self._logger.warning("Battlegrounds statistics Store write failed code=%s", type(exc).__name__)
+                raise
+            if _is_error_result(result):
+                with self._lock:
+                    self._record_failure_locked(sequence, "stats:store_err")
+                self._logger.warning("Battlegrounds statistics Store write returned Err")
+            else:
+                with self._lock:
+                    if sequence >= self._health_sequence:
+                        self._health_sequence = sequence
+                        self._write_failed = False
+                        self._last_error_code = ""
+            return result
+
+    def _record_failure_locked(self, sequence: int, error_code: str) -> None:
+        if sequence >= self._health_sequence:
+            self._health_sequence = sequence
+            self._write_failed = True
+            self._last_error_code = error_code
 
     def _completed(self, future: Future[Any]) -> None:
         with self._lock:
             self._pending.discard(future)
         try:
-            result = future.result()
-            if _is_error_result(result):
-                with self._lock:
-                    self._write_failed = True
-                    self._last_error_code = "stats:store_err"
-                self._logger.warning("Battlegrounds statistics Store write returned Err")
-        except Exception as exc:
-            with self._lock:
-                self._write_failed = True
-                self._last_error_code = f"stats:{type(exc).__name__}"
-            self._logger.warning("Battlegrounds statistics Store write failed code=%s", type(exc).__name__)
+            future.result()
+        except Exception:
+            pass
 
 
 __all__ = ["AsyncStoreWriter"]

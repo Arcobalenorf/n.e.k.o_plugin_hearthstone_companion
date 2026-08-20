@@ -126,6 +126,67 @@ def test_active_battlegrounds_bootstrap_notifies_state_ready_before_first_turn()
     assert monitor.status().events_seen == 0
 
 
+def test_stale_active_bootstrap_does_not_notify_state_ready() -> None:
+    path = Path("stale/Power.log")
+    lines = (
+        _line("CREATE_GAME"),
+        _line("GameEntity EntityID=1"),
+        _line("TAG_CHANGE Entity=GameEntity tag=STEP value=MAIN_READY"),
+    )
+    modified_at = time.time() - 24 * 60 * 60
+
+    monitor, observed, llm_events, results = _run_bootstrap_batches(
+        [
+            TailBatch(
+                lines,
+                path,
+                bootstrap=True,
+                source_reset=True,
+                bootstrap_complete=True,
+                modified_at=modified_at,
+            )
+        ]
+    )
+
+    assert [kind for kind, _snapshot in observed] == ["source_reset"]
+    assert monitor.snapshot().phase == "playing"
+    assert monitor.status().last_line_at == modified_at
+    assert llm_events == []
+    assert results == []
+
+
+def test_live_state_emits_stale_edge_after_inactivity() -> None:
+    observed: list[str] = []
+    monitor = CompanionMonitor(
+        CompanionConfig(poll_interval_seconds=0.1),
+        _logger(),
+        on_llm=lambda *_args: False,
+        on_event=lambda event, _snapshot: observed.append(event.kind),
+    )
+    active = GameSnapshot(mode="constructed", phase="playing", game_number=1)
+    monitor._parser = SimpleNamespace(
+        snapshot=lambda: active,
+        entity_capacity_exceeded=False,
+    )
+    monitor._snapshot = active
+    monitor._bootstrap_complete = True
+    monitor._state_ready_notified = True
+    monitor._live_context_generation = monitor._source_generation
+    monitor._status.last_line_at = time.time() - 301.0
+    monitor._tailer = _BatchSequence(
+        monitor,
+        [TailBatch((), Path("Power.log"), bootstrap_complete=True)],
+    )
+
+    assert monitor.start()
+    deadline = time.monotonic() + 2.0
+    while not monitor._stop.is_set() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert monitor.stop(timeout=2.0)
+
+    assert observed == ["state_stale"]
+
+
 def test_ended_bootstrap_does_not_replay_terminal_events_or_statistics() -> None:
     path = Path("ended/Power.log")
     lines = (
@@ -238,6 +299,189 @@ def test_state_ready_is_once_per_log_source_generation() -> None:
     ]
     assert llm_events == []
     assert results == []
+
+
+def test_source_reset_clears_previous_generation_activity_before_freshness_check() -> None:
+    lines = (
+        _line("CREATE_GAME"),
+        _line("GameEntity EntityID=1"),
+        _line("TAG_CHANGE Entity=GameEntity tag=STEP value=MAIN_READY"),
+    )
+    first = Path("session-1/Power.log")
+    second = Path("session-2/Power.log")
+    now = time.time()
+
+    monitor, observed, _llm_events, _results = _run_bootstrap_batches(
+        [
+            TailBatch(
+                lines,
+                first,
+                bootstrap=True,
+                source_reset=True,
+                bootstrap_complete=True,
+                modified_at=now,
+            ),
+            TailBatch(
+                (_line("TAG_CHANGE Entity=GameEntity tag=TURN value=1"),),
+                first,
+                bootstrap_complete=True,
+                modified_at=now,
+            ),
+            TailBatch(
+                lines,
+                second,
+                bootstrap=True,
+                source_reset=True,
+                bootstrap_complete=True,
+                modified_at=now - 3600.0,
+            ),
+        ]
+    )
+
+    assert [kind for kind, _snapshot in observed] == [
+        "source_reset",
+        "state_ready",
+        "turn_started",
+        "source_reset",
+    ]
+    assert monitor.status().last_event_at == 0.0
+    assert monitor.status().last_event_kind == ""
+    assert monitor.status().last_line_at == now - 3600.0
+
+
+def test_reader_reset_clears_generation_scoped_runtime_activity() -> None:
+    monitor = CompanionMonitor(
+        CompanionConfig(log_path="old/Power.log"),
+        _logger(),
+        on_llm=lambda *_args: False,
+    )
+    monitor._status.resolved_log_path = "old/Power.log"
+    monitor._status.source_modified_at = 100.0
+    monitor._status.last_line_at = 101.0
+    monitor._status.last_event_at = 102.0
+    monitor._status.last_event_kind = "turn_started"
+
+    monitor.update_config(CompanionConfig(log_path="new/Power.log"))
+
+    status = monitor.status()
+    assert status.resolved_log_path == ""
+    assert status.source_modified_at == 0.0
+    assert status.last_line_at == 0.0
+    assert status.last_event_at == 0.0
+    assert status.last_event_kind == ""
+
+
+def test_incremental_live_game_emits_stale_without_bootstrap_state_ready() -> None:
+    observed: list[str] = []
+    monitor = CompanionMonitor(
+        CompanionConfig(poll_interval_seconds=0.1),
+        _logger(),
+        on_llm=lambda *_args: False,
+        on_event=lambda event, _snapshot: observed.append(event.kind),
+    )
+    active_lines = (
+        _line("CREATE_GAME"),
+        _line("GameEntity EntityID=1"),
+        _line("TAG_CHANGE Entity=GameEntity tag=STEP value=MAIN_READY"),
+    )
+    calls = 0
+
+    def poll() -> TailBatch:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return TailBatch(
+                (),
+                Path("Power.log"),
+                bootstrap=True,
+                source_reset=True,
+                bootstrap_complete=True,
+            )
+        if calls == 2:
+            return TailBatch(active_lines, Path("Power.log"), bootstrap_complete=True)
+        if calls == 3:
+            monitor._status.last_line_at = time.time() - 301.0
+            monitor._status.last_event_at = time.time() - 301.0
+            return TailBatch((), Path("Power.log"), bootstrap_complete=True)
+        monitor._stop.set()
+        return TailBatch((), Path("Power.log"), bootstrap_complete=True)
+
+    monitor._tailer = SimpleNamespace(poll=poll)
+
+    assert monitor.start()
+    deadline = time.monotonic() + 2.0
+    while not monitor._stop.is_set() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert monitor.stop(timeout=2.0)
+
+    assert "state_ready" not in observed
+    assert observed[-1] == "state_stale"
+    assert observed.count("state_stale") == 1
+
+
+def test_restart_bootstraps_current_log_without_replaying_stopped_backlog(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / "Power.log"
+    first_game = (
+        _line("CREATE_GAME"),
+        _line("GameEntity EntityID=1"),
+        _line("Player EntityID=8 PlayerID=3 GameAccountId=[hi=0 lo=0]"),
+        "D 12:00:00.0000000 GameState.DebugPrintGame() - GameType=GT_BATTLEGROUNDS",
+        _line("FULL_ENTITY - Creating ID=103 CardID=TB_BaconShop_HERO_03"),
+        _line("    tag=CONTROLLER value=3"),
+        _line("    tag=ZONE value=PLAY"),
+        _line("    tag=CARDTYPE value=HERO"),
+        _line("    tag=PLAYER_ID value=3"),
+        _line("    tag=PLAYER_LEADERBOARD_PLACE value=3"),
+    )
+    log_path.write_text("\n".join((*first_game, "")), encoding="utf-8")
+    observed: list[str] = []
+    llm_events: list[str] = []
+    results: list[str] = []
+    monitor = CompanionMonitor(
+        CompanionConfig(
+            log_path=str(log_path),
+            poll_interval_seconds=0.1,
+            llm_commentary_enabled=True,
+            llm_data_consent=True,
+        ),
+        _logger(),
+        on_llm=lambda _prompt, event, _snapshot: not llm_events.append(event.kind),
+        on_result=lambda event, _snapshot: results.append(event.kind),
+        on_event=lambda event, _snapshot: observed.append(event.kind),
+    )
+
+    assert monitor.start()
+    deadline = time.monotonic() + 2.0
+    while "state_ready" not in observed and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert monitor.stop(timeout=2.0)
+    assert "state_ready" in observed
+
+    observed.clear()
+    llm_events.clear()
+    results.clear()
+    stopped_backlog = (
+        _line("TAG_CHANGE Entity=103 tag=PLAYER_LEADERBOARD_PLACE value=4"),
+        _line("TAG_CHANGE Entity=GameEntity tag=STATE value=COMPLETE"),
+        _line("CREATE_GAME"),
+        _line("GameEntity EntityID=1"),
+        _line("TAG_CHANGE Entity=GameEntity tag=STEP value=MAIN_READY"),
+    )
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write("\n".join((*stopped_backlog, "")))
+
+    assert monitor.start()
+    deadline = time.monotonic() + 2.0
+    while "state_ready" not in observed and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert monitor.stop(timeout=2.0)
+
+    assert observed == ["source_reset", "state_ready"]
+    assert llm_events == []
+    assert results == []
+    assert monitor.snapshot().phase == "playing"
 
 
 def test_monitor_delegates_authorized_commentary_to_llm_callback() -> None:
