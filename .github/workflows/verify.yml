@@ -37,7 +37,7 @@ jobs:
       - name: Compile Python sources
         run: >-
           uv run python -m compileall -q -f .
-          -x "[/\\](.git|.venv|.pytest_cache|.ruff_cache|build|dist)[/\\]"
+          -x '[/\\](.git|.venv|.pytest_cache|.ruff_cache|build|dist)[/\\]'
       - name: Check committed patch whitespace
         run: git show --check --format= HEAD
 
