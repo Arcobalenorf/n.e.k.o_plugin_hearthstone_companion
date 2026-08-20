@@ -39,15 +39,17 @@ hsbg.cards public API --> fixed-origin background GET --> atomic cache --> obser
 
 ## 日志与状态机
 
-`PowerLogTailer` 增量跟随最新 `Power.log`，处理轮换、截断和首次接入上限。首次恢复默认且最多读取末尾 64 MiB；恢复字节只在本机逐行解析，不会进入模型请求。`PowerLogParser` 解析实体和 tag 变化，`CompanionMonitor` 是状态唯一写入者；UI、工具和统计只取得不可变快照。
+`PowerLogTailer` 以 100 ms 周期增量跟随最新 `Power.log`，处理轮换、截断和首次接入上限。首次恢复默认且最多读取末尾 64 MiB，并从窗口内最新的完整 `GameState CREATE_GAME` 边界开始，兼容 LF 与 CRLF；恢复字节只在本机逐行解析，不会进入模型请求。`PowerLogParser` 解析实体和 tag 变化，`CompanionMonitor` 是状态唯一写入者；UI、工具和统计只取得不可变快照。Hosted UI 打开时每 500 ms 串行拉取一次不可变状态，刷新失败不会覆盖用户尚未保存的草稿。
 
 每次日志换源、读取器重建或停止后重启都会进入新的 source generation，并清空上一代的行/事件时间。bootstrap 只恢复当前公开状态，不重放主动解说、终局事件或统计；日志超过实时窗口后会退出角色场景，只有同一代来源重新出现新数据才恢复。工具可用性与场景 context 使用同一套新鲜度判定，旧来源时间不能让历史快照冒充实时局势。
 
+实时链路按日志职责合并而不是二选一：`PowerTaskList.DebugPrintPower` 是动态实体、tag 和 block 的权威实时流；`GameState.DebugPrintGame` 提供模式元数据；`GameState.DebugPrintPower` 只提供最早的新局边界、受限静态实体补全和 `STATE=COMPLETE`/终局 `PLAYSTATE`。新局静态包先进入隔离暂存区，直到 PowerTaskList 确认 `CREATE_GAME` 后才提交；进行中的静态补全只能填空，不能覆盖 PowerTaskList 已观察字段，也不能恢复被 `HIDE_ENTITY` 撤销的可见性。
+
 战棋实现不假设本地 `PlayerID=1`。Bob 通过 `BACON_DUMMY_PLAYER` 识别；大厅由带 `PLAYER_ID` 的英雄实体组成；单排和双排分别使用可验证的战斗状态 tag；最终名次来自本地英雄的 `PLAYER_LEADERBOARD_PLACE`。
 
-对手战团是过去战斗中看到的公开信息，快照始终携带 `last_seen_round` 和 `is_last_observed`，禁止把它描述成当前阵容。战斗边沿只隔离上一轮 Bob 商店；只有实体出现明确的 `ATTACKING/DEFENDING` 战斗标记后才确认公开战斗代理，从而同时避免商店污染和无依据补猜。`snapshot()` 与 `to_public_dict()` 必须保持纯读，UI 刷新或工具查询频率不能改变解析结果。
+对手战团是过去战斗中看到的公开信息，快照始终携带 `last_seen_round` 和 `is_last_observed`，禁止把它描述成当前阵容。战斗边沿只隔离上一轮 Bob 商店；只有实体出现明确的 `ATTACKING/DEFENDING` 战斗标记后，才在每场公开战斗开始时冻结首次确认的阵容。插件按对手保留最近一次观察，同一场战斗中产生的召唤物、变形或死亡不会改写这份记录。记录保留随从 CardID、名称、攻血和星级，供后续陪伴回忆和规则事实查询。缺失 `CARDTYPE` 的实体必须额外具备合法站位或攻血联合证据，内部效果实体不能仅凭 CardID 进入公开战团。`snapshot()` 与 `to_public_dict()` 必须保持纯读，UI 刷新或工具查询频率不能改变解析结果。
 
-英雄选择快照只收集 `Power.log` 明确归属于本地 controller、未隐藏、未锁定且带可选/皮肤标记的英雄，进入招募后立即清空。它不根据卡池、远端玩家或缺失日志补猜候选；选择完成后的我方英雄仍由大厅实体识别。普通构筑快照只公开我方手牌数量，不包含具体手牌身份；因此它适合公开场面、生命和法力层面的陪伴，不支持可靠的逐张手牌出牌建议。
+英雄选择快照只收集 `Power.log` 明确归属于本地 controller、未隐藏、未锁定且带可选/皮肤标记的英雄。候选持续保留到本地玩家明确出现 `MULLIGAN_STATE=DONE`；选择完成标记在一局内单调，迟到的 INPUT/DEALING 镜像不会重新打开候选，普通招募阶段信号也不会提前清空。它不根据卡池、远端玩家或缺失日志补猜候选；选择完成后的我方英雄仍由大厅实体识别。普通构筑快照只公开我方手牌数量，不包含具体手牌身份；因此它适合公开场面、生命和法力层面的陪伴，不支持可靠的逐张手牌出牌建议。
 
 ## 陪伴调度
 
@@ -71,7 +73,7 @@ hsbg.cards public API --> fixed-origin background GET --> atomic cache --> obser
 `hearthstone_battlegrounds_advice` 是只读 LLM tool，不直接生成台词。它返回：
 
 - 当前战棋公开局势；
-- `hsbg.cards` 当前卡池摘要，以及按 `card_id` 去重的当前商店/手牌/战团/英雄规则事实；
+- `hsbg.cards` 当前卡池摘要，以及按 `card_id` 去重的当前商店/手牌/战团/英雄和上次观察对手战团规则事实；
 - 带来源、补丁和验证时间的赛季规则；
 - 当前赛季的本机聚合统计与样本量；
 - 全局 meta 数据的可用状态和禁止编造契约。

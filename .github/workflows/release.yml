@@ -118,3 +118,20 @@ jobs:
       plugin-id: hearthstone_companion
       neko-repository: Project-N-E-K-O/N.E.K.O
       neko-ref: 50e23ac5403fcddc96e0dfb9fc78075f32a2428e
+
+  release-notes:
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Check out plugin
+        uses: actions/checkout@v4
+      - name: Publish versioned release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release edit "$GITHUB_REF_NAME"
+          --repo "$GITHUB_REPOSITORY"
+          --notes-file ".github/release-notes/${GITHUB_REF_NAME}.md"
