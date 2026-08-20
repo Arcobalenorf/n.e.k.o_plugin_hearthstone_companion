@@ -7,7 +7,7 @@ import threading
 import time
 import types
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 from hearthstone_companion_under_test.config import CompanionConfig
@@ -84,6 +84,125 @@ def _load_sdk_entry(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setitem(sys.modules, module_name, module)
     spec.loader.exec_module(module)
     return module
+
+
+def _make_lifecycle_test_plugin(
+    entry: Any,
+    *,
+    load_stats: Callable[[], Any],
+    initially_running: bool = False,
+    monitor_stop_entered: threading.Event | None = None,
+    release_monitor_stop: threading.Event | None = None,
+) -> tuple[Any, dict[str, Any], list[str]]:
+    calls: list[str] = []
+
+    class Worker:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.running = initially_running
+
+        def configure(self, **_kwargs: Any) -> None:
+            calls.append(f"{self.name}.configure")
+
+        def update_config(self, _config: CompanionConfig) -> None:
+            calls.append(f"{self.name}.configure")
+
+        def start(self) -> bool:
+            calls.append(f"{self.name}.start")
+            self.running = True
+            return True
+
+        def stop(self, **_kwargs: Any) -> bool:
+            if self.name == "monitor" and monitor_stop_entered is not None:
+                calls.append("monitor.stop.enter")
+                monitor_stop_entered.set()
+                assert release_monitor_stop is not None
+                assert release_monitor_stop.wait(1.0)
+            calls.append(f"{self.name}.stop")
+            self.running = False
+            return True
+
+        def status(self) -> Any:
+            return types.SimpleNamespace(monitor_running=self.running)
+
+        def is_running(self) -> bool:
+            return self.running
+
+        def is_accepting(self) -> bool:
+            return self.running
+
+    class Overlay:
+        running = initially_running
+
+        def configure(self, _config: CompanionConfig) -> None:
+            calls.append("overlay.configure")
+
+        def resume_starts(self) -> None:
+            calls.append("overlay.resume")
+
+        def suspend_starts(self) -> None:
+            calls.append("overlay.suspend")
+
+        def start(self) -> dict[str, Any]:
+            calls.append("overlay.start")
+            self.running = True
+            return {"ok": True, "running": True}
+
+        def stop(self, **_kwargs: Any) -> dict[str, Any]:
+            calls.append("overlay.stop")
+            self.running = False
+            return {"ok": True, "running": False}
+
+    monitor = Worker("monitor")
+    catalog = Worker("catalog")
+    writer = Worker("writer")
+    overlay = Overlay()
+    workers = {
+        "monitor": monitor,
+        "catalog": catalog,
+        "writer": writer,
+        "overlay": overlay,
+    }
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(
+        monitor_on_start=True,
+        card_catalog_network_enabled=False,
+        overlay_enabled=False,
+        overlay_auto_start=False,
+    )
+    plugin._read_effective_config = lambda: _return_async(plugin.cfg)
+    plugin._load_stats = load_stats
+    plugin._store_writer = writer
+    plugin._catalog = catalog
+    plugin._overlay = overlay
+    plugin._monitor = monitor
+    plugin._monitor_applied_instance = monitor
+    plugin._monitor_applied_config = CompanionConfig.from_mapping(plugin.cfg.to_dict())
+    plugin._ensure_monitor = lambda: monitor
+    plugin._ownership_lock = threading.RLock()
+    plugin._monitor_action_lock = asyncio.Lock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._lifecycle_lock = asyncio.Lock()
+    plugin._lifecycle_generation = 0
+    plugin._startup_task = None
+    plugin._context_target = None
+    plugin._started = initially_running
+    plugin._monitor_dispatch_enabled = initially_running
+    plugin._settings_transition = False
+    plugin._settings_transition_revision = 0
+    plugin._config_revision = 0
+    plugin._config_reconciled_revision = 0
+    plugin._config_reconcile_task = None
+    plugin._config_reconcile_accepting = initially_running
+    plugin.logger = types.SimpleNamespace(
+        info=lambda *_args, **_kwargs: None,
+        warning=lambda *_args, **_kwargs: None,
+    )
+    return plugin, workers, calls
+
+
+async def _return_async(value: Any) -> Any:
+    return value
 
 
 def test_plugin_constructs_and_starts_with_stable_sdk_surface(
@@ -222,6 +341,9 @@ def test_legacy_none_push_receipt_counts_default_target_submission(monkeypatch) 
 def test_startup_failure_rolls_back_started_workers(monkeypatch) -> None:
     entry = _load_sdk_entry(monkeypatch)
 
+    async def read_config() -> CompanionConfig:
+        return plugin.cfg
+
     async def no_op() -> None:
         return None
 
@@ -246,11 +368,18 @@ def test_startup_failure_rolls_back_started_workers(monkeypatch) -> None:
         card_catalog_network_enabled=False,
         overlay_auto_start=False,
     )
-    plugin._reload_config = no_op
+    plugin._read_effective_config = read_config
     plugin._load_stats = no_op
     plugin._store_writer = writer
-    plugin._catalog = types.SimpleNamespace(start=lambda: False, stop=lambda **_kwargs: True)
-    plugin._overlay = types.SimpleNamespace(stop=lambda **_kwargs: {"ok": True, "running": False})
+    plugin._catalog = types.SimpleNamespace(
+        configure=lambda **_kwargs: None,
+        start=lambda: False,
+        stop=lambda **_kwargs: True,
+    )
+    plugin._overlay = types.SimpleNamespace(
+        configure=lambda _config: None,
+        stop=lambda **_kwargs: {"ok": True, "running": False},
+    )
     plugin._monitor = None
     plugin._ensure_monitor = lambda: (_ for _ in ()).throw(RuntimeError("monitor init failed"))
     plugin._ownership_lock = threading.RLock()
@@ -268,6 +397,713 @@ def test_startup_failure_rolls_back_started_workers(monkeypatch) -> None:
     assert writer.is_running() is False
     assert plugin._started is False
     assert plugin._monitor_dispatch_enabled is False
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_error"),
+    [
+        ("dump_timeout", "Hearthstone config load failed: TimeoutError"),
+        ("missing_section", "Hearthstone config load failed: InvalidSection"),
+        ("catalog_configure", "Hearthstone startup config apply failed: catalog:RuntimeError"),
+    ],
+)
+def test_startup_config_failure_never_starts_runtime_workers(
+    monkeypatch,
+    failure_kind: str,
+    expected_error: str,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    starts = {"writer": 0, "catalog": 0, "monitor": 0}
+
+    class Config:
+        async def dump(self, **_kwargs: Any) -> dict[str, Any]:
+            if failure_kind == "dump_timeout":
+                raise TimeoutError("host config IPC stalled")
+            if failure_kind == "missing_section":
+                return {}
+            return {
+                entry._CONFIG_SECTION: CompanionConfig(
+                    monitor_on_start=True,
+                    card_catalog_network_enabled=True,
+                ).to_dict()
+            }
+
+    class Writer:
+        def start(self) -> bool:
+            starts["writer"] += 1
+            return True
+
+        def stop(self, **_kwargs: Any) -> bool:
+            return True
+
+    class Catalog:
+        def configure(self, **_kwargs: Any) -> None:
+            if failure_kind == "catalog_configure":
+                raise RuntimeError("catalog apply failed")
+
+        def start(self) -> bool:
+            starts["catalog"] += 1
+            return True
+
+        def stop(self, **_kwargs: Any) -> bool:
+            return True
+
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig()
+    plugin.config = Config()
+    plugin._store_writer = Writer()
+    plugin._catalog = Catalog()
+    plugin._overlay = types.SimpleNamespace(
+        configure=lambda _config: None,
+        stop=lambda **_kwargs: {"ok": True, "running": False},
+    )
+    plugin._monitor = None
+    plugin._ensure_monitor = lambda: starts.__setitem__("monitor", starts["monitor"] + 1)
+    plugin._load_stats = lambda: (_ for _ in ()).throw(
+        AssertionError("Store load must not begin before config is valid")
+    )
+    plugin._ownership_lock = threading.RLock()
+    plugin._monitor_action_lock = asyncio.Lock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._context_target = None
+    plugin._started = False
+    plugin._monitor_dispatch_enabled = False
+    plugin._settings_transition = False
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args, **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match=expected_error):
+        asyncio.run(plugin.startup())
+
+    assert starts == {"writer": 0, "catalog": 0, "monitor": 0}
+    assert plugin._started is False
+    assert plugin._monitor_dispatch_enabled is False
+
+
+def test_shutdown_supersedes_blocked_startup_without_worker_resurrection(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+
+    async def scenario() -> tuple[Any, Any, Any, dict[str, Any], list[str]]:
+        load_entered = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        release_load = asyncio.Event()
+
+        async def load_stats() -> None:
+            load_entered.set()
+            try:
+                await release_load.wait()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+                await release_load.wait()
+
+        plugin, workers, calls = _make_lifecycle_test_plugin(
+            entry,
+            load_stats=load_stats,
+        )
+        startup_task = asyncio.create_task(plugin.startup())
+        await asyncio.wait_for(load_entered.wait(), timeout=1.0)
+
+        shutdown_task = asyncio.create_task(plugin.shutdown())
+        await asyncio.wait_for(cancellation_seen.wait(), timeout=1.0)
+        assert plugin._lifecycle_generation == 2
+        assert plugin._started is False
+        release_load.set()
+
+        startup_result = await asyncio.wait_for(startup_task, timeout=1.0)
+        shutdown_result = await asyncio.wait_for(shutdown_task, timeout=1.0)
+        await asyncio.sleep(0)
+        return plugin, startup_result, shutdown_result, workers, calls
+
+    plugin, startup_result, shutdown_result, workers, calls = asyncio.run(scenario())
+
+    assert isinstance(startup_result, RuntimeError)
+    assert "startup superseded" in str(startup_result)
+    assert shutdown_result["status"] == "stopped"
+    assert not any(call.endswith(".start") for call in calls)
+    assert all(not worker.running for worker in workers.values())
+    assert plugin._started is False
+    assert plugin._monitor_dispatch_enabled is False
+    assert plugin._startup_task is None
+
+
+def test_startup_queued_during_shutdown_runs_only_after_cleanup(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    stop_entered = threading.Event()
+    release_stop = threading.Event()
+
+    async def no_op() -> None:
+        return None
+
+    async def scenario() -> tuple[Any, Any, Any, dict[str, Any], list[str]]:
+        plugin, workers, calls = _make_lifecycle_test_plugin(
+            entry,
+            load_stats=no_op,
+            initially_running=True,
+            monitor_stop_entered=stop_entered,
+            release_monitor_stop=release_stop,
+        )
+        shutdown_task = asyncio.create_task(plugin.shutdown())
+        assert await asyncio.wait_for(
+            asyncio.to_thread(stop_entered.wait, 1.0),
+            timeout=1.0,
+        )
+
+        startup_task = asyncio.create_task(plugin.startup())
+        await asyncio.sleep(0)
+        assert not any(call.endswith(".start") for call in calls)
+        release_stop.set()
+
+        shutdown_result = await asyncio.wait_for(shutdown_task, timeout=1.0)
+        startup_result = await asyncio.wait_for(startup_task, timeout=1.0)
+        await asyncio.sleep(0)
+        return plugin, startup_result, shutdown_result, workers, calls
+
+    plugin, startup_result, shutdown_result, workers, calls = asyncio.run(scenario())
+
+    assert shutdown_result["status"] == "stopped"
+    assert startup_result["status"] == "ready"
+    last_stop = max(index for index, call in enumerate(calls) if call.endswith(".stop"))
+    first_start = min(index for index, call in enumerate(calls) if call.endswith(".start"))
+    assert last_stop < first_start
+    assert workers["monitor"].running is True
+    assert workers["catalog"].running is True
+    assert workers["writer"].running is True
+    assert workers["overlay"].running is False
+    assert plugin._started is True
+    assert plugin._monitor_dispatch_enabled is True
+    assert plugin._startup_task is None
+
+
+def test_shutdown_queued_after_startup_reclaims_final_lifecycle_ownership(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+
+    async def no_op() -> None:
+        return None
+
+    async def scenario() -> tuple[Any, Any, Any, dict[str, Any], list[str]]:
+        plugin, workers, calls = _make_lifecycle_test_plugin(
+            entry,
+            load_stats=no_op,
+        )
+        await plugin._lifecycle_lock.acquire()
+        startup_task = asyncio.create_task(plugin.startup())
+        await asyncio.sleep(0)
+        assert plugin._lifecycle_generation == 0
+
+        shutdown_task = asyncio.create_task(plugin.shutdown())
+        await asyncio.sleep(0)
+        assert plugin._lifecycle_generation == 1
+        plugin._lifecycle_lock.release()
+
+        startup_result = await asyncio.wait_for(startup_task, timeout=1.0)
+        shutdown_result = await asyncio.wait_for(shutdown_task, timeout=1.0)
+        await asyncio.sleep(0)
+        return plugin, startup_result, shutdown_result, workers, calls
+
+    plugin, startup_result, shutdown_result, workers, calls = asyncio.run(scenario())
+
+    assert isinstance(startup_result, RuntimeError)
+    assert "startup superseded" in str(startup_result)
+    assert shutdown_result["status"] == "stopped"
+    assert not any(call.endswith(".start") for call in calls)
+    assert all(not worker.running for worker in workers.values())
+    assert plugin._started is False
+    assert plugin._monitor_dispatch_enabled is False
+    assert plugin._config_reconcile_accepting is False
+    assert plugin._startup_task is None
+
+
+def test_startup_queued_after_shutdown_supersedes_cleanup_and_becomes_owner(
+    monkeypatch,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+
+    async def no_op() -> None:
+        return None
+
+    async def scenario() -> tuple[Any, Any, Any, dict[str, Any], list[str]]:
+        plugin, workers, calls = _make_lifecycle_test_plugin(
+            entry,
+            load_stats=no_op,
+            initially_running=True,
+        )
+        workers["overlay"].running = False
+        await plugin._lifecycle_lock.acquire()
+        shutdown_task = asyncio.create_task(plugin.shutdown())
+        await asyncio.sleep(0)
+        assert plugin._latest_lifecycle_request == 1
+
+        startup_task = asyncio.create_task(plugin.startup())
+        await asyncio.sleep(0)
+        assert plugin._latest_lifecycle_request == 2
+        plugin._lifecycle_lock.release()
+
+        shutdown_result = await asyncio.wait_for(shutdown_task, timeout=1.0)
+        startup_result = await asyncio.wait_for(startup_task, timeout=1.0)
+        await asyncio.sleep(0)
+        return plugin, startup_result, shutdown_result, workers, calls
+
+    plugin, startup_result, shutdown_result, workers, calls = asyncio.run(scenario())
+
+    assert shutdown_result == {"status": "superseded", "cleanup_skipped": True}
+    assert startup_result["status"] == "ready"
+    assert not any(call.endswith(".stop") for call in calls)
+    assert all(workers[name].running for name in ("monitor", "catalog", "writer"))
+    assert workers["overlay"].running is False
+    assert plugin._started is True
+    assert plugin._monitor_dispatch_enabled is True
+    assert plugin._config_reconcile_accepting is True
+    assert plugin._startup_task is None
+
+
+def test_new_startup_never_reuses_reconcile_task_cancelled_by_old_shutdown(
+    monkeypatch,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+
+    async def no_op() -> None:
+        return None
+
+    async def scenario() -> tuple[Any, Any, Any, dict[str, Any]]:
+        old_cancel_seen = asyncio.Event()
+        release_old_reconcile = asyncio.Event()
+        new_reconcile_started = asyncio.Event()
+        plugin, workers, _calls = _make_lifecycle_test_plugin(
+            entry,
+            load_stats=no_op,
+            initially_running=True,
+        )
+        workers["overlay"].running = False
+        plugin._config_revision = 1
+        plugin._config_reconciled_revision = 0
+
+        async def old_reconcile() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                old_cancel_seen.set()
+                await release_old_reconcile.wait()
+                raise
+
+        async def new_reconcile() -> None:
+            new_reconcile_started.set()
+            plugin._config_reconciled_revision = plugin._config_revision
+
+        old_reconcile_task = asyncio.create_task(old_reconcile())
+        plugin._config_reconcile_task = old_reconcile_task
+        old_reconcile_task.add_done_callback(plugin._clear_config_reconcile_task)
+        plugin._reconcile_config_changes = new_reconcile
+        await plugin._lifecycle_lock.acquire()
+        shutdown_task = asyncio.create_task(plugin.shutdown())
+        await asyncio.wait_for(old_cancel_seen.wait(), timeout=1.0)
+        assert old_reconcile_task.cancelling() > 0
+
+        startup_task = asyncio.create_task(plugin.startup())
+        await asyncio.sleep(0)
+        plugin._lifecycle_lock.release()
+        try:
+            shutdown_result = await asyncio.wait_for(shutdown_task, timeout=1.0)
+            await asyncio.wait_for(new_reconcile_started.wait(), timeout=1.0)
+            startup_result = await asyncio.wait_for(startup_task, timeout=1.0)
+        finally:
+            release_old_reconcile.set()
+            await asyncio.gather(old_reconcile_task, return_exceptions=True)
+            if not startup_task.done():
+                startup_task.cancel()
+                await asyncio.gather(startup_task, return_exceptions=True)
+        await asyncio.sleep(0)
+        return plugin, startup_result, shutdown_result, workers
+
+    plugin, startup_result, shutdown_result, workers = asyncio.run(scenario())
+
+    assert shutdown_result == {"status": "superseded", "cleanup_skipped": True}
+    assert startup_result["status"] == "ready"
+    assert all(workers[name].running for name in ("monitor", "catalog", "writer"))
+    assert plugin._config_reconciled_revision == 1
+    assert plugin._config_reconcile_task is None
+    assert plugin._started is True
+    assert plugin._monitor_dispatch_enabled is True
+
+
+@pytest.mark.parametrize(
+    ("updated_enabled", "expected_start_calls"),
+    [(False, 0), (True, 1)],
+)
+def test_new_startup_adopts_running_overlay_with_effective_runtime_config(
+    monkeypatch,
+    updated_enabled: bool,
+    expected_start_calls: int,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+
+    async def no_op() -> None:
+        return None
+
+    async def scenario() -> tuple[Any, Any, Any, Any, list[str]]:
+        plugin, _workers, _worker_calls = _make_lifecycle_test_plugin(
+            entry,
+            load_stats=no_op,
+            initially_running=True,
+        )
+        old = CompanionConfig(
+            monitor_on_start=True,
+            overlay_enabled=True,
+            overlay_auto_start=False,
+            overlay_font_size=24,
+        )
+        updated_values = old.to_dict()
+        updated_values.update(
+            {
+                "overlay_enabled": updated_enabled,
+                "overlay_font_size": 31,
+            }
+        )
+        updated = CompanionConfig.from_mapping(updated_values)
+        calls: list[str] = []
+
+        class Overlay:
+            running = True
+            config = old
+
+            def status(self) -> dict[str, Any]:
+                return {"running": self.running}
+
+            def configure(self, config: CompanionConfig) -> None:
+                calls.append("configure")
+                self.config = config
+
+            def resume_starts(self) -> None:
+                calls.append("resume")
+
+            def stop(self, **_kwargs: Any) -> dict[str, Any]:
+                calls.append("stop")
+                self.running = False
+                return {"ok": True, "running": False}
+
+            def start(self) -> dict[str, Any]:
+                calls.append("start")
+                self.running = True
+                return {"ok": True, "running": True}
+
+        overlay = Overlay()
+        plugin.cfg = old
+        plugin._overlay = overlay
+        plugin._overlay_applied_config = old
+        plugin._read_effective_config = lambda: _return_async(updated)
+        await plugin._lifecycle_lock.acquire()
+        shutdown_task = asyncio.create_task(plugin.shutdown())
+        await asyncio.sleep(0)
+        startup_task = asyncio.create_task(plugin.startup())
+        await asyncio.sleep(0)
+        plugin._lifecycle_lock.release()
+
+        shutdown_result = await asyncio.wait_for(shutdown_task, timeout=1.0)
+        startup_result = await asyncio.wait_for(startup_task, timeout=1.0)
+        return plugin, startup_result, shutdown_result, overlay, calls
+
+    plugin, startup_result, shutdown_result, overlay, calls = asyncio.run(scenario())
+
+    assert shutdown_result == {"status": "superseded", "cleanup_skipped": True}
+    assert startup_result["status"] == "ready"
+    assert calls.count("stop") == 1
+    assert calls.count("start") == expected_start_calls
+    if expected_start_calls:
+        assert calls.index("stop") < calls.index("start")
+    assert overlay.running is updated_enabled
+    assert overlay.config.overlay_font_size == 31
+    assert plugin._overlay_applied_config.to_dict() == plugin.cfg.to_dict()
+
+
+@pytest.mark.parametrize(
+    ("case", "restore_accepted", "expect_ready", "expected_target"),
+    [
+        ("consent_revoked", True, True, None),
+        ("target_changed", False, False, "Lanlan-A"),
+        ("unchanged", True, True, "Lanlan-A"),
+    ],
+)
+def test_startup_reconciles_or_preserves_existing_character_context(
+    monkeypatch,
+    case: str,
+    restore_accepted: bool,
+    expect_ready: bool,
+    expected_target: str | None,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    restore_calls: list[str] = []
+
+    async def no_op() -> None:
+        return None
+
+    async def scenario() -> tuple[Any, Any, dict[str, Any], list[str]]:
+        plugin, workers, calls = _make_lifecycle_test_plugin(
+            entry,
+            load_stats=no_op,
+            initially_running=True,
+        )
+        workers["overlay"].running = False
+        previous = CompanionConfig(
+            monitor_on_start=True,
+            llm_data_consent=True,
+            target_lanlan="Lanlan-A",
+            log_path="old/Power.log",
+        )
+        updated_values = previous.to_dict()
+        if case == "consent_revoked":
+            updated_values["llm_data_consent"] = False
+        elif case == "target_changed":
+            updated_values["target_lanlan"] = "Lanlan-B"
+        updated = CompanionConfig.from_mapping(updated_values)
+        plugin.cfg = previous
+        plugin._overlay_applied_config = previous
+        plugin._context_target = "Lanlan-A"
+        plugin._read_effective_config = lambda: _return_async(updated)
+
+        def restore_context() -> bool:
+            restore_calls.append(str(plugin._context_target))
+            if restore_accepted:
+                plugin._context_target = None
+            return restore_accepted
+
+        plugin._restore_context = restore_context
+        if expect_ready:
+            result = await plugin.startup()
+        else:
+            with pytest.raises(RuntimeError, match="context_restore:rejected") as raised:
+                await plugin.startup()
+            result = raised.value
+        await asyncio.sleep(0)
+        return plugin, result, workers, calls
+
+    plugin, result, workers, calls = asyncio.run(scenario())
+
+    if case == "unchanged":
+        assert restore_calls == []
+    else:
+        assert restore_calls
+    assert plugin._context_target == expected_target
+    if expect_ready:
+        assert result["status"] == "ready"
+        assert plugin._started is True
+    else:
+        assert {"monitor.stop", "catalog.stop", "overlay.stop", "writer.stop"} <= set(calls)
+        assert all(not worker.running for worker in workers.values())
+        assert plugin._started is False
+        assert plugin._monitor_dispatch_enabled is False
+
+
+def test_cancelled_startup_rollback_cannot_clear_or_stop_new_startup(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    stop_entered = threading.Event()
+    release_stop = threading.Event()
+
+    async def scenario() -> tuple[Any, Any, dict[str, Any], list[str]]:
+        first_load_entered = asyncio.Event()
+        second_load_entered = asyncio.Event()
+        release_second_load = asyncio.Event()
+        load_count = 0
+
+        async def load_stats() -> None:
+            nonlocal load_count
+            load_count += 1
+            if load_count == 1:
+                first_load_entered.set()
+                await asyncio.Event().wait()
+            second_load_entered.set()
+            await release_second_load.wait()
+
+        plugin, workers, calls = _make_lifecycle_test_plugin(
+            entry,
+            load_stats=load_stats,
+            monitor_stop_entered=stop_entered,
+            release_monitor_stop=release_stop,
+        )
+        old_startup = asyncio.create_task(plugin.startup())
+        await asyncio.wait_for(first_load_entered.wait(), timeout=1.0)
+        old_startup.cancel()
+        assert await asyncio.wait_for(
+            asyncio.to_thread(stop_entered.wait, 1.0),
+            timeout=1.0,
+        )
+
+        new_startup = asyncio.create_task(plugin.startup())
+        await asyncio.sleep(0)
+        assert plugin._startup_task is old_startup
+        release_stop.set()
+        await asyncio.wait_for(second_load_entered.wait(), timeout=1.0)
+        with pytest.raises(asyncio.CancelledError):
+            await old_startup
+        await asyncio.sleep(0)
+        assert plugin._startup_task is new_startup
+
+        release_second_load.set()
+        startup_result = await asyncio.wait_for(new_startup, timeout=1.0)
+        await asyncio.sleep(0)
+        return plugin, startup_result, workers, calls
+
+    plugin, startup_result, workers, calls = asyncio.run(scenario())
+
+    assert startup_result["status"] == "ready"
+    assert calls.count("monitor.start") == 1
+    assert calls.count("catalog.start") == 1
+    assert calls.count("writer.start") == 1
+    assert workers["monitor"].running is True
+    assert workers["catalog"].running is True
+    assert workers["writer"].running is True
+    assert plugin._started is True
+    assert plugin._monitor_dispatch_enabled is True
+    assert plugin._startup_task is None
+
+
+def test_cancelled_shutdown_still_cleans_runtime_after_claiming_lifecycle(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+
+    async def no_op() -> None:
+        return None
+
+    async def scenario() -> tuple[Any, dict[str, Any], list[str]]:
+        plugin, workers, calls = _make_lifecycle_test_plugin(
+            entry,
+            load_stats=no_op,
+            initially_running=True,
+        )
+        await plugin._lifecycle_lock.acquire()
+        shutdown_task = asyncio.create_task(plugin.shutdown())
+        await asyncio.sleep(0)
+        assert plugin._lifecycle_generation == 1
+        assert plugin._started is False
+
+        shutdown_task.cancel()
+        plugin._lifecycle_lock.release()
+        try:
+            await asyncio.wait_for(shutdown_task, timeout=1.0)
+        except asyncio.CancelledError:
+            pass
+        await asyncio.sleep(0)
+        return plugin, workers, calls
+
+    plugin, workers, calls = asyncio.run(scenario())
+
+    assert {"monitor.stop", "catalog.stop", "overlay.stop", "writer.stop"} <= set(calls)
+    assert all(not worker.running for worker in workers.values())
+    assert plugin._started is False
+    assert plugin._monitor_dispatch_enabled is False
+
+
+def test_repeated_startup_cancellation_cannot_interrupt_owned_rollback(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    stop_entered = threading.Event()
+    release_stop = threading.Event()
+
+    async def scenario() -> tuple[Any, dict[str, Any], list[str]]:
+        load_entered = asyncio.Event()
+
+        async def load_stats() -> None:
+            load_entered.set()
+            await asyncio.Event().wait()
+
+        plugin, workers, calls = _make_lifecycle_test_plugin(
+            entry,
+            load_stats=load_stats,
+            initially_running=True,
+            monitor_stop_entered=stop_entered,
+            release_monitor_stop=release_stop,
+        )
+        startup_task = asyncio.create_task(plugin.startup())
+        await asyncio.wait_for(load_entered.wait(), timeout=1.0)
+        startup_task.cancel()
+        assert await asyncio.wait_for(
+            asyncio.to_thread(stop_entered.wait, 1.0),
+            timeout=1.0,
+        )
+
+        startup_task.cancel()
+        release_stop.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(startup_task, timeout=1.0)
+        await asyncio.sleep(0)
+        return plugin, workers, calls
+
+    plugin, workers, calls = asyncio.run(scenario())
+
+    assert {"monitor.stop", "catalog.stop", "overlay.stop", "writer.stop"} <= set(calls)
+    assert all(not worker.running for worker in workers.values())
+    assert plugin._started is False
+    assert plugin._monitor_dispatch_enabled is False
+
+
+@pytest.mark.parametrize("unhealthy_component", ["writer", "monitor"])
+def test_startup_rejects_nonstarting_unhealthy_required_worker(
+    monkeypatch,
+    unhealthy_component: str,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+
+    async def no_op() -> None:
+        return None
+
+    async def scenario() -> tuple[Any, dict[str, Any], list[str]]:
+        plugin, workers, calls = _make_lifecycle_test_plugin(
+            entry,
+            load_stats=no_op,
+        )
+        worker = workers[unhealthy_component]
+
+        def refuse_start() -> bool:
+            calls.append(f"{unhealthy_component}.start")
+            return False
+
+        worker.start = refuse_start
+        worker.running = False
+        with pytest.raises(RuntimeError):
+            await plugin.startup()
+        await asyncio.sleep(0)
+        return plugin, workers, calls
+
+    plugin, workers, calls = asyncio.run(scenario())
+
+    assert f"{unhealthy_component}.start" in calls
+    assert {"monitor.stop", "catalog.stop", "overlay.stop", "writer.stop"} <= set(calls)
+    assert all(not worker.running for worker in workers.values())
+    assert plugin._started is False
+    assert plugin._monitor_dispatch_enabled is False
+
+
+def test_startup_accepts_nonstarting_workers_that_are_still_healthy(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+
+    async def no_op() -> None:
+        return None
+
+    async def scenario() -> tuple[Any, Any, dict[str, Any], list[str]]:
+        plugin, workers, calls = _make_lifecycle_test_plugin(
+            entry,
+            load_stats=no_op,
+            initially_running=True,
+        )
+        workers["overlay"].running = False
+
+        for name in ("writer", "catalog", "monitor"):
+            worker = workers[name]
+
+            def already_running(worker_name: str = name) -> bool:
+                calls.append(f"{worker_name}.start")
+                return False
+
+            worker.start = already_running
+
+        result = await plugin.startup()
+        await asyncio.sleep(0)
+        return plugin, result, workers, calls
+
+    plugin, result, workers, calls = asyncio.run(scenario())
+
+    assert result["status"] == "ready"
+    assert result["monitor_started"] is False
+    assert result["card_catalog_started"] is False
+    assert all(workers[name].running for name in ("writer", "catalog", "monitor"))
+    assert workers["overlay"].running is False
+    assert plugin._started is True
+    assert plugin._monitor_dispatch_enabled is True
 
 
 def test_llm_state_tool_does_not_read_state_without_data_consent(monkeypatch) -> None:
@@ -289,6 +1125,38 @@ def test_llm_state_tool_does_not_read_state_without_data_consent(monkeypatch) ->
     assert result["reason"] == "llm_data_sharing_not_authorized"
     assert result["answer_contract"]["own_hand_card_identities_available"] is False
     assert result["answer_contract"]["specific_card_play_available"] is False
+
+
+@pytest.mark.parametrize("tool_name", ["current_state", "battlegrounds_advice"])
+def test_live_tools_do_not_read_stale_monitor_after_plugin_stops(
+    monkeypatch,
+    tool_name: str,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+
+    def fail_if_called() -> Any:
+        raise AssertionError("stopped plugin must not read its previous monitor snapshot")
+
+    plugin = types.SimpleNamespace(
+        cfg=CompanionConfig(llm_data_consent=True),
+        _started=False,
+        _settings_transition=False,
+        _settings_transition_revision=4,
+        _ensure_monitor=fail_if_called,
+    )
+
+    async def call_tool() -> dict[str, Any]:
+        if tool_name == "current_state":
+            return await entry.HearthstoneCompanionPlugin.hearthstone_current_state(plugin)
+        return await entry.HearthstoneCompanionPlugin.hearthstone_battlegrounds_advice(
+            plugin,
+            topic="current_strategy",
+        )
+
+    result = asyncio.run(call_tool())
+
+    assert result["available"] is False
+    assert result["reason"] == "plugin_not_running"
 
 
 def test_status_entry_never_routes_game_snapshot_through_llm_result_fields(monkeypatch) -> None:
@@ -894,18 +1762,518 @@ def test_config_change_applies_host_effective_config_without_redumping(monkeypat
         overlay_font_size=35,
     )
 
-    result = asyncio.run(
-        plugin.config_change(new_config={entry._CONFIG_SECTION: updated.to_dict()})
-    )
+    async def scenario() -> dict[str, Any]:
+        result = await plugin.config_change(
+            new_config={entry._CONFIG_SECTION: updated.to_dict()}
+        )
+        assert plugin.cfg.overlay_font_size == 35
+        assert monitor_updates == []
+        await plugin._wait_for_config_reconcile()
+        return result
 
-    assert result["status"] == "reloaded"
-    assert result["context_restored"] is True
+    result = asyncio.run(scenario())
+
+    assert result["status"] == "accepted"
+    assert result["reconcile_scheduled"] is True
     assert plugin.cfg.llm_data_consent is False
     assert plugin.cfg.overlay_font_size == 35
     assert monitor_updates[-1].llm_data_consent is False
 
 
-def test_config_change_raises_when_effective_config_cannot_be_loaded(monkeypatch) -> None:
+def test_config_change_does_not_wait_for_settings_lock_and_revokes_consent_immediately(
+    monkeypatch,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    monitor_updates: list[CompanionConfig] = []
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(
+        llm_commentary_enabled=True,
+        llm_data_consent=True,
+    )
+    plugin._context_target = None
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._settings_transition = False
+    plugin._monitor = types.SimpleNamespace(
+        update_config=lambda config: monitor_updates.append(config)
+    )
+    plugin._catalog = types.SimpleNamespace(configure=lambda **_kwargs: None)
+    plugin._overlay = types.SimpleNamespace(
+        status=lambda: {"running": False},
+        configure=lambda _config: None,
+    )
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
+    updated = CompanionConfig(
+        llm_commentary_enabled=False,
+        llm_data_consent=False,
+    )
+
+    async def scenario() -> dict[str, Any]:
+        await plugin._settings_lock.acquire()
+        try:
+            result = await asyncio.wait_for(
+                plugin.config_change(
+                    new_config={entry._CONFIG_SECTION: updated.to_dict()}
+                ),
+                timeout=0.05,
+            )
+            assert plugin.cfg.llm_data_consent is False
+            assert plugin.cfg.llm_commentary_enabled is False
+            assert monitor_updates == []
+        finally:
+            plugin._settings_lock.release()
+        await plugin._wait_for_config_reconcile()
+        return result
+
+    result = asyncio.run(scenario())
+
+    assert result["status"] == "accepted"
+    assert len(monitor_updates) == 1
+    assert monitor_updates[0].llm_data_consent is False
+    assert monitor_updates[0].llm_commentary_enabled is False
+
+
+def test_older_settings_transaction_cannot_reopen_newer_consent_revocation(
+    monkeypatch,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    first_persist_entered: asyncio.Event | None = None
+    release_first_persist: asyncio.Event | None = None
+    monitor_consents: list[bool] = []
+    sync_states: list[tuple[bool, bool]] = []
+    base = CompanionConfig(
+        llm_commentary_enabled=True,
+        llm_data_consent=True,
+        overlay_font_size=24,
+    )
+
+    async def persist(patch: dict[str, Any]) -> dict[str, Any]:
+        section = patch
+        values = base.to_dict()
+        values.update(section)
+        if "llm_data_consent" not in section:
+            assert first_persist_entered is not None
+            assert release_first_persist is not None
+            first_persist_entered.set()
+            await release_first_persist.wait()
+        return {entry._CONFIG_SECTION: values}
+
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = base
+    plugin._started = True
+    plugin._context_target = None
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._settings_transition = False
+    plugin._settings_transition_revision = 0
+    plugin._consent_request_revision = 0
+    plugin._consent_revocation_pending = False
+    plugin._config_runtime_error_codes = ()
+    plugin._config_restart_required = False
+    plugin._overlay_applied_config = base
+    plugin._persist_settings_config = persist
+    plugin._monitor = types.SimpleNamespace(
+        update_config=lambda config: monitor_consents.append(config.llm_data_consent)
+    )
+    plugin._ensure_monitor = lambda: plugin._monitor
+    plugin._catalog = types.SimpleNamespace(configure=lambda **_kwargs: None)
+    plugin._overlay = types.SimpleNamespace(
+        status=lambda: {"running": False},
+        configure=lambda _config: None,
+    )
+    plugin._sync_active_game_context = lambda: sync_states.append(
+        (plugin.cfg.llm_data_consent, plugin._settings_transition)
+    )
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
+
+    async def scenario() -> None:
+        nonlocal first_persist_entered, release_first_persist
+        first_persist_entered = asyncio.Event()
+        release_first_persist = asyncio.Event()
+        older = asyncio.create_task(plugin.save_settings(overlay_font_size=31))
+        await first_persist_entered.wait()
+        revocation = asyncio.create_task(
+            plugin.save_settings(llm_data_consent=False)
+        )
+        for _ in range(10):
+            await asyncio.sleep(0)
+            if not plugin.cfg.llm_data_consent:
+                break
+        assert plugin.cfg.llm_data_consent is False
+        assert plugin._settings_transition is True
+        release_first_persist.set()
+        await asyncio.gather(older, revocation)
+
+    asyncio.run(scenario())
+
+    assert monitor_consents
+    assert all(consent is False for consent in monitor_consents)
+    assert sync_states
+    assert all(consent is False for consent, _transition in sync_states)
+    assert plugin.cfg.llm_data_consent is False
+    assert plugin.cfg.llm_commentary_enabled is False
+    assert plugin._settings_transition is False
+
+
+def test_config_change_coalesces_pending_revisions_to_latest_effective_config(
+    monkeypatch,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    applied_sizes: list[int] = []
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(overlay_font_size=24)
+    plugin._context_target = None
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._settings_transition = False
+    plugin._monitor = types.SimpleNamespace(
+        update_config=lambda config: applied_sizes.append(config.overlay_font_size)
+    )
+    plugin._catalog = types.SimpleNamespace(configure=lambda **_kwargs: None)
+    plugin._overlay = types.SimpleNamespace(
+        status=lambda: {"running": False},
+        configure=lambda _config: None,
+    )
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
+
+    async def scenario() -> None:
+        await plugin._settings_lock.acquire()
+        try:
+            first = await plugin.config_change(
+                new_config={
+                    entry._CONFIG_SECTION: CompanionConfig(
+                        overlay_font_size=30
+                    ).to_dict()
+                }
+            )
+            second = await plugin.config_change(
+                new_config={
+                    entry._CONFIG_SECTION: CompanionConfig(
+                        overlay_font_size=37
+                    ).to_dict()
+                }
+            )
+            assert first["revision"] == 1
+            assert second["revision"] == 2
+            assert plugin.cfg.overlay_font_size == 37
+        finally:
+            plugin._settings_lock.release()
+        await plugin._wait_for_config_reconcile()
+
+    asyncio.run(scenario())
+
+    assert applied_sizes == [37]
+    assert plugin._config_reconciled_revision == 2
+    assert plugin._config_restart_required is False
+
+
+def test_startup_config_apply_reconciles_change_accepted_while_runtime_is_blocked(
+    monkeypatch,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    first_update_entered = threading.Event()
+    release_first_update = threading.Event()
+    applied_paths: list[str] = []
+
+    class Monitor:
+        def update_config(self, config: CompanionConfig) -> None:
+            applied_paths.append(config.log_path)
+            if len(applied_paths) == 1:
+                first_update_entered.set()
+                assert release_first_update.wait(1.0)
+
+    previous = CompanionConfig(log_path="old/Power.log", llm_data_consent=True)
+    startup_config = CompanionConfig(log_path="startup/Power.log", llm_data_consent=True)
+    host_config = CompanionConfig(log_path="host/Power.log", llm_data_consent=True)
+    monitor = Monitor()
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = previous
+    plugin._monitor = monitor
+    plugin._monitor_applied_instance = monitor
+    plugin._monitor_applied_config = CompanionConfig.from_mapping(previous.to_dict())
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._settings_transition = False
+    plugin._settings_transition_revision = 0
+    plugin._config_revision = 0
+    plugin._config_reconciled_revision = 0
+    plugin._config_reconcile_accepting = False
+    plugin._config_reconcile_task = None
+    plugin._context_target = None
+    plugin._catalog = types.SimpleNamespace(configure=lambda **_kwargs: None)
+    plugin._overlay = types.SimpleNamespace(
+        status=lambda: {"running": False},
+        configure=lambda _config: None,
+    )
+    plugin._sync_active_game_context = lambda: None
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
+
+    async def scenario() -> None:
+        configure_task = asyncio.create_task(
+            asyncio.to_thread(
+                plugin._configure_startup_runtime,
+                startup_config,
+                expected_config_revision=0,
+            )
+        )
+        assert await asyncio.to_thread(first_update_entered.wait, 1.0)
+        change = await plugin.config_change(
+            new_config={entry._CONFIG_SECTION: host_config.to_dict()}
+        )
+        assert change["reconcile_scheduled"] is False
+        release_first_update.set()
+        await configure_task
+        assert plugin.cfg.log_path == "host/Power.log"
+        assert plugin._settings_transition is True
+        with plugin._ownership_lock:
+            plugin._config_reconcile_accepting = True
+        assert plugin._schedule_config_reconcile() is True
+        await plugin._wait_for_config_reconcile()
+
+    asyncio.run(scenario())
+
+    assert applied_paths == ["startup/Power.log", "host/Power.log"]
+    assert plugin.cfg.to_dict() == host_config.to_dict()
+    assert plugin._monitor_applied_instance is monitor
+    assert plugin._monitor_applied_config.to_dict() == host_config.to_dict()
+    assert plugin._settings_transition is False
+    assert plugin._config_reconciled_revision == 1
+
+
+def test_stale_save_transaction_cannot_overwrite_newer_host_log_config(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    persist_entered: asyncio.Event | None = None
+    release_persist: asyncio.Event | None = None
+    monitor_updates: list[str] = []
+    previous = CompanionConfig(log_path="old/Power.log", llm_data_consent=True)
+    saved = CompanionConfig(log_path="save/Power.log", llm_data_consent=True)
+    host = CompanionConfig(log_path="host/Power.log", llm_data_consent=True)
+
+    async def persist(_patch: dict[str, Any]) -> dict[str, Any]:
+        assert persist_entered is not None
+        assert release_persist is not None
+        persist_entered.set()
+        await release_persist.wait()
+        return {entry._CONFIG_SECTION: saved.to_dict()}
+
+    class Monitor:
+        def update_config(self, config: CompanionConfig) -> None:
+            monitor_updates.append(config.log_path)
+
+    monitor = Monitor()
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = previous
+    plugin._started = True
+    plugin._monitor = monitor
+    plugin._monitor_applied_instance = monitor
+    plugin._monitor_applied_config = CompanionConfig.from_mapping(previous.to_dict())
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._settings_transition = False
+    plugin._settings_transition_revision = 0
+    plugin._config_revision = 0
+    plugin._config_reconciled_revision = 0
+    plugin._config_reconcile_accepting = True
+    plugin._config_reconcile_task = None
+    plugin._consent_request_revision = 0
+    plugin._consent_revocation_pending = False
+    plugin._context_target = None
+    plugin._persist_settings_config = persist
+    plugin._catalog = types.SimpleNamespace(configure=lambda **_kwargs: None)
+    plugin._overlay = types.SimpleNamespace(
+        status=lambda: {"running": False},
+        configure=lambda _config: None,
+    )
+    plugin._sync_active_game_context = lambda: None
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
+
+    async def scenario() -> Any:
+        nonlocal persist_entered, release_persist
+        persist_entered = asyncio.Event()
+        release_persist = asyncio.Event()
+        save_task = asyncio.create_task(plugin.save_settings(log_path=saved.log_path))
+        await persist_entered.wait()
+        await plugin.config_change(
+            new_config={entry._CONFIG_SECTION: host.to_dict()}
+        )
+        release_persist.set()
+        result = await save_task
+        await plugin._wait_for_config_reconcile()
+        return result
+
+    result = asyncio.run(scenario())
+
+    assert result["summary"] == "炉石陪玩设置已保存。"
+    assert plugin.cfg.to_dict() == host.to_dict()
+    assert monitor_updates == ["host/Power.log"]
+    assert plugin._monitor_applied_instance is monitor
+    assert plugin._monitor_applied_config.to_dict() == host.to_dict()
+    assert plugin._settings_transition is False
+
+
+def test_stale_reload_cannot_overwrite_newer_host_log_config(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    read_entered: asyncio.Event | None = None
+    release_read: asyncio.Event | None = None
+    monitor_updates: list[str] = []
+    previous = CompanionConfig(log_path="old/Power.log", llm_data_consent=True)
+    stale_dump = CompanionConfig(log_path="dump/Power.log", llm_data_consent=True)
+    host = CompanionConfig(log_path="host/Power.log", llm_data_consent=True)
+
+    async def read_config() -> CompanionConfig:
+        assert read_entered is not None
+        assert release_read is not None
+        read_entered.set()
+        await release_read.wait()
+        return stale_dump
+
+    class Monitor:
+        def update_config(self, config: CompanionConfig) -> None:
+            monitor_updates.append(config.log_path)
+
+    monitor = Monitor()
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = previous
+    plugin._monitor = monitor
+    plugin._monitor_applied_instance = monitor
+    plugin._monitor_applied_config = CompanionConfig.from_mapping(previous.to_dict())
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._settings_transition = False
+    plugin._settings_transition_revision = 0
+    plugin._config_revision = 0
+    plugin._config_reconciled_revision = 0
+    plugin._config_reconcile_accepting = True
+    plugin._config_reconcile_task = None
+    plugin._consent_revocation_pending = False
+    plugin._context_target = None
+    plugin._read_effective_config = read_config
+    plugin._catalog = types.SimpleNamespace(configure=lambda **_kwargs: None)
+    plugin._overlay = types.SimpleNamespace(
+        status=lambda: {"running": False},
+        configure=lambda _config: None,
+    )
+    plugin._sync_active_game_context = lambda: None
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
+
+    async def scenario() -> None:
+        nonlocal read_entered, release_read
+        read_entered = asyncio.Event()
+        release_read = asyncio.Event()
+        reload_task = asyncio.create_task(plugin._reload_config())
+        await read_entered.wait()
+        await plugin.config_change(
+            new_config={entry._CONFIG_SECTION: host.to_dict()}
+        )
+        release_read.set()
+        assert await reload_task is True
+        await plugin._wait_for_config_reconcile()
+
+    asyncio.run(scenario())
+
+    assert plugin.cfg.to_dict() == host.to_dict()
+    assert monitor_updates == ["host/Power.log"]
+    assert plugin._monitor_applied_config.to_dict() == host.to_dict()
+    assert plugin._settings_transition is False
+
+
+def test_startup_monitor_apply_failure_retries_on_next_startup_configure(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    attempts = 0
+    previous = CompanionConfig(log_path="old/Power.log", llm_data_consent=True)
+    updated = CompanionConfig(log_path="new/Power.log", llm_data_consent=True)
+
+    class Monitor:
+        def update_config(self, _config: CompanionConfig) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("first startup apply failed")
+
+    monitor = Monitor()
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = previous
+    plugin._monitor = monitor
+    plugin._monitor_applied_instance = monitor
+    plugin._monitor_applied_config = CompanionConfig.from_mapping(previous.to_dict())
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_transition = False
+    plugin._settings_transition_revision = 0
+    plugin._config_revision = 0
+    plugin._catalog = types.SimpleNamespace(configure=lambda **_kwargs: None)
+    plugin._overlay = types.SimpleNamespace(configure=lambda _config: None)
+
+    with pytest.raises(RuntimeError, match="startup config apply failed"):
+        plugin._configure_startup_runtime(updated, expected_config_revision=0)
+
+    assert plugin._monitor_applied_config.to_dict() == previous.to_dict()
+    assert plugin._settings_transition is False
+
+    plugin._configure_startup_runtime(updated, expected_config_revision=0)
+
+    assert attempts == 2
+    assert plugin._monitor_applied_instance is monitor
+    assert plugin._monitor_applied_config.to_dict() == updated.to_dict()
+    assert plugin._settings_transition is False
+
+
+def test_consent_revocation_updates_monitor_without_holding_ownership_lock(
+    monkeypatch,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    current = CompanionConfig(llm_commentary_enabled=True, llm_data_consent=True)
+
+    class Monitor:
+        def update_config(self, _config: CompanionConfig) -> None:
+            other_thread_acquired = threading.Event()
+
+            def acquire_from_other_thread() -> None:
+                with plugin._ownership_lock:
+                    other_thread_acquired.set()
+
+            contender = threading.Thread(target=acquire_from_other_thread)
+            contender.start()
+            assert other_thread_acquired.wait(0.5)
+            contender.join(0.5)
+            assert contender.is_alive() is False
+
+    async def persist(patch: dict[str, Any]) -> dict[str, Any]:
+        values = current.to_dict()
+        values.update(patch)
+        return {entry._CONFIG_SECTION: values}
+
+    monitor = Monitor()
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = current
+    plugin._started = True
+    plugin._monitor = monitor
+    plugin._monitor_applied_instance = monitor
+    plugin._monitor_applied_config = CompanionConfig.from_mapping(current.to_dict())
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._settings_transition = False
+    plugin._settings_transition_revision = 0
+    plugin._config_revision = 0
+    plugin._consent_request_revision = 0
+    plugin._consent_revocation_pending = False
+    plugin._context_target = None
+    plugin._persist_settings_config = persist
+    plugin._catalog = types.SimpleNamespace(configure=lambda **_kwargs: None)
+    plugin._overlay = types.SimpleNamespace(
+        status=lambda: {"running": False},
+        configure=lambda _config: None,
+    )
+    plugin._sync_active_game_context = lambda: None
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
+
+    result = asyncio.run(plugin.save_settings(llm_data_consent=False))
+
+    assert result["llm_enabled"] is False
+    assert plugin.cfg.llm_data_consent is False
+    assert plugin._monitor_applied_config.llm_data_consent is False
+
+
+def test_config_change_with_missing_effective_section_degrades_fail_closed(monkeypatch) -> None:
     entry = _load_sdk_entry(monkeypatch)
 
     class Config:
@@ -914,15 +2282,19 @@ def test_config_change_raises_when_effective_config_cannot_be_loaded(monkeypatch
 
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
     plugin.cfg = CompanionConfig(llm_data_consent=True)
+    plugin._context_target = None
     plugin._ownership_lock = threading.RLock()
     plugin._settings_lock = asyncio.Lock()
     plugin.config = Config()
     plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
 
-    with pytest.raises(RuntimeError, match="could not be loaded"):
-        asyncio.run(plugin.config_change())
+    result = asyncio.run(plugin.config_change())
 
-    assert plugin.cfg.llm_data_consent is True
+    assert result["status"] == "degraded"
+    assert result["restart_required"] is True
+    assert plugin.cfg.llm_data_consent is False
+    assert plugin.cfg.llm_commentary_enabled is False
+    assert plugin._config_runtime_error_codes == ("config:invalid_effective_section",)
 
 
 def test_config_change_revocation_stays_fail_closed_when_context_restore_is_rejected(
@@ -946,16 +2318,24 @@ def test_config_change_revocation_stays_fail_closed_when_context_restore_is_reje
     plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
     updated = CompanionConfig(llm_data_consent=False, target_lanlan="lanlan-a")
 
-    result = asyncio.run(
-        plugin.config_change(new_config={entry._CONFIG_SECTION: updated.to_dict()})
-    )
+    async def scenario() -> dict[str, Any]:
+        result = await plugin.config_change(
+            new_config={entry._CONFIG_SECTION: updated.to_dict()}
+        )
+        assert plugin.cfg.llm_data_consent is False
+        await plugin._wait_for_config_reconcile()
+        return result
 
-    assert result["context_restored"] is False
+    result = asyncio.run(scenario())
+
+    assert result["status"] == "accepted"
     assert plugin.cfg.llm_data_consent is False
     assert plugin.cfg.llm_commentary_enabled is False
     assert monitor_updates
     assert all(config.llm_data_consent is False for config in monitor_updates)
     assert plugin._context_target == "lanlan-a"
+    assert "context_restore:rejected" in plugin._config_runtime_error_codes
+    assert plugin._config_restart_required is True
 
 
 def test_config_change_revocation_restores_context_and_resets_transition_when_monitor_raises(
@@ -983,31 +2363,34 @@ def test_config_change_revocation_restores_context_and_resets_transition_when_mo
     plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
     updated = CompanionConfig(llm_data_consent=False, target_lanlan="lanlan-a")
 
-    with pytest.raises(RuntimeError, match="monitor apply failed"):
-        asyncio.run(
-            plugin.config_change(new_config={entry._CONFIG_SECTION: updated.to_dict()})
+    async def scenario() -> dict[str, Any]:
+        result = await plugin.config_change(
+            new_config={entry._CONFIG_SECTION: updated.to_dict()}
         )
+        assert plugin.cfg.llm_data_consent is False
+        await plugin._wait_for_config_reconcile()
+        return result
 
+    result = asyncio.run(scenario())
+
+    assert result["status"] == "accepted"
     assert plugin.cfg.llm_data_consent is False
     assert plugin.cfg.llm_commentary_enabled is False
     assert plugin._settings_transition is False
     assert plugin._context_target is None
     assert len(submitted) == 1
     assert submitted[0]["metadata"]["context_expired"] is True
+    assert "monitor:RuntimeError" in plugin._config_runtime_error_codes
+    assert plugin._config_restart_required is True
 
 
-def test_config_change_rolls_back_non_privacy_runtime_apply_failure(monkeypatch) -> None:
+def test_config_change_keeps_host_config_on_non_privacy_runtime_apply_failure(monkeypatch) -> None:
     entry = _load_sdk_entry(monkeypatch)
     previous = CompanionConfig(overlay_font_size=24)
     applied_sizes: list[int] = []
-    fail_once = True
-
     def update_monitor(config: CompanionConfig) -> None:
-        nonlocal fail_once
         applied_sizes.append(config.overlay_font_size)
-        if fail_once:
-            fail_once = False
-            raise RuntimeError("monitor apply failed")
+        raise RuntimeError("monitor apply failed")
 
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
     plugin.cfg = previous
@@ -1024,13 +2407,20 @@ def test_config_change_rolls_back_non_privacy_runtime_apply_failure(monkeypatch)
     plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
     updated = CompanionConfig(overlay_font_size=39)
 
-    with pytest.raises(RuntimeError, match="monitor apply failed"):
-        asyncio.run(
-            plugin.config_change(new_config={entry._CONFIG_SECTION: updated.to_dict()})
+    async def scenario() -> dict[str, Any]:
+        result = await plugin.config_change(
+            new_config={entry._CONFIG_SECTION: updated.to_dict()}
         )
+        await plugin._wait_for_config_reconcile()
+        return result
 
-    assert plugin.cfg.overlay_font_size == 24
-    assert applied_sizes == [39, 24]
+    result = asyncio.run(scenario())
+
+    assert result["status"] == "accepted"
+    assert plugin.cfg.overlay_font_size == 39
+    assert applied_sizes == [39]
+    assert plugin._config_runtime_error_codes == ("monitor:RuntimeError",)
+    assert plugin._config_restart_required is True
     assert plugin._settings_transition is False
 
 
@@ -1066,16 +2456,23 @@ def test_config_change_does_not_restart_running_overlay_for_non_runtime_fields(m
     plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
     updated = CompanionConfig(overlay_font_size=24, llm_min_priority=7)
 
-    result = asyncio.run(
-        plugin.config_change(new_config={entry._CONFIG_SECTION: updated.to_dict()})
-    )
+    async def scenario() -> dict[str, Any]:
+        result = await plugin.config_change(
+            new_config={entry._CONFIG_SECTION: updated.to_dict()}
+        )
+        await plugin._wait_for_config_reconcile()
+        return result
 
-    assert result["status"] == "reloaded"
+    result = asyncio.run(scenario())
+
+    assert result["status"] == "accepted"
     assert plugin.cfg.llm_min_priority == 7
     assert overlay.config.llm_min_priority == 7
 
 
-def test_config_change_rejects_inconsistent_overlay_stop_and_rolls_back(monkeypatch) -> None:
+def test_config_change_reports_inconsistent_overlay_stop_without_rolling_back_host_config(
+    monkeypatch,
+) -> None:
     entry = _load_sdk_entry(monkeypatch)
 
     class Overlay:
@@ -1109,14 +2506,24 @@ def test_config_change_rejects_inconsistent_overlay_stop_and_rolls_back(monkeypa
     plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
     updated = CompanionConfig(overlay_font_size=31)
 
-    with pytest.raises(RuntimeError, match="inconsistent running state"):
-        asyncio.run(
-            plugin.config_change(new_config={entry._CONFIG_SECTION: updated.to_dict()})
+    async def scenario() -> dict[str, Any]:
+        result = await plugin.config_change(
+            new_config={entry._CONFIG_SECTION: updated.to_dict()}
         )
+        await plugin._wait_for_config_reconcile()
+        return result
 
-    assert plugin.cfg.overlay_font_size == 24
+    result = asyncio.run(scenario())
+
+    assert result["status"] == "accepted"
+    assert plugin.cfg.overlay_font_size == 31
     assert overlay.config.overlay_font_size == 24
     assert overlay.start_calls == 0
+    assert any(
+        code.startswith("overlay_runtime:overlay stop returned an inconsistent")
+        for code in plugin._config_runtime_error_codes
+    )
+    assert plugin._config_restart_required is True
     assert plugin._settings_transition is False
 
 
@@ -1619,6 +3026,58 @@ def test_consent_revocation_blocks_dispatch_before_config_write_finishes(monkeyp
     assert persisted[0][entry._CONFIG_SECTION]["llm_data_consent"] is False
 
 
+def test_consent_revocation_fails_closed_before_waiting_for_settings_lock(
+    monkeypatch,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    update_entered: asyncio.Event | None = None
+
+    class Config:
+        async def update(self, patch: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+            assert update_entered is not None
+            update_entered.set()
+            merged = CompanionConfig().to_dict()
+            merged.update(patch[entry._CONFIG_SECTION])
+            return {entry._CONFIG_SECTION: merged}
+
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(
+        llm_commentary_enabled=True,
+        llm_data_consent=True,
+    )
+    plugin._context_target = None
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._settings_transition = False
+    plugin._started = True
+    plugin.config = Config()
+    plugin._monitor = types.SimpleNamespace(update_config=lambda _config: None)
+    plugin._catalog = types.SimpleNamespace(configure=lambda **_kwargs: None)
+    plugin._overlay = types.SimpleNamespace(
+        status=lambda: {"running": False},
+        configure=lambda _config: None,
+    )
+    plugin._ensure_monitor = lambda: plugin._monitor
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
+
+    async def scenario() -> Any:
+        nonlocal update_entered
+        update_entered = asyncio.Event()
+        await plugin._settings_lock.acquire()
+        task = asyncio.create_task(plugin.save_settings(llm_data_consent=False))
+        await asyncio.sleep(0)
+        assert plugin.cfg.llm_data_consent is False
+        assert plugin.cfg.llm_commentary_enabled is False
+        assert plugin._settings_transition is True
+        assert not update_entered.is_set()
+        plugin._settings_lock.release()
+        return await task
+
+    result = asyncio.run(scenario())
+
+    assert result["llm_enabled"] is False
+
+
 def test_failed_context_restore_still_persists_and_applies_consent_revocation(monkeypatch) -> None:
     entry = _load_sdk_entry(monkeypatch)
 
@@ -1653,6 +3112,7 @@ def test_failed_context_restore_still_persists_and_applies_consent_revocation(mo
         plugin._settings_transition = False
         plugin.ctx = types.SimpleNamespace(_current_lanlan="兰兰A")
         plugin.config = Config()
+        plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
         plugin._overlay = types.SimpleNamespace(
             status=lambda: {"running": False},
             configure=lambda _config: None,
@@ -1674,6 +3134,8 @@ def test_failed_context_restore_still_persists_and_applies_consent_revocation(mo
     assert plugin.cfg.llm_commentary_enabled is False
     assert plugin._settings_transition is False
     assert plugin._context_target == "兰兰A"
+    assert plugin._config_runtime_error_codes == ("context_restore:rejected",)
+    assert plugin._config_restart_required is True
 
 
 def test_reload_and_save_settings_are_serialized(monkeypatch) -> None:
@@ -2238,6 +3700,199 @@ def test_clear_stats_exposes_unconfirmed_compensation(monkeypatch) -> None:
     assert warnings == ["Battlegrounds statistics Store compensation was not confirmed"]
 
 
+def test_later_full_stats_snapshot_recovers_unconfirmed_compensation(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    callbacks: list[Callable[[], None]] = []
+
+    class Writer:
+        def submit(
+            self,
+            _value: dict[str, Any],
+            *,
+            on_success: Callable[[], None] | None = None,
+        ) -> bool:
+            assert on_success is not None
+            callbacks.append(on_success)
+            return True
+
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin._stats = BattlegroundsStats()
+    plugin._stats_loaded = True
+    plugin._stats_submission_lock = threading.RLock()
+    plugin._stats_recovery_generation = 4
+    plugin._stats_store_error_code = "stats:clear_compensation_unconfirmed"
+    plugin._store_writer = Writer()
+    plugin._season = {"key": "S14"}
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
+
+    plugin._record_battlegrounds_result(
+        GameEvent(
+            "battlegrounds_game_ended",
+            10,
+            "ended",
+            100.0,
+            {"placement": 2, "variant": "solo", "hero_card_id": "BG_HERO_1"},
+        ),
+        GameSnapshot(),
+    )
+    callbacks[0]()
+
+    assert plugin._stats_store_error_code == ""
+
+
+def test_earlier_stats_success_cannot_clear_newer_compensation_failure(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    callbacks: list[Callable[[], None]] = []
+
+    class Writer:
+        def submit(
+            self,
+            _value: dict[str, Any],
+            *,
+            on_success: Callable[[], None] | None = None,
+        ) -> bool:
+            assert on_success is not None
+            callbacks.append(on_success)
+            return True
+
+        def write_and_wait(self, _value: dict[str, Any], *, timeout: float) -> bool:
+            assert timeout == entry._STATS_CLEAR_WRITE_TIMEOUT_SECONDS
+            return False
+
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin._stats = BattlegroundsStats()
+    plugin._stats_loaded = True
+    plugin._stats_submission_lock = threading.RLock()
+    plugin._stats_recovery_generation = 0
+    plugin._stats_store_error_code = ""
+    plugin._store_writer = Writer()
+    plugin._season = {"key": "S14"}
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
+
+    plugin._record_battlegrounds_result(
+        GameEvent(
+            "battlegrounds_game_ended",
+            10,
+            "ended",
+            100.0,
+            {"placement": 3, "variant": "solo", "hero_card_id": "BG_HERO_1"},
+        ),
+        GameSnapshot(),
+    )
+    assert plugin._clear_battlegrounds_stats() is False
+    callbacks[0]()
+
+    assert plugin._stats_recovery_generation == 1
+    assert plugin._stats_store_error_code == "stats:clear_compensation_unconfirmed"
+
+
+def test_failed_full_stats_snapshot_does_not_recover_compensation(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+
+    class StoreErr:
+        def is_err(self) -> bool:
+            return True
+
+    async def write(_value: dict[str, Any]) -> StoreErr:
+        return StoreErr()
+
+    writer = entry.AsyncStoreWriter(
+        write,
+        types.SimpleNamespace(warning=lambda *_args: None),
+    )
+    writer.start()
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin._stats = BattlegroundsStats()
+    plugin._stats_loaded = True
+    plugin._stats_submission_lock = threading.RLock()
+    plugin._stats_recovery_generation = 2
+    plugin._stats_store_error_code = "stats:clear_compensation_unconfirmed"
+    plugin._store_writer = writer
+    plugin._season = {"key": "S14"}
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
+
+    plugin._record_battlegrounds_result(
+        GameEvent(
+            "battlegrounds_game_ended",
+            10,
+            "ended",
+            100.0,
+            {"placement": 4, "variant": "solo", "hero_card_id": "BG_HERO_1"},
+        ),
+        GameSnapshot(),
+    )
+
+    assert writer.flush() is False
+    assert plugin._stats_store_error_code == "stats:clear_compensation_unconfirmed"
+    assert writer.stop() is False
+
+
+def test_stats_recovery_callback_does_not_block_serial_clear_write(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    monkeypatch.setattr(entry, "_STATS_CLEAR_WRITE_TIMEOUT_SECONDS", 0.2)
+    first_write_entered = threading.Event()
+    release_first_write = threading.Event()
+    clear_wait_entered = threading.Event()
+    write_count = 0
+
+    async def write(_value: dict[str, Any]) -> object:
+        nonlocal write_count
+        write_count += 1
+        if write_count == 1:
+            first_write_entered.set()
+            await asyncio.to_thread(release_first_write.wait, 1.0)
+        return object()
+
+    writer = entry.AsyncStoreWriter(
+        write,
+        types.SimpleNamespace(warning=lambda *_args: None),
+    )
+    writer.start()
+    original_write_and_wait = writer.write_and_wait
+
+    def marked_write_and_wait(value: dict[str, Any], *, timeout: float) -> bool:
+        clear_wait_entered.set()
+        return original_write_and_wait(value, timeout=timeout)
+
+    writer.write_and_wait = marked_write_and_wait
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin._stats = BattlegroundsStats()
+    plugin._stats_loaded = True
+    plugin._stats_submission_lock = threading.RLock()
+    plugin._stats_recovery_lock = threading.RLock()
+    plugin._stats_recovery_generation = 0
+    plugin._stats_store_error_code = "stats:clear_compensation_unconfirmed"
+    plugin._store_writer = writer
+    plugin._season = {"key": "S14"}
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
+
+    plugin._record_battlegrounds_result(
+        GameEvent(
+            "battlegrounds_game_ended",
+            10,
+            "ended",
+            100.0,
+            {"placement": 2, "variant": "solo", "hero_card_id": "BG_HERO_1"},
+        ),
+        GameSnapshot(),
+    )
+    assert first_write_entered.wait(1.0)
+    clear_results: list[bool] = []
+    clear_thread = threading.Thread(
+        target=lambda: clear_results.append(plugin._clear_battlegrounds_stats())
+    )
+    clear_thread.start()
+    assert clear_wait_entered.wait(1.0)
+    release_first_write.set()
+    clear_thread.join(1.0)
+
+    assert clear_thread.is_alive() is False
+    assert clear_results == [True]
+    assert write_count == 2
+    assert plugin._stats_store_error_code == ""
+    assert writer.stop(timeout=1.0) is True
+
+
 def test_stats_store_read_error_does_not_overwrite_unknown_history(monkeypatch) -> None:
     entry = _load_sdk_entry(monkeypatch)
     warnings: list[str] = []
@@ -2252,7 +3907,12 @@ def test_stats_store_read_error_does_not_overwrite_unknown_history(monkeypatch) 
             return StoreReadErr()
 
     class Writer:
-        def submit(self, value: dict[str, Any]) -> bool:
+        def submit(
+            self,
+            value: dict[str, Any],
+            *,
+            on_success: Callable[[], None] | None = None,
+        ) -> bool:
             writes.append(value)
             return True
 
@@ -2335,7 +3995,12 @@ def test_result_submit_failure_is_exposed_in_dashboard_storage_status(monkeypatc
     entry = _load_sdk_entry(monkeypatch)
 
     class Writer:
-        def submit(self, _value: dict[str, Any]) -> bool:
+        def submit(
+            self,
+            _value: dict[str, Any],
+            *,
+            on_success: Callable[[], None] | None = None,
+        ) -> bool:
             return False
 
         def last_error_code(self) -> str:
@@ -2448,6 +4113,41 @@ def test_shutdown_leaves_host_store_open_even_when_monitor_does_not_stop(monkeyp
     assert plugin._monitor_dispatch_enabled is False
 
 
+def test_shutdown_suspends_late_overlay_starts_before_stopping_runtime(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    calls: list[str] = []
+
+    class Overlay:
+        suspended = False
+
+        def suspend_starts(self) -> None:
+            self.suspended = True
+            calls.append("suspend")
+
+        def stop(self, **_kwargs: Any) -> dict[str, Any]:
+            assert self.suspended is True
+            calls.append("stop")
+            return {"ok": True, "running": False}
+
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin._ownership_lock = threading.RLock()
+    plugin._monitor_action_lock = asyncio.Lock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._started = True
+    plugin._monitor_dispatch_enabled = True
+    plugin._settings_transition = False
+    plugin._context_target = None
+    plugin._monitor = None
+    plugin._catalog = None
+    plugin._overlay = Overlay()
+    plugin._store_writer = types.SimpleNamespace(stop=lambda **_kwargs: True)
+
+    result = asyncio.run(plugin.shutdown())
+
+    assert result["status"] == "stopped"
+    assert calls == ["suspend", "stop"]
+
+
 def test_shutdown_reports_context_restore_error_without_closing_host_store(monkeypatch) -> None:
     entry = _load_sdk_entry(monkeypatch)
 
@@ -2527,6 +4227,63 @@ def test_shutdown_is_bounded_and_continues_after_component_exception(monkeypatch
     assert isinstance(result, RuntimeError)
     assert elapsed < 1.2
     assert set(calls) == {"monitor", "catalog", "overlay", "writer"}
+
+
+def test_shutdown_cancels_config_reconcile_without_waiting_for_settings_lock(
+    monkeypatch,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    reconcile_entered: asyncio.Event | None = None
+
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(llm_data_consent=True)
+    plugin._context_target = None
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._monitor_action_lock = asyncio.Lock()
+    plugin._settings_transition = False
+    plugin._started = True
+    plugin._monitor_dispatch_enabled = True
+    plugin._monitor = None
+    plugin._catalog = types.SimpleNamespace(
+        configure=lambda **_kwargs: None,
+        stop=lambda **_kwargs: True,
+    )
+    plugin._overlay = types.SimpleNamespace(
+        status=lambda: {"running": False},
+        configure=lambda _config: None,
+        stop=lambda **_kwargs: {"ok": True, "running": False},
+    )
+    plugin._store_writer = types.SimpleNamespace(stop=lambda **_kwargs: True)
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args, **_kwargs: None)
+
+    async def block_reconcile(*_args: Any, **_kwargs: Any) -> tuple[list[str], bool]:
+        assert reconcile_entered is not None
+        reconcile_entered.set()
+        await asyncio.Event().wait()
+        raise AssertionError("cancelled reconcile must not resume")
+
+    plugin._apply_runtime_config_best_effort = block_reconcile
+
+    async def scenario() -> Any:
+        nonlocal reconcile_entered
+        reconcile_entered = asyncio.Event()
+        await plugin.config_change(
+            new_config={
+                entry._CONFIG_SECTION: CompanionConfig(
+                    llm_data_consent=False
+                ).to_dict()
+            }
+        )
+        await reconcile_entered.wait()
+        return await asyncio.wait_for(plugin.shutdown(), timeout=1.0)
+
+    result = asyncio.run(scenario())
+
+    assert result["status"] == "stopped"
+    assert plugin._config_reconcile_accepting is False
+    assert plugin._config_reconcile_task is None
+    assert plugin.cfg.llm_data_consent is False
 
 
 def test_commentary_reports_error_when_no_output_channel_accepts(monkeypatch) -> None:
@@ -2709,6 +4466,53 @@ def test_start_monitoring_rolls_back_dispatch_gate_when_start_raises(monkeypatch
     assert plugin._monitor_dispatch_enabled is False
 
 
+def test_start_monitoring_rejects_nonaccepting_monitor_left_by_stop_timeout(
+    monkeypatch,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin._ownership_lock = threading.RLock()
+    plugin._monitor_action_lock = asyncio.Lock()
+    plugin._monitor_dispatch_enabled = False
+    plugin._started = True
+    plugin._sync_active_game_context = lambda: (_ for _ in ()).throw(
+        AssertionError("unhealthy monitor must not publish active context")
+    )
+    monitor = types.SimpleNamespace(
+        start=lambda: False,
+        is_accepting=lambda: False,
+    )
+    plugin._ensure_monitor = lambda: monitor
+
+    with pytest.raises(RuntimeError, match="monitor did not start"):
+        asyncio.run(plugin.start_monitoring())
+
+    assert plugin._monitor_dispatch_enabled is False
+
+
+def test_start_monitoring_accepts_healthy_already_running_monitor(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    synced: list[bool] = []
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin._ownership_lock = threading.RLock()
+    plugin._monitor_action_lock = asyncio.Lock()
+    plugin._monitor_dispatch_enabled = False
+    plugin._started = True
+    plugin._sync_active_game_context = lambda: synced.append(True)
+    monitor = types.SimpleNamespace(
+        start=lambda: False,
+        is_accepting=lambda: True,
+    )
+    plugin._ensure_monitor = lambda: monitor
+
+    result = asyncio.run(plugin.start_monitoring())
+
+    assert result["started"] is False
+    assert "已在运行" in result["summary"]
+    assert plugin._monitor_dispatch_enabled is True
+    assert synced == [True]
+
+
 def test_current_state_marks_stopped_monitor_snapshot_as_cached(monkeypatch) -> None:
     entry = _load_sdk_entry(monkeypatch)
     snapshot = GameSnapshot(mode="battlegrounds", phase="playing", game_number=9)
@@ -2733,6 +4537,325 @@ def test_current_state_marks_stopped_monitor_snapshot_as_cached(monkeypatch) -> 
     assert result["freshness"]["source"] == "cached"
     assert result["freshness"]["do_not_treat_cached_as_live"] is True
     assert result["answer_contract"]["never_recommend_from_cached_state"] is True
+
+
+def test_current_state_uses_atomic_capture_across_log_source_generations(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    now = time.time()
+
+    class Monitor:
+        def capture(self) -> tuple[GameSnapshot, Any, int]:
+            return (
+                GameSnapshot(),
+                types.SimpleNamespace(
+                    source_state="watching",
+                    monitor_running=True,
+                    last_line_at=now,
+                    last_event_at=now,
+                ),
+                2,
+            )
+
+        def snapshot(self) -> GameSnapshot:
+            raise AssertionError("snapshot and status must not be read separately")
+
+        def status(self) -> Any:
+            raise AssertionError("snapshot and status must not be read separately")
+
+    plugin = types.SimpleNamespace(
+        cfg=CompanionConfig(llm_data_consent=True),
+        _ensure_monitor=Monitor,
+    )
+
+    result = asyncio.run(entry.HearthstoneCompanionPlugin.hearthstone_current_state(plugin))
+
+    assert result["available"] is False
+    assert result["state"] == {}
+    assert result["freshness"]["game_number"] == 0
+
+
+def test_monitor_creation_retries_latest_config_and_publishes_one_identity(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    first_constructor_entered = threading.Event()
+    release_first_constructor = threading.Event()
+    constructed_paths: list[str] = []
+
+    class Monitor:
+        def __init__(self, config: CompanionConfig, *_args: Any, **_kwargs: Any) -> None:
+            self.config = config
+            constructed_paths.append(config.log_path)
+            if len(constructed_paths) == 1:
+                first_constructor_entered.set()
+                assert release_first_constructor.wait(1.0)
+
+        def update_config(self, config: CompanionConfig) -> None:
+            self.config = config
+
+    monkeypatch.setattr(entry, "CompanionMonitor", Monitor)
+    previous = CompanionConfig(log_path="old/Power.log", llm_data_consent=True)
+    updated = CompanionConfig(log_path="new/Power.log", llm_data_consent=True)
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = previous
+    plugin._monitor = None
+    plugin._monitor_applied_instance = None
+    plugin._monitor_applied_config = None
+    plugin._monitor_creation_lock = threading.Lock()
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_transition = False
+    plugin._settings_transition_revision = 0
+    plugin._config_revision = 0
+    plugin._config_reconciled_revision = 0
+    plugin._config_reconcile_accepting = False
+    plugin._config_reconcile_task = None
+    plugin._context_target = None
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
+    results: list[Any] = []
+    first = threading.Thread(target=lambda: results.append(plugin._ensure_monitor()))
+    second = threading.Thread(target=lambda: results.append(plugin._ensure_monitor()))
+    first.start()
+    second.start()
+    assert first_constructor_entered.wait(1.0)
+
+    change = asyncio.run(
+        plugin.config_change(
+            new_config={entry._CONFIG_SECTION: updated.to_dict()}
+        )
+    )
+    assert change["reconcile_scheduled"] is False
+    release_first_constructor.set()
+    first.join(1.0)
+    second.join(1.0)
+
+    assert first.is_alive() is False
+    assert second.is_alive() is False
+    assert constructed_paths == ["old/Power.log", "new/Power.log"]
+    assert len(results) == 2
+    assert results[0] is results[1] is plugin._monitor
+    assert plugin._monitor.config.log_path == "new/Power.log"
+    assert plugin._monitor_applied_instance is plugin._monitor
+    assert plugin._monitor_applied_config.to_dict() == updated.to_dict()
+
+
+def test_active_outputs_and_stats_require_monitor_applied_config(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    submitted: list[dict[str, Any]] = []
+    recorded: list[dict[str, Any]] = []
+
+    class Monitor:
+        capture_calls = 0
+
+        def update_config(self, _config: CompanionConfig) -> None:
+            return None
+
+        def capture(self) -> tuple[GameSnapshot, Any, int]:
+            self.capture_calls += 1
+            now = time.time()
+            return (
+                GameSnapshot(mode="battlegrounds", phase="recruit", game_number=8),
+                types.SimpleNamespace(
+                    source_state="watching",
+                    monitor_running=True,
+                    last_line_at=now,
+                    last_event_at=now,
+                ),
+                1,
+            )
+
+    class Stats:
+        def record_game(self, **kwargs: Any) -> None:
+            recorded.append(kwargs)
+
+        def to_store_dict(self) -> dict[str, Any]:
+            return {"schema": 1}
+
+    class Writer:
+        def submit(self, _value: dict[str, Any], **_kwargs: Any) -> bool:
+            return True
+
+    old = CompanionConfig(
+        log_path="old/Power.log",
+        llm_commentary_enabled=True,
+        llm_data_consent=True,
+        target_lanlan="兰兰A",
+    )
+    new = CompanionConfig(
+        log_path="new/Power.log",
+        llm_commentary_enabled=True,
+        llm_data_consent=True,
+        target_lanlan="兰兰A",
+    )
+    monitor = Monitor()
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = new
+    plugin._monitor = monitor
+    plugin._monitor_applied_instance = monitor
+    plugin._monitor_applied_config = CompanionConfig.from_mapping(old.to_dict())
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_transition = False
+    plugin._settings_transition_revision = 1
+    plugin._started = True
+    plugin._monitor_dispatch_enabled = True
+    plugin._last_user_chat_at = 0.0
+    plugin._context_target = None
+    plugin._stats = Stats()
+    plugin._stats_loaded = True
+    plugin._stats_store_error_code = ""
+    plugin._stats_submission_lock = threading.RLock()
+    plugin._stats_recovery_lock = threading.RLock()
+    plugin._stats_recovery_generation = 0
+    plugin._store_writer = Writer()
+    plugin._season = {"key": "S14"}
+    plugin.ctx = types.SimpleNamespace(_current_lanlan="兰兰A")
+    plugin.push_message = lambda **kwargs: submitted.append(kwargs) or {"submitted": True}
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
+    event = GameEvent(
+        "battlegrounds_game_ended",
+        10,
+        "ended",
+        100.0,
+        {"placement": 1, "variant": "solo", "hero_card_id": "BG_HERO_1"},
+    )
+    snapshot = GameSnapshot(mode="battlegrounds", phase="ended", game_number=7)
+
+    assert plugin._dispatch_llm("old source prompt", event, snapshot) is False
+    plugin._observe_game_event(event, snapshot)
+    plugin._sync_active_game_context()
+    plugin._record_battlegrounds_result(event, snapshot)
+    assert submitted == []
+    assert recorded == []
+    assert monitor.capture_calls == 0
+
+    plugin._update_monitor_config(monitor, new)
+    plugin._sync_active_game_context()
+    commentary_event = GameEvent("battlegrounds_triple", 9, "triple", 102.0, {})
+    commentary_snapshot = GameSnapshot(
+        mode="battlegrounds",
+        phase="recruit",
+        game_number=8,
+    )
+    assert plugin._dispatch_llm(
+        "new source prompt",
+        commentary_event,
+        commentary_snapshot,
+    ) is True
+    plugin._record_battlegrounds_result(event, snapshot)
+
+    assert [item["ai_behavior"] for item in submitted] == ["read", "respond"]
+    assert len(recorded) == 1
+    assert monitor.capture_calls == 1
+
+
+@pytest.mark.parametrize("tool_name", ["current_state", "battlegrounds_advice"])
+@pytest.mark.parametrize("monitor_update_fails", [False, True])
+def test_live_tools_fail_closed_while_log_path_change_is_reconciling(
+    monkeypatch,
+    tool_name: str,
+    monitor_update_fails: bool,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    now = time.time()
+    snapshot = GameSnapshot(
+        mode="battlegrounds",
+        phase="recruit",
+        game_number=3,
+        battlegrounds=BattlegroundsSnapshot(
+            phase="recruit",
+            shop=(BattlegroundsCardSnapshot(card_id="BG_SHOP_1"),),
+        ),
+    )
+
+    class Monitor:
+        capture_calls = 0
+        applied_log_paths: list[str] = []
+
+        def capture(self) -> tuple[GameSnapshot, Any, int]:
+            self.capture_calls += 1
+            return (
+                snapshot,
+                types.SimpleNamespace(
+                    source_state="watching",
+                    monitor_running=True,
+                    last_line_at=now,
+                    last_event_at=now,
+                ),
+                len(self.applied_log_paths),
+            )
+
+        def update_config(self, config: CompanionConfig) -> None:
+            self.applied_log_paths.append(config.log_path)
+            if monitor_update_fails:
+                raise RuntimeError("log source switch failed")
+
+    class Catalog:
+        def configure(self, **_kwargs: Any) -> None:
+            return None
+
+        def status(self) -> dict[str, Any]:
+            return {"available": True}
+
+        def facts_for(self, _value: Any) -> dict[str, Any]:
+            return {"available": True, "observed_card_facts": {}}
+
+    monitor = Monitor()
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    previous = CompanionConfig(log_path="old/Power.log", llm_data_consent=True)
+    plugin.cfg = previous
+    plugin._context_target = None
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._settings_transition = False
+    plugin._settings_transition_revision = 0
+    plugin._monitor = monitor
+    plugin._monitor_applied_config = CompanionConfig.from_mapping(previous.to_dict())
+    plugin._monitor_applied_instance = monitor
+    plugin._catalog = Catalog()
+    plugin._overlay = types.SimpleNamespace(
+        status=lambda: {"running": False},
+        configure=lambda _config: None,
+    )
+    plugin._season = {"key": "S14", "status": "bundled_static"}
+    plugin._stats = BattlegroundsStats()
+    plugin._sync_active_game_context = lambda: None
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
+    updated = CompanionConfig(log_path="new/Power.log", llm_data_consent=True)
+
+    async def call_tool() -> dict[str, Any]:
+        if tool_name == "current_state":
+            return await plugin.hearthstone_current_state()
+        return await plugin.hearthstone_battlegrounds_advice(topic="current_strategy")
+
+    async def scenario() -> tuple[dict[str, Any], dict[str, Any]]:
+        await plugin._settings_lock.acquire()
+        try:
+            await plugin.config_change(
+                new_config={entry._CONFIG_SECTION: updated.to_dict()}
+            )
+            assert plugin._settings_transition is True
+            blocked = await call_tool()
+            assert monitor.capture_calls == 0
+        finally:
+            plugin._settings_lock.release()
+        await plugin._wait_for_config_reconcile()
+        after_reconcile = await call_tool()
+        return blocked, after_reconcile
+
+    blocked, after_reconcile = asyncio.run(scenario())
+
+    assert blocked["available"] is False
+    assert blocked["reason"] == "configuration_reconciling"
+    assert monitor.applied_log_paths == ["new/Power.log"]
+    if monitor_update_fails:
+        assert plugin._config_restart_required is True
+        assert plugin._config_runtime_error_codes == ("monitor:RuntimeError",)
+        assert monitor.capture_calls == 0
+        assert after_reconcile["available"] is False
+        assert after_reconcile["reason"] == "monitor_configuration_not_applied"
+        assert plugin._monitor_applied_config == previous
+    else:
+        assert plugin._config_restart_required is False
+        assert monitor.capture_calls == 1
+        assert after_reconcile["available"] is True
+        assert plugin._monitor_applied_config.to_dict() == plugin.cfg.to_dict()
 
 
 def test_battlegrounds_advice_separates_local_evidence_from_global_meta(monkeypatch) -> None:
@@ -2924,6 +5047,149 @@ def test_battlegrounds_advice_fails_closed_when_consent_is_revoked_during_catalo
         "answer_contract",
         "privacy_scope",
     }
+
+
+def test_battlegrounds_advice_recaptures_when_catalog_wait_enters_combat(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    now = time.time()
+    recruit = GameSnapshot(
+        mode="battlegrounds",
+        phase="recruit",
+        game_number=3,
+        battlegrounds=BattlegroundsSnapshot(
+            phase="recruit",
+            shop=(BattlegroundsCardSnapshot(card_id="OLD_SHOP"),),
+        ),
+    )
+    combat = GameSnapshot(
+        mode="battlegrounds",
+        phase="combat",
+        game_number=3,
+        battlegrounds=BattlegroundsSnapshot(
+            phase="combat",
+            shop=(BattlegroundsCardSnapshot(card_id="OLD_SHOP"),),
+            warband=(BattlegroundsCardSnapshot(card_id="PUBLIC_BOARD"),),
+        ),
+    )
+
+    class Monitor:
+        current = recruit
+        capture_calls = 0
+
+        def capture(self) -> tuple[GameSnapshot, Any, int]:
+            self.capture_calls += 1
+            return (
+                self.current,
+                types.SimpleNamespace(
+                    source_state="watching",
+                    monitor_running=True,
+                    last_line_at=now,
+                    last_event_at=now,
+                ),
+                1,
+            )
+
+    monitor = Monitor()
+
+    class Catalog:
+        def status(self) -> dict[str, Any]:
+            return {"available": False, "degraded_reason": "loading"}
+
+        def wait_ready(self, _timeout: float) -> bool:
+            monitor.current = combat
+            return True
+
+        def facts_for(self, _value: Any) -> dict[str, Any]:
+            raise AssertionError("combat state must not request recruit-shop facts")
+
+    plugin = types.SimpleNamespace(
+        cfg=CompanionConfig(llm_data_consent=True),
+        _season={"key": "S14", "status": "bundled_static"},
+        _stats=BattlegroundsStats(),
+        _catalog=Catalog(),
+        _catalog_status=lambda: {},
+        _ensure_monitor=lambda: monitor,
+    )
+
+    result = asyncio.run(
+        entry.HearthstoneCompanionPlugin.hearthstone_battlegrounds_advice(
+            plugin, topic="current_strategy"
+        )
+    )
+
+    assert monitor.capture_calls == 2
+    assert result["available"] is True
+    assert result["current_public_state"]["phase"] == "combat"
+    assert result["current_public_state"]["shop"] == []
+    assert result["capabilities"]["specific_purchase_advice"] == {
+        "available": False,
+        "reason": "no_fresh_recruit_shop",
+        "evidence": "",
+    }
+    assert result["capabilities"]["combat_commentary"]["available"] is True
+
+
+def test_battlegrounds_advice_recaptures_freshness_after_catalog_wait(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    now = time.time()
+    snapshot = GameSnapshot(
+        mode="battlegrounds",
+        phase="recruit",
+        game_number=3,
+        battlegrounds=BattlegroundsSnapshot(
+            phase="recruit",
+            shop=(BattlegroundsCardSnapshot(card_id="OLD_SHOP"),),
+        ),
+    )
+
+    class Monitor:
+        activity_at = now
+        capture_calls = 0
+
+        def capture(self) -> tuple[GameSnapshot, Any, int]:
+            self.capture_calls += 1
+            return (
+                snapshot,
+                types.SimpleNamespace(
+                    source_state="watching",
+                    monitor_running=True,
+                    last_line_at=self.activity_at,
+                    last_event_at=self.activity_at,
+                ),
+                1,
+            )
+
+    monitor = Monitor()
+
+    class Catalog:
+        def status(self) -> dict[str, Any]:
+            return {"available": False, "degraded_reason": "loading"}
+
+        def wait_ready(self, _timeout: float) -> bool:
+            monitor.activity_at = now - 3600.0
+            return True
+
+    plugin = types.SimpleNamespace(
+        cfg=CompanionConfig(llm_data_consent=True),
+        _season={"key": "S14", "status": "bundled_static"},
+        _stats=BattlegroundsStats(),
+        _catalog=Catalog(),
+        _catalog_status=lambda: {},
+        _ensure_monitor=lambda: monitor,
+    )
+
+    result = asyncio.run(
+        entry.HearthstoneCompanionPlugin.hearthstone_battlegrounds_advice(
+            plugin, topic="current_strategy"
+        )
+    )
+
+    assert monitor.capture_calls == 2
+    assert result["available"] is False
+    assert result["reason"] == "no_live_battlegrounds_state"
+    assert result["freshness"]["source"] == "cached"
+    assert result["current_public_state"] is None
+    assert result["capabilities"]["specific_purchase_advice"]["available"] is False
 
 
 @pytest.mark.parametrize("topic", ["season_meta", "hero_performance", "post_game"])

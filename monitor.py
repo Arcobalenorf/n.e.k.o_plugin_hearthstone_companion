@@ -50,6 +50,7 @@ class CompanionMonitor:
         self._status = RuntimeStatus()
         self._snapshot = GameSnapshot()
         self._lock = threading.RLock()
+        self._emission_lock = threading.RLock()
         self._lifecycle_lock = threading.RLock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -123,16 +124,41 @@ class CompanionMonitor:
                         self._status.monitor_running = False
         return stopped
 
-    def update_config(self, config: CompanionConfig) -> None:
-        with self._lock:
-            source_changed = (
-                config.log_path != self.config.log_path
-                or config.initial_read_max_bytes != self.config.initial_read_max_bytes
+    def is_accepting(self) -> bool:
+        with self._lifecycle_lock:
+            return bool(
+                self._thread is not None
+                and self._thread.is_alive()
+                and not self._stop.is_set()
             )
-            self.config = config
-            self._arbiter.update(config)
-            if source_changed:
-                self._reset_reader_locked()
+
+    def update_config(self, config: CompanionConfig) -> None:
+        with self._emission_lock:
+            with self._lock:
+                source_changed = (
+                    config.log_path != self.config.log_path
+                    or config.initial_read_max_bytes != self.config.initial_read_max_bytes
+                )
+                staged_parser: PowerLogParser | None = None
+                staged_tailer: PowerLogTailer | None = None
+                staged_snapshot: GameSnapshot | None = None
+                if source_changed:
+                    staged_parser = PowerLogParser()
+                    staged_tailer = PowerLogTailer(
+                        PowerLogLocator(config.log_path),
+                        initial_read_max_bytes=config.initial_read_max_bytes,
+                    )
+                    staged_snapshot = staged_parser.snapshot()
+                self._arbiter.update(config)
+                self.config = config
+                if source_changed:
+                    assert staged_parser is not None
+                    assert staged_tailer is not None
+                    assert staged_snapshot is not None
+                    self._parser = staged_parser
+                    self._tailer = staged_tailer
+                    self._snapshot = staged_snapshot
+                    self._begin_source_generation_locked()
 
     def snapshot(self) -> GameSnapshot:
         with self._lock:
@@ -141,6 +167,11 @@ class CompanionMonitor:
     def status(self) -> RuntimeStatus:
         with self._lock:
             return replace(self._status)
+
+    def capture(self) -> tuple[GameSnapshot, RuntimeStatus, int]:
+        """Return one immutable view of the current log-source generation."""
+        with self._lock:
+            return self._snapshot, replace(self._status), self._source_generation
 
     def _run(self, stop_event: threading.Event) -> None:
         with self._lock:
@@ -253,11 +284,14 @@ class CompanionMonitor:
                         if self._bootstrap_complete
                         else "bootstrap_incomplete"
                     )
+                    tick_generation = self._source_generation
                 if interrupted:
                     break
                 if batch.source_reset:
                     self._notify_event(
-                        GameEvent("source_reset", 0, "日志来源已重置", now, {}), snapshot
+                        GameEvent("source_reset", 0, "日志来源已重置", now, {}),
+                        snapshot,
+                        source_generation=tick_generation,
                     )
                 if state_ready:
                     self._notify_event(
@@ -273,6 +307,7 @@ class CompanionMonitor:
                             },
                         ),
                         snapshot,
+                        source_generation=tick_generation,
                     )
                 if state_stale:
                     self._notify_event(
@@ -288,6 +323,7 @@ class CompanionMonitor:
                             },
                         ),
                         snapshot,
+                        source_generation=tick_generation,
                     )
                 if state_resumed:
                     self._notify_event(
@@ -303,9 +339,14 @@ class CompanionMonitor:
                             },
                         ),
                         snapshot,
+                        source_generation=tick_generation,
                     )
                 if not batch.bootstrap and self._bootstrap_complete:
-                    self._handle_batch(emissions, now)
+                    self._handle_batch(
+                        emissions,
+                        now,
+                        source_generation=tick_generation,
+                    )
                 if not stop_event.is_set() and now >= next_report:
                     self._report()
                     next_report = now + 2.0
@@ -335,7 +376,25 @@ class CompanionMonitor:
         self._handle_batch([(event, snapshot)], now)
 
     def _handle_batch(
-        self, emissions: list[tuple[GameEvent, GameSnapshot]], now: float
+        self,
+        emissions: list[tuple[GameEvent, GameSnapshot]],
+        now: float,
+        *,
+        source_generation: int | None = None,
+    ) -> None:
+        with self._emission_lock:
+            with self._lock:
+                if (
+                    source_generation is not None
+                    and source_generation != self._source_generation
+                ):
+                    return
+            self._handle_batch_serial(emissions, now)
+
+    def _handle_batch_serial(
+        self,
+        emissions: list[tuple[GameEvent, GameSnapshot]],
+        now: float,
     ) -> None:
         if not emissions:
             return
@@ -395,15 +454,31 @@ class CompanionMonitor:
             return snapshot
         return replace(snapshot, battlegrounds=replace(battlegrounds, round=event_round))
 
-    def _notify_event(self, event: GameEvent, snapshot: GameSnapshot) -> None:
+    def _notify_event(
+        self,
+        event: GameEvent,
+        snapshot: GameSnapshot,
+        *,
+        source_generation: int | None = None,
+    ) -> None:
         if self._on_event is None:
             return
-        try:
-            self._on_event(event, snapshot)
-        except Exception as exc:
+        with self._emission_lock:
             with self._lock:
-                self._status.last_error_code = f"event:{type(exc).__name__}"
-            self.logger.warning("Hearthstone companion event hook failed code=%s", type(exc).__name__)
+                if (
+                    source_generation is not None
+                    and source_generation != self._source_generation
+                ):
+                    return
+            try:
+                self._on_event(event, snapshot)
+            except Exception as exc:
+                with self._lock:
+                    self._status.last_error_code = f"event:{type(exc).__name__}"
+                self.logger.warning(
+                    "Hearthstone companion event hook failed code=%s",
+                    type(exc).__name__,
+                )
 
     def _safe_output(
         self,

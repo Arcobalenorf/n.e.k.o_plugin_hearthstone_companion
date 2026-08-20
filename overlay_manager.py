@@ -21,6 +21,14 @@ class OverlayManager:
         self._availability: dict[str, Any] | None = None
         self._generation = 0
         self._stopping: tuple[subprocess.Popen[str], int] | None = None
+        self._starts_allowed = threading.Event()
+        self._starts_allowed.set()
+
+    def suspend_starts(self) -> None:
+        self._starts_allowed.clear()
+
+    def resume_starts(self) -> None:
+        self._starts_allowed.set()
 
     def configure(self, config: CompanionConfig) -> None:
         with self._lock:
@@ -72,7 +80,19 @@ class OverlayManager:
         }
 
     def start(self) -> dict[str, Any]:
+        if not self._starts_allowed.is_set():
+            return {
+                "ok": False,
+                "running": False,
+                "error_code": "overlay_start_suspended",
+            }
         with self._lock:
+            if not self._starts_allowed.is_set():
+                return {
+                    "ok": False,
+                    "running": False,
+                    "error_code": "overlay_start_suspended",
+                }
             if not self.config.overlay_enabled:
                 return {
                     "ok": False,
@@ -95,6 +115,12 @@ class OverlayManager:
             script = self.plugin_dir / "overlay_process.py"
             if not script.is_file():
                 return {"ok": False, "running": False, "error_code": "overlay_script_missing"}
+            if not self._starts_allowed.is_set():
+                return {
+                    "ok": False,
+                    "running": False,
+                    "error_code": "overlay_start_suspended",
+                }
             command = [
                 sys.executable,
                 str(script),

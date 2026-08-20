@@ -5,6 +5,8 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import hearthstone_companion_under_test.monitor as monitor_module
+import pytest
 from hearthstone_companion_under_test.config import CompanionConfig
 from hearthstone_companion_under_test.models import (
     BattlegroundsSnapshot,
@@ -371,6 +373,159 @@ def test_reader_reset_clears_generation_scoped_runtime_activity() -> None:
     assert status.last_event_kind == ""
 
 
+def test_failed_source_config_staging_keeps_old_identity_and_retry_resets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monitor = CompanionMonitor(
+        CompanionConfig(log_path="old/Power.log"),
+        _logger(),
+        on_llm=lambda *_args: False,
+    )
+    old_snapshot = GameSnapshot(mode="constructed", phase="playing", game_number=7)
+    monitor._snapshot = old_snapshot
+    _snapshot, _status, old_generation = monitor.capture()
+    real_tailer = monitor_module.PowerLogTailer
+    construction_calls = 0
+
+    def fail_once(*args: object, **kwargs: object) -> object:
+        nonlocal construction_calls
+        construction_calls += 1
+        if construction_calls == 1:
+            raise RuntimeError("reader staging failed")
+        return real_tailer(*args, **kwargs)
+
+    monkeypatch.setattr(monitor_module, "PowerLogTailer", fail_once)
+    updated = CompanionConfig(log_path="new/Power.log")
+
+    with pytest.raises(RuntimeError, match="reader staging failed"):
+        monitor.update_config(updated)
+
+    failed_snapshot, _failed_status, failed_generation = monitor.capture()
+    assert monitor.config.log_path == "old/Power.log"
+    assert failed_snapshot == old_snapshot
+    assert failed_generation == old_generation
+
+    monitor.update_config(updated)
+
+    reset_snapshot, reset_status, reset_generation = monitor.capture()
+    assert construction_calls == 2
+    assert monitor.config.log_path == "new/Power.log"
+    assert reset_snapshot == GameSnapshot()
+    assert reset_status.source_state == "waiting"
+    assert reset_generation == old_generation + 1
+
+
+def test_old_source_generation_drops_all_delayed_callbacks() -> None:
+    observed: list[str] = []
+    results: list[str] = []
+    llm_events: list[str] = []
+    monitor = CompanionMonitor(
+        CompanionConfig(llm_commentary_enabled=True, llm_data_consent=True),
+        _logger(),
+        on_llm=lambda _prompt, event, _snapshot: not llm_events.append(event.kind),
+        on_result=lambda event, _snapshot: results.append(event.kind),
+        on_event=lambda event, _snapshot: observed.append(event.kind),
+    )
+    _snapshot, _status, old_generation = monitor.capture()
+    event = GameEvent(
+        "battlegrounds_game_ended",
+        10,
+        "ended",
+        100.0,
+        {"placement": 1},
+    )
+    snapshot = GameSnapshot(
+        mode="battlegrounds",
+        phase="ended",
+        game_number=7,
+        battlegrounds=BattlegroundsSnapshot(placement=1),
+    )
+
+    monitor.update_config(CompanionConfig(log_path="new/Power.log"))
+    monitor._handle_batch(
+        [(event, snapshot)],
+        100.0,
+        source_generation=old_generation,
+    )
+
+    assert observed == []
+    assert results == []
+    assert llm_events == []
+    assert monitor.status().events_seen == 0
+
+
+def test_source_update_waits_for_in_flight_event_callback() -> None:
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+    update_finished = threading.Event()
+
+    def on_event(_event: GameEvent, _snapshot: GameSnapshot) -> None:
+        callback_entered.set()
+        release_callback.wait(1.0)
+
+    monitor = CompanionMonitor(
+        CompanionConfig(log_path="old/Power.log"),
+        _logger(),
+        on_llm=lambda *_args: False,
+        on_event=on_event,
+    )
+    _snapshot, _status, generation = monitor.capture()
+    callback_thread = threading.Thread(
+        target=lambda: monitor._notify_event(
+            GameEvent("turn_started", 5, "turn", 100.0, {}),
+            GameSnapshot(mode="constructed", phase="playing", game_number=1),
+            source_generation=generation,
+        )
+    )
+    callback_thread.start()
+    assert callback_entered.wait(1.0)
+    update_thread = threading.Thread(
+        target=lambda: (
+            monitor.update_config(CompanionConfig(log_path="new/Power.log")),
+            update_finished.set(),
+        )
+    )
+    update_thread.start()
+
+    assert update_finished.wait(0.05) is False
+    release_callback.set()
+    callback_thread.join(1.0)
+    update_thread.join(1.0)
+
+    assert callback_thread.is_alive() is False
+    assert update_thread.is_alive() is False
+    assert update_finished.is_set()
+    assert monitor.config.log_path == "new/Power.log"
+
+
+def test_capture_returns_one_generation_and_copies_mutable_status() -> None:
+    monitor = CompanionMonitor(
+        CompanionConfig(log_path="old/Power.log"),
+        _logger(),
+        on_llm=lambda *_args: False,
+    )
+    expected_snapshot = GameSnapshot(mode="constructed", phase="playing", game_number=4)
+    monitor._snapshot = expected_snapshot
+    monitor._status.source_state = "watching"
+    monitor._status.last_line_at = 123.0
+
+    snapshot, status, generation = monitor.capture()
+
+    assert snapshot is expected_snapshot
+    assert status.source_state == "watching"
+    assert status.last_line_at == 123.0
+    status.source_state = "modified_outside_monitor"
+    assert monitor.status().source_state == "watching"
+
+    monitor.update_config(CompanionConfig(log_path="new/Power.log"))
+    reset_snapshot, reset_status, reset_generation = monitor.capture()
+
+    assert reset_generation == generation + 1
+    assert reset_snapshot == GameSnapshot()
+    assert reset_status.source_state == "waiting"
+    assert reset_status.last_line_at == 0.0
+
+
 def test_incremental_live_game_emits_stale_without_bootstrap_state_ready() -> None:
     observed: list[str] = []
     monitor = CompanionMonitor(
@@ -621,6 +776,47 @@ def test_stop_timeout_does_not_wait_for_monitor_state_lock() -> None:
     thread.join(1.0)
 
     assert elapsed < 0.2
+
+
+def test_monitor_is_accepting_tracks_start_stop_request_and_completion() -> None:
+    monitor = CompanionMonitor(
+        CompanionConfig(poll_interval_seconds=0.1),
+        _logger(),
+        on_llm=lambda *_args: False,
+    )
+    poll_entered = threading.Event()
+    release_poll = threading.Event()
+    stop_result: list[bool] = []
+
+    class BlockingTailer:
+        def poll(self) -> TailBatch:
+            poll_entered.set()
+            assert release_poll.wait(1.0)
+            return TailBatch((), Path("Power.log"), bootstrap_complete=True)
+
+    monitor._tailer = BlockingTailer()  # type: ignore[assignment]
+    assert monitor.is_accepting() is False
+    assert monitor.start() is True
+    assert poll_entered.wait(1.0)
+    assert monitor.is_accepting() is True
+
+    stopping = threading.Thread(
+        target=lambda: stop_result.append(monitor.stop(timeout=1.0)),
+        daemon=True,
+    )
+    stopping.start()
+    deadline = time.monotonic() + 1.0
+    while not monitor._stop.is_set() and time.monotonic() < deadline:
+        time.sleep(0.005)
+
+    assert monitor._thread is not None and monitor._thread.is_alive()
+    assert monitor.is_accepting() is False
+    release_poll.set()
+    stopping.join(1.0)
+
+    assert stopping.is_alive() is False
+    assert stop_result == [True]
+    assert monitor.is_accepting() is False
 
 
 def test_stop_flushes_a_fully_parsed_live_batch() -> None:

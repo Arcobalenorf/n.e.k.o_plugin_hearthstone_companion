@@ -119,6 +119,44 @@ def test_start_is_stably_rejected_when_overlay_is_disabled(tmp_path: Path) -> No
     }
 
 
+def test_suspended_manager_rejects_a_start_that_arrives_after_stop(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    manager = _manager(tmp_path)
+    process = _FakeProcess(100, exit_on_close=True)
+    _install_processes(monkeypatch, [process])
+    release_start = threading.Event()
+    results: list[dict[str, Any]] = []
+
+    start_thread = threading.Thread(
+        target=lambda: (release_start.wait(1.0), results.append(manager.start()))
+    )
+    start_thread.start()
+    manager.suspend_starts()
+    assert manager.stop(timeout=0.01)["running"] is False
+    release_start.set()
+    start_thread.join(1.0)
+
+    assert results == [
+        {
+            "ok": False,
+            "running": False,
+            "error_code": "overlay_start_suspended",
+        }
+    ]
+    assert manager.status()["running"] is False
+    assert process.poll() is None
+
+    manager.resume_starts()
+    monkeypatch.setattr(
+        "hearthstone_companion_under_test.overlay_manager.time.sleep",
+        lambda _value: None,
+    )
+    assert manager.start() == {"ok": True, "running": True, "pid": 100}
+    assert manager.stop(timeout=0.01)["ok"] is True
+
+
 def test_start_and_short_timeout_stop_gracefully(
     tmp_path: Path,
     monkeypatch: Any,

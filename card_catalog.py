@@ -21,10 +21,11 @@ _ORIGIN = "https://hsbg.cards"
 _API_ROOT = f"{_ORIGIN}/api/v1"
 _ATTRIBUTION_URL = f"{_ORIGIN}/about"
 _TERMS_URL = f"{_ORIGIN}/terms"
-_CACHE_SCHEMA = 1
+_CACHE_SCHEMA = 2
 _MAX_CACHE_BYTES = 12 * 1024 * 1024
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 _MAX_CARDS = 5_000
+_MAX_CHILD_RELATIONSHIPS = 32
 _PAGE_SIZE = 100
 _USER_AGENT = (
     "NEKO-Hearthstone-Companion/0.1.5 "
@@ -36,6 +37,16 @@ class CatalogError(RuntimeError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+class _FetchAttempt:
+    def __init__(self, checked_at: float) -> None:
+        self.checked_at = checked_at
+        self.done = threading.Event()
+        self.prepared: dict[str, Any] | None = None
+        self.staged_cache: Path | None = None
+        self.cache_error = ""
+        self.error_code = ""
 
 
 class _NoRedirects(HTTPRedirectHandler):
@@ -98,6 +109,24 @@ def _string_list(value: Any, *, maximum_items: int, maximum_length: int) -> list
     return result
 
 
+def _relationship_id(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return _integer(value)
+
+
+def _relationship_ids(value: Any) -> list[int]:
+    if not isinstance(value, list) or len(value) > _MAX_CHILD_RELATIONSHIPS:
+        return []
+    result: list[int] = []
+    for item in value:
+        identifier = _relationship_id(item)
+        if not identifier or identifier in result:
+            return []
+        result.append(identifier)
+    return result
+
+
 def project_card(value: Mapping[str, Any]) -> dict[str, Any] | None:
     provider_id = _integer(value.get("id"))
     external_id = _text(value.get("externalId"), 100)
@@ -127,6 +156,10 @@ def project_card(value: Mapping[str, Any]) -> dict[str, Any] | None:
         "duos_only": bool(value.get("isDuosOnly")),
         "solos_only": bool(value.get("isSolosOnly")),
         "golden_provider_card_id": _integer(value.get("dbfIdGold")),
+        "child_provider_ids": _relationship_ids(value.get("childIds")),
+        "parent_provider_id": _relationship_id(value.get("parentId")),
+        "is_hero": value.get("isHero") is True,
+        "is_hero_skin": value.get("isHeroSkin") is True,
     }
 
 
@@ -156,14 +189,17 @@ class BattlegroundsCardCatalog:
         self._refresh_hours = max(6.0, min(168.0, float(refresh_hours)))
         self._now = now
         self._lock = threading.RLock()
+        self._lifecycle_lock = threading.RLock()
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
         self._ready_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._generation = 0
         self._force_refresh = False
         self._retry_delay_seconds = 0.0
         self._cards: tuple[dict[str, Any], ...] = ()
         self._by_identifier: dict[str, tuple[dict[str, Any], bool]] = {}
+        self._hero_power_by_hero_provider_id: dict[int, dict[str, Any]] = {}
         self._patch = ""
         self._season = ""
         self._fetched_at = 0.0
@@ -172,48 +208,79 @@ class BattlegroundsCardCatalog:
         self._load_cache()
 
     def configure(self, *, network_enabled: bool, refresh_hours: float) -> None:
-        with self._lock:
-            was_enabled = self._network_enabled
-            self._network_enabled = bool(network_enabled)
-            self._refresh_hours = max(6.0, min(168.0, float(refresh_hours)))
-        if self._network_enabled and not was_enabled:
-            self.start()
-        self._wake_event.set()
+        with self._lifecycle_lock:
+            with self._lock:
+                was_enabled = self._network_enabled
+                self._network_enabled = bool(network_enabled)
+                self._refresh_hours = max(6.0, min(168.0, float(refresh_hours)))
+                enabled = self._network_enabled
+                stop_event = self._stop_event
+                wake_event = self._wake_event
+                ready_event = self._ready_event
+            if enabled and not was_enabled:
+                self.start()
+            else:
+                wake_event.set()
+            if not enabled:
+                stop_event.set()
+                ready_event.set()
 
     def start(self) -> bool:
-        with self._lock:
-            if self._thread is not None and self._thread.is_alive():
-                return False
-            if not self._network_enabled:
-                self._ready_event.set()
-                return False
-            self._stop_event.clear()
-            self._wake_event.clear()
-            self._thread = threading.Thread(
-                target=self._run,
-                name="hearthstone-card-catalog",
-                daemon=True,
-            )
-            self._thread.start()
-            return True
+        with self._lifecycle_lock:
+            with self._lock:
+                if (
+                    self._thread is not None
+                    and self._thread.is_alive()
+                    and not self._stop_event.is_set()
+                ):
+                    return False
+                if not self._network_enabled:
+                    self._ready_event.set()
+                    return False
+                self._generation += 1
+                generation = self._generation
+                stop_event = threading.Event()
+                wake_event = threading.Event()
+                ready_event = threading.Event()
+                self._stop_event = stop_event
+                self._wake_event = wake_event
+                self._ready_event = ready_event
+                if self._cards:
+                    ready_event.set()
+                thread = threading.Thread(
+                    target=self._run,
+                    args=(generation, stop_event, wake_event, ready_event),
+                    name="hearthstone-card-catalog",
+                    daemon=True,
+                )
+                self._thread = thread
+                thread.start()
+                return True
 
     def stop(self, timeout: float = 8.0) -> bool:
-        self._stop_event.set()
-        self._wake_event.set()
-        thread = self._thread
+        with self._lifecycle_lock:
+            with self._lock:
+                stop_event = self._stop_event
+                wake_event = self._wake_event
+                thread = self._thread
+                stop_event.set()
+                wake_event.set()
         if thread is not None and thread.is_alive():
             thread.join(max(0.1, timeout))
         return thread is None or not thread.is_alive()
 
     def wait_ready(self, timeout: float = 1.5) -> bool:
-        self._ready_event.wait(max(0.0, timeout))
+        with self._lock:
+            ready_event = self._ready_event
+        ready_event.wait(max(0.0, timeout))
         with self._lock:
             return bool(self._cards)
 
     def request_refresh(self) -> None:
         with self._lock:
             self._force_refresh = True
-        self._wake_event.set()
+            wake_event = self._wake_event
+        wake_event.set()
 
     def _seconds_until_refresh(self) -> float:
         with self._lock:
@@ -227,25 +294,139 @@ class BattlegroundsCardCatalog:
             checked_at = self._checked_at
         return max(0.0, interval - (self._now() - checked_at))
 
-    def _run(self) -> None:
+    def _run(
+        self,
+        generation: int,
+        stop_event: threading.Event,
+        wake_event: threading.Event,
+        ready_event: threading.Event,
+    ) -> None:
+        owner_thread = threading.current_thread()
         try:
-            while not self._stop_event.is_set():
+            while not stop_event.is_set():
                 with self._lock:
+                    if generation != self._generation:
+                        return
                     enabled = self._network_enabled
                 if not enabled:
-                    wait_seconds = 3600.0
+                    return
                 elif self._seconds_until_refresh() <= 0.0:
                     with self._lock:
+                        if generation != self._generation or stop_event.is_set():
+                            return
                         self._force_refresh = False
-                    self.refresh_once()
+                    attempt = self._start_fetch_attempt(
+                        generation,
+                        stop_event,
+                        checked_at=self._now(),
+                    )
+                    while not attempt.done.wait(0.05):
+                        if stop_event.is_set():
+                            return
+                        with self._lock:
+                            if generation != self._generation or not self._network_enabled:
+                                return
+                    if not self._finish_fetch_attempt(generation, stop_event, attempt):
+                        return
                     wait_seconds = min(max(0.1, self._seconds_until_refresh()), 3600.0)
                 else:
                     wait_seconds = min(max(0.1, self._seconds_until_refresh()), 3600.0)
-                self._ready_event.set()
-                self._wake_event.wait(wait_seconds)
-                self._wake_event.clear()
+                ready_event.set()
+                wake_event.wait(wait_seconds)
+                wake_event.clear()
         finally:
-            self._ready_event.set()
+            ready_event.set()
+            with self._lifecycle_lock:
+                if self._thread is owner_thread:
+                    self._thread = None
+
+    def _start_fetch_attempt(
+        self,
+        generation: int,
+        stop_event: threading.Event,
+        *,
+        checked_at: float,
+    ) -> _FetchAttempt:
+        attempt = _FetchAttempt(checked_at)
+
+        def fetch() -> None:
+            try:
+                payload = self._fetch_payload(checked_at, stop_event)
+                attempt.prepared = self._prepare_install(payload)
+                try:
+                    attempt.staged_cache = self._stage_cache(payload)
+                except OSError:
+                    attempt.cache_error = "cache_write_failed"
+            except CatalogError as exc:
+                attempt.prepared = None
+                attempt.error_code = exc.code
+            except Exception as exc:
+                attempt.prepared = None
+                attempt.error_code = f"internal_{type(exc).__name__}"
+                try:
+                    self.logger.warning(
+                        "Battlegrounds catalog fetch failed code=%s",
+                        attempt.error_code,
+                    )
+                except Exception:
+                    pass
+            finally:
+                with self._lock:
+                    discard = (
+                        generation != self._generation
+                        or stop_event.is_set()
+                        or not self._network_enabled
+                    )
+                if discard:
+                    self._discard_staged_cache(attempt.staged_cache)
+                    attempt.staged_cache = None
+                    attempt.prepared = None
+                attempt.done.set()
+
+        threading.Thread(
+            target=fetch,
+            name=f"hearthstone-card-catalog-fetch-{generation}",
+            daemon=True,
+        ).start()
+        return attempt
+
+    def _finish_fetch_attempt(
+        self,
+        generation: int,
+        stop_event: threading.Event,
+        attempt: _FetchAttempt,
+    ) -> bool:
+        discard: Path | None = None
+        committed = False
+        with self._lock:
+            if (
+                generation != self._generation
+                or stop_event.is_set()
+                or not self._network_enabled
+            ):
+                discard = attempt.staged_cache
+            elif attempt.prepared is None:
+                self._record_refresh_failure_locked(
+                    attempt.checked_at,
+                    attempt.error_code or "empty_catalog",
+                )
+                return True
+            else:
+                cache_error = attempt.cache_error
+                if attempt.staged_cache is not None:
+                    try:
+                        os.replace(attempt.staged_cache, self.cache_file)
+                    except OSError:
+                        cache_error = "cache_write_failed"
+                    else:
+                        attempt.staged_cache = None
+                self._apply_install_locked(attempt.prepared, error_code=cache_error)
+                self._retry_delay_seconds = 300.0 if cache_error else 0.0
+                discard = attempt.staged_cache
+                attempt.staged_cache = None
+                committed = True
+        self._discard_staged_cache(discard)
+        return committed
 
     def refresh_once(self) -> bool:
         with self._lock:
@@ -254,42 +435,79 @@ class BattlegroundsCardCatalog:
                 self._checked_at = self._now()
                 self._ready_event.set()
                 return False
+            generation = self._generation
+            stop_event = self._stop_event
+            ready_event = self._ready_event
         checked_at = self._now()
+        staged_cache: Path | None = None
         try:
-            patch, season = self._fetch_patch()
-            cards = self._fetch_current_cards()
-            if not cards:
-                raise CatalogError("empty_catalog")
-            payload = {
-                "schema_version": _CACHE_SCHEMA,
-                "provider": _PROVIDER,
-                "patch": patch,
-                "season": season,
-                "fetched_at": checked_at,
-                "checked_at": checked_at,
-                "cards": cards,
-            }
+            payload = self._fetch_payload(checked_at, stop_event)
+            prepared = self._prepare_install(payload)
             cache_error = ""
             try:
-                self._write_cache(payload)
+                staged_cache = self._stage_cache(payload)
             except OSError:
                 cache_error = "cache_write_failed"
-            self._install(payload, error_code=cache_error)
             with self._lock:
+                if generation != self._generation or stop_event.is_set():
+                    raise CatalogError("shutdown_requested")
+                if not self._network_enabled:
+                    raise CatalogError("network_disabled")
+                if staged_cache is not None:
+                    try:
+                        os.replace(staged_cache, self.cache_file)
+                    except OSError:
+                        cache_error = "cache_write_failed"
+                    else:
+                        staged_cache = None
+                self._apply_install_locked(prepared, error_code=cache_error)
                 self._retry_delay_seconds = 300.0 if cache_error else 0.0
             return True
         except CatalogError as exc:
             with self._lock:
-                self._checked_at = checked_at
-                self._last_error_code = exc.code
-                self._retry_delay_seconds = (
-                    300.0
-                    if self._retry_delay_seconds <= 0.0
-                    else min(3600.0, self._retry_delay_seconds * 3.0)
-                )
+                if generation == self._generation:
+                    self._record_refresh_failure_locked(checked_at, exc.code)
             return False
         finally:
-            self._ready_event.set()
+            self._discard_staged_cache(staged_cache)
+            ready_event.set()
+
+    def _fetch_payload(
+        self,
+        checked_at: float,
+        stop_event: threading.Event,
+    ) -> dict[str, Any]:
+        self._ensure_fetch_allowed(stop_event)
+        patch, season = self._fetch_patch()
+        self._ensure_fetch_allowed(stop_event)
+        cards = self._fetch_current_cards(stop_event=stop_event)
+        if not cards:
+            raise CatalogError("empty_catalog")
+        return {
+            "schema_version": _CACHE_SCHEMA,
+            "provider": _PROVIDER,
+            "patch": patch,
+            "season": season,
+            "fetched_at": checked_at,
+            "checked_at": checked_at,
+            "cards": cards,
+        }
+
+    def _ensure_fetch_allowed(self, stop_event: threading.Event) -> None:
+        with self._lock:
+            if not self._network_enabled:
+                raise CatalogError("network_disabled")
+        if stop_event.is_set():
+            raise CatalogError("shutdown_requested")
+
+    def _record_refresh_failure_locked(self, checked_at: float, error_code: str) -> None:
+        self._checked_at = checked_at
+        self._last_error_code = error_code
+        self._retry_delay_seconds = (
+            300.0
+            if self._retry_delay_seconds <= 0.0
+            else min(3600.0, self._retry_delay_seconds * 3.0)
+        )
 
     def _fetch_patch(self) -> tuple[str, str]:
         payload = self._request_json("/patches", {}, maximum_bytes=512 * 1024)
@@ -302,18 +520,21 @@ class BattlegroundsCardCatalog:
             raise CatalogError("invalid_patch_schema")
         return patch, season
 
-    def _fetch_current_cards(self) -> list[dict[str, Any]]:
+    def _fetch_current_cards(
+        self,
+        *,
+        stop_event: threading.Event | None = None,
+    ) -> list[dict[str, Any]]:
+        if stop_event is None:
+            with self._lock:
+                stop_event = self._stop_event
         offset = 0
         projected: list[dict[str, Any]] = []
         provider_ids: set[int] = set()
         external_ids: set[str] = set()
         total = 1
         while offset < total:
-            if self._stop_event.is_set():
-                raise CatalogError("shutdown_requested")
-            with self._lock:
-                if not self._network_enabled:
-                    raise CatalogError("network_disabled")
+            self._ensure_fetch_allowed(stop_event)
             payload = self._request_json(
                 "/cards",
                 {"pool": "current", "limit": _PAGE_SIZE, "offset": offset, "sort": "id"},
@@ -411,7 +632,7 @@ class BattlegroundsCardCatalog:
         except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
             raise CatalogError("invalid_json") from None
 
-    def _write_cache(self, payload: Mapping[str, Any]) -> None:
+    def _stage_cache(self, payload: Mapping[str, Any]) -> Path:
         self.cache_file.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.cache_file.with_name(
             f".{self.cache_file.name}.{os.getpid()}.{threading.get_ident()}.tmp"
@@ -419,12 +640,22 @@ class BattlegroundsCardCatalog:
         try:
             with gzip.open(temporary, "wt", encoding="utf-8", newline="\n") as handle:
                 json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-            os.replace(temporary, self.cache_file)
-        finally:
+            return temporary
+        except BaseException:
             try:
                 temporary.unlink(missing_ok=True)
             except OSError:
                 pass
+            raise
+
+    @staticmethod
+    def _discard_staged_cache(temporary: Path | None) -> None:
+        if temporary is None:
+            return
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def _load_cache(self) -> None:
         try:
@@ -448,7 +679,7 @@ class BattlegroundsCardCatalog:
         ):
             self._last_error_code = "cache_invalid"
 
-    def _install(self, payload: Mapping[str, Any], *, error_code: str = "") -> None:
+    def _prepare_install(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         if _integer(payload.get("schema_version"), maximum=100) != _CACHE_SCHEMA:
             raise CatalogError("cache_schema_invalid")
         if payload.get("provider") != _PROVIDER:
@@ -477,6 +708,10 @@ class BattlegroundsCardCatalog:
                     "isDuosOnly": row.get("duos_only"),
                     "isSolosOnly": row.get("solos_only"),
                     "dbfIdGold": row.get("golden_provider_card_id"),
+                    "childIds": row.get("child_provider_ids"),
+                    "parentId": row.get("parent_provider_id"),
+                    "isHero": row.get("is_hero"),
+                    "isHeroSkin": row.get("is_hero_skin"),
                 }
             )
             if card is None:
@@ -489,14 +724,39 @@ class BattlegroundsCardCatalog:
             golden_id = int(card["golden_provider_card_id"])
             if golden_id:
                 identifiers[str(golden_id)] = (card, True)
+        provider_cards = {int(card["provider_card_id"]): card for card in cards}
+        hero_powers = _build_hero_power_index(cards, provider_cards)
+        fetched_at = _epoch_or_zero(payload.get("fetched_at"))
+        checked_at = _epoch_or_zero(payload.get("checked_at")) or fetched_at
+        return {
+            "cards": tuple(cards),
+            "identifiers": identifiers,
+            "hero_powers": hero_powers,
+            "patch": _text(payload.get("patch"), 32),
+            "season": _text(payload.get("season"), 80),
+            "fetched_at": fetched_at,
+            "checked_at": checked_at,
+        }
+
+    def _apply_install_locked(
+        self,
+        prepared: Mapping[str, Any],
+        *,
+        error_code: str = "",
+    ) -> None:
+        self._cards = prepared["cards"]
+        self._by_identifier = prepared["identifiers"]
+        self._hero_power_by_hero_provider_id = prepared["hero_powers"]
+        self._patch = str(prepared["patch"])
+        self._season = str(prepared["season"])
+        self._fetched_at = float(prepared["fetched_at"])
+        self._checked_at = float(prepared["checked_at"])
+        self._last_error_code = error_code
+
+    def _install(self, payload: Mapping[str, Any], *, error_code: str = "") -> None:
+        prepared = self._prepare_install(payload)
         with self._lock:
-            self._cards = tuple(cards)
-            self._by_identifier = identifiers
-            self._patch = _text(payload.get("patch"), 32)
-            self._season = _text(payload.get("season"), 80)
-            self._fetched_at = _epoch_or_zero(payload.get("fetched_at"))
-            self._checked_at = _epoch_or_zero(payload.get("checked_at")) or self._fetched_at
-            self._last_error_code = error_code
+            self._apply_install_locked(prepared, error_code=error_code)
 
     def _pool_summary(self, cards: tuple[dict[str, Any], ...]) -> dict[str, Any]:
         types = Counter()
@@ -587,6 +847,7 @@ class BattlegroundsCardCatalog:
                     ordered_ids.append(normalized)
         with self._lock:
             index = dict(self._by_identifier)
+            hero_power_index = dict(self._hero_power_by_hero_provider_id)
         facts: dict[str, dict[str, Any]] = {}
         missing: list[str] = []
         for identifier in ordered_ids[:40]:
@@ -595,7 +856,7 @@ class BattlegroundsCardCatalog:
                 missing.append(identifier)
                 continue
             card, golden = match
-            facts[identifier] = {
+            fact = {
                 "catalog_ref": f"{_PROVIDER}:{card['provider_card_id']}",
                 "name": card["name"],
                 "rules_text": card["golden_rules_text"] if golden else card["rules_text"],
@@ -609,9 +870,21 @@ class BattlegroundsCardCatalog:
                 "direct_tavern_pool": card["direct_tavern_pool"],
                 "duos_only": card["duos_only"],
                 "solos_only": card["solos_only"],
+                "is_hero": card["is_hero"],
+                "is_hero_skin": card["is_hero_skin"],
                 "golden_observation": golden,
                 "untrusted_reference_text": True,
             }
+            hero_power = hero_power_index.get(int(card["provider_card_id"]))
+            if hero_power is not None:
+                fact["hero_power"] = {
+                    "catalog_ref": f"{_PROVIDER}:{hero_power['provider_card_id']}",
+                    "card_id": hero_power["external_id"],
+                    "name": hero_power["name"],
+                    "rules_text": hero_power["rules_text"],
+                    "untrusted_reference_text": True,
+                }
+            facts[identifier] = fact
         return {
             **status,
             "coverage": {
@@ -622,6 +895,37 @@ class BattlegroundsCardCatalog:
             },
             "observed_card_facts": facts,
         }
+
+
+def _build_hero_power_index(
+    cards: list[dict[str, Any]],
+    provider_cards: Mapping[int, dict[str, Any]],
+) -> dict[int, dict[str, Any]]:
+    result: dict[int, dict[str, Any]] = {}
+    for observed_hero in cards:
+        if (
+            observed_hero["card_type"] != "hero"
+            or not observed_hero["is_hero"]
+            or observed_hero["is_hero_skin"]
+            or observed_hero["parent_provider_id"]
+        ):
+            continue
+        base_id = int(observed_hero["provider_card_id"])
+        candidates: list[dict[str, Any]] = []
+        for child_id in observed_hero["child_provider_ids"]:
+            child = provider_cards.get(int(child_id))
+            if (
+                child is not None
+                and child["card_type"] == "hero_power"
+                and not child["is_hero"]
+                and not child["is_hero_skin"]
+                and int(child["parent_provider_id"]) == base_id
+                and child["rules_text"]
+            ):
+                candidates.append(child)
+        if len(candidates) == 1:
+            result[base_id] = candidates[0]
+    return result
 
 
 __all__ = ["BattlegroundsCardCatalog", "CatalogError", "clean_rules_text", "project_card"]

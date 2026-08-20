@@ -41,6 +41,7 @@ _LLM_DELIVERY_MAX_CHARS = 1800
 _STATS_CLEAR_WRITE_TIMEOUT_SECONDS = 3.0
 _SHUTDOWN_THREAD_BUDGET_SECONDS = 0.4
 _SHUTDOWN_WRITER_BUDGET_SECONDS = 0.3
+_SHUTDOWN_CONFIG_RECONCILE_BUDGET_SECONDS = 0.25
 _OVERLAY_RUNTIME_FIELDS = (
     "overlay_enabled",
     "overlay_window_titles",
@@ -48,6 +49,10 @@ _OVERLAY_RUNTIME_FIELDS = (
     "overlay_font_size",
     "overlay_speed_px_per_second",
 )
+
+
+class _StartupSuperseded(RuntimeError):
+    """Raised internally when another lifecycle transition owns the plugin."""
 
 
 def _is_missing_active_profile_error(exc: Exception) -> bool:
@@ -170,6 +175,56 @@ def _state_freshness(snapshot: GameSnapshot, runtime: Any, *, captured_at: float
     }
 
 
+def _capture_monitor(monitor: Any) -> tuple[GameSnapshot, Any, int | None]:
+    capture = getattr(monitor, "capture", None)
+    if callable(capture):
+        return capture()
+    snapshot_getter = getattr(monitor, "snapshot", None)
+    if not callable(snapshot_getter):
+        raise AttributeError("monitor snapshot is unavailable")
+    status_getter = getattr(monitor, "status", None)
+    runtime = status_getter() if callable(status_getter) else None
+    return snapshot_getter(), runtime, None
+
+
+def _live_state_access(
+    plugin: Any,
+    *,
+    expected_transition_revision: int | None = None,
+    require_consent: bool = True,
+) -> tuple[str, int]:
+    def inspect() -> tuple[str, int]:
+        revision = int(getattr(plugin, "_settings_transition_revision", 0))
+        if hasattr(plugin, "_started") and not getattr(plugin, "_started"):
+            return "plugin_not_running", revision
+        if require_consent and not getattr(
+            getattr(plugin, "cfg", None), "llm_data_consent", False
+        ):
+            return "llm_data_sharing_not_authorized", revision
+        if getattr(plugin, "_settings_transition", False):
+            return "configuration_reconciling", revision
+        if (
+            expected_transition_revision is not None
+            and revision != expected_transition_revision
+        ):
+            return "configuration_reconciling", revision
+        monitor = getattr(plugin, "_monitor", None)
+        if monitor is not None and hasattr(plugin, "_monitor_applied_config"):
+            applied = getattr(plugin, "_monitor_applied_config", None)
+            applied_instance = getattr(plugin, "_monitor_applied_instance", None)
+            applied_values = applied.to_dict() if applied is not None else None
+            current_values = plugin.cfg.to_dict()
+            if applied_instance is not monitor or applied_values != current_values:
+                return "monitor_configuration_not_applied", revision
+        return "", revision
+
+    ownership_lock = getattr(plugin, "_ownership_lock", None)
+    if ownership_lock is None:
+        return inspect()
+    with ownership_lock:
+        return inspect()
+
+
 @neko_plugin
 class HearthstoneCompanionPlugin(NekoPluginBase):
     """Read-only Hearthstone companion built on the public N.E.K.O Plugin SDK."""
@@ -178,6 +233,9 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         super().__init__(ctx)
         self.cfg = CompanionConfig()
         self._monitor: CompanionMonitor | None = None
+        self._monitor_applied_config: CompanionConfig | None = None
+        self._monitor_applied_instance: CompanionMonitor | None = None
+        self._monitor_creation_lock = threading.Lock()
         self._overlay = OverlayManager(
             self.logger,
             plugin_dir=Path(self.config_dir),
@@ -193,66 +251,251 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         self._stats = BattlegroundsStats()
         self._stats_loaded = False
         self._stats_store_error_code = ""
+        self._stats_recovery_generation = 0
+        self._stats_recovery_lock = threading.RLock()
         self._store_writer = AsyncStoreWriter(self._persist_stats, self.logger)
         self._context_target: str | None = None
         self._ownership_lock = threading.RLock()
         self._settings_lock = asyncio.Lock()
         self._monitor_action_lock = asyncio.Lock()
+        self._lifecycle_lock = asyncio.Lock()
+        self._lifecycle_generation = 0
+        self._lifecycle_request_sequence = 0
+        self._latest_lifecycle_request = 0
+        self._startup_task: asyncio.Task[Any] | None = None
         self._stats_submission_lock = threading.RLock()
         self._last_user_chat_at = 0.0
         self._started = False
         self._monitor_dispatch_enabled = False
         self._settings_transition = False
+        self._settings_transition_revision = 0
+        self._config_transition_revision = 0
+        self._consent_request_revision = 0
+        self._consent_revocation_pending = False
+        self._config_revision = 0
+        self._config_reconciled_revision = 0
+        self._config_reconcile_task: asyncio.Task[None] | None = None
+        self._config_reconcile_accepting = False
+        self._config_reconcile_restore_required = False
+        self._config_reconcile_base_error_codes: tuple[str, ...] = ()
+        self._config_reconcile_previous = self.cfg
+        self._config_runtime_error_codes: tuple[str, ...] = ()
+        self._config_restart_required = False
+        self._overlay_applied_config = self.cfg
 
     @lifecycle(id="startup")
     async def startup(self, **_: Any):
-        try:
-            await self._reload_config()
-            await self._load_stats()
-            self._store_writer.start()
-            catalog_started = self._catalog.start()
-            self._ensure_monitor()
-            with self._ownership_lock:
-                self._started = True
-                self._monitor_dispatch_enabled = self.cfg.monitor_on_start
-            monitor_started = self._monitor.start() if self.cfg.monitor_on_start and self._monitor else False
-            overlay_result: dict[str, Any] = {"ok": True, "running": False, "auto_start": False}
-            if self.cfg.overlay_enabled and self.cfg.overlay_auto_start:
-                overlay_result = await asyncio.to_thread(self._overlay.start)
-        except BaseException:
+        startup_request = self._request_lifecycle()
+        async with self._lifecycle_actions():
+            if not self._is_current_lifecycle_request(startup_request):
+                return Err(SdkError("startup superseded by another lifecycle transition"))
+            startup_generation = self._begin_startup()
             try:
-                await self.shutdown()
-            except BaseException as cleanup_exc:
-                self.logger.warning(
-                    "Hearthstone startup rollback failed code=%s",
-                    type(cleanup_exc).__name__,
+                async with self._settings_actions():
+                    with self._ownership_lock:
+                        startup_config_revision = int(
+                            getattr(self, "_config_revision", 0)
+                        )
+                        startup_previous_config = self.cfg
+                    updated = await self._read_effective_config()
+                    self._require_current_startup(startup_generation)
+                    previous_overlay, overlay_was_running = (
+                        self._capture_startup_overlay_state()
+                    )
+                    self._configure_startup_runtime(
+                        updated,
+                        expected_config_revision=startup_config_revision,
+                    )
+                    self._restore_startup_context_if_needed(
+                        startup_previous_config,
+                        self.cfg,
+                    )
+                    await self._reconcile_startup_overlay(
+                        previous_overlay,
+                        self.cfg,
+                        was_running=overlay_was_running,
+                    )
+                    self._require_current_startup(startup_generation)
+                self._require_current_startup(startup_generation)
+                await self._load_stats()
+                self._require_current_startup(startup_generation)
+                writer_started = self._store_writer.start()
+                if not self._worker_accepting(self._store_writer, writer_started):
+                    raise RuntimeError("statistics Store writer did not start")
+                self._require_current_startup(startup_generation)
+                self._ensure_monitor()
+                self._require_current_startup(startup_generation)
+                with self._ownership_lock:
+                    self._require_current_startup_locked(startup_generation)
+                    self._config_reconcile_accepting = True
+                    reconcile_pending = int(getattr(self, "_config_revision", 0)) > int(
+                        getattr(self, "_config_reconciled_revision", 0)
+                    )
+                if reconcile_pending:
+                    self._schedule_config_reconcile()
+                    await self._wait_for_config_reconcile()
+                    self._require_current_startup(startup_generation)
+                catalog_started = self._catalog.start()
+                self._require_current_startup(startup_generation)
+                with self._ownership_lock:
+                    self._require_current_startup_locked(startup_generation)
+                    self._started = True
+                    self._monitor_dispatch_enabled = self.cfg.monitor_on_start
+                monitor_started = (
+                    self._monitor.start()
+                    if self.cfg.monitor_on_start and self._monitor
+                    else False
                 )
-            raise
-        self.logger.info(
-            "Hearthstone companion ready monitor=%s overlay=%s llm=%s consent=%s",
-            bool(self._monitor and self._monitor.status().monitor_running),
-            bool(overlay_result.get("running")),
-            self.cfg.llm_commentary_enabled,
-            self.cfg.llm_data_consent,
-        )
-        return Ok(
-            {
-                "status": "ready",
-                "monitor_started": monitor_started,
-                "overlay": overlay_result,
-                "card_catalog_started": catalog_started,
-                "llm_enabled": self.cfg.llm_commentary_enabled and self.cfg.llm_data_consent,
-            }
-        )
+                if (
+                    self.cfg.monitor_on_start
+                    and self._monitor is not None
+                    and not self._worker_accepting(self._monitor, monitor_started)
+                ):
+                    raise RuntimeError("Hearthstone log monitor did not start")
+                self._require_current_startup(startup_generation)
+                overlay_result: dict[str, Any] = {
+                    "ok": True,
+                    "running": False,
+                    "auto_start": False,
+                }
+                if self.cfg.overlay_enabled and self.cfg.overlay_auto_start:
+                    overlay_result = await asyncio.to_thread(self._overlay.start)
+                    self._require_current_startup(startup_generation)
+            except _StartupSuperseded:
+                self._clear_current_startup_task()
+                return Err(SdkError("startup superseded by another lifecycle transition"))
+            except asyncio.CancelledError:
+                if not self._is_current_startup(startup_generation):
+                    self._clear_current_startup_task()
+                    return Err(SdkError("startup superseded by another lifecycle transition"))
+                try:
+                    await self._rollback_startup(startup_generation)
+                finally:
+                    self._clear_current_startup_task()
+                raise
+            except BaseException:
+                try:
+                    await self._rollback_startup(startup_generation)
+                except BaseException as cleanup_exc:
+                    self.logger.warning(
+                        "Hearthstone startup rollback failed code=%s",
+                        type(cleanup_exc).__name__,
+                    )
+                finally:
+                    self._clear_current_startup_task()
+                raise
+            self._finish_current_startup(startup_generation)
+            self.logger.info(
+                "Hearthstone companion ready monitor=%s overlay=%s llm=%s consent=%s",
+                bool(self._monitor and self._monitor.status().monitor_running),
+                bool(overlay_result.get("running")),
+                self.cfg.llm_commentary_enabled,
+                self.cfg.llm_data_consent,
+            )
+            return Ok(
+                {
+                    "status": "ready",
+                    "monitor_started": monitor_started,
+                    "overlay": overlay_result,
+                    "card_catalog_started": catalog_started,
+                    "llm_enabled": self.cfg.llm_commentary_enabled
+                    and self.cfg.llm_data_consent,
+                }
+            )
 
     @lifecycle(id="shutdown")
     async def shutdown(self, **_: Any):
-        with self._ownership_lock:
-            self._started = False
-            self._monitor_dispatch_enabled = False
-            self._settings_transition = True
+        shutdown_request = self._request_lifecycle()
+        _claimed, reconcile_task = self._begin_shutdown(
+            expected_lifecycle_request=shutdown_request,
+        )
+        cleanup_task = asyncio.create_task(
+            self._complete_shutdown(shutdown_request, reconcile_task),
+            name="hearthstone-shutdown-cleanup",
+        )
+        return await self._await_cleanup_despite_cancellation(cleanup_task)
 
+    async def _complete_shutdown(
+        self,
+        shutdown_request: int,
+        reconcile_task: asyncio.Task[None] | None,
+    ):
+        async with self._lifecycle_actions():
+            claimed, latest_reconcile_task = self._begin_shutdown(
+                expected_lifecycle_request=shutdown_request,
+            )
+            if not claimed:
+                return Ok({"status": "superseded", "cleanup_skipped": True})
+            reconcile_tasks = tuple(
+                task
+                for index, task in enumerate((reconcile_task, latest_reconcile_task))
+                if task is not None
+                and task not in (reconcile_task, latest_reconcile_task)[:index]
+            )
+            return await self._shutdown_runtime(reconcile_tasks)
+
+    async def _await_cleanup_despite_cancellation(self, cleanup_task: asyncio.Task[Any]):
+        try:
+            return await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            cleanup_error_observed = False
+            while not cleanup_task.done():
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    if cleanup_task.cancelled():
+                        break
+                    continue
+                except BaseException as cleanup_exc:
+                    cleanup_error_observed = True
+                    self.logger.warning(
+                        "Hearthstone lifecycle cleanup failed after cancellation code=%s",
+                        type(cleanup_exc).__name__,
+                    )
+                    break
+            if (
+                cleanup_task.done()
+                and not cleanup_task.cancelled()
+                and not cleanup_error_observed
+            ):
+                try:
+                    cleanup_task.result()
+                except BaseException as cleanup_exc:
+                    self.logger.warning(
+                        "Hearthstone lifecycle cleanup ended with error code=%s",
+                        type(cleanup_exc).__name__,
+                    )
+            raise
+
+    async def _shutdown_runtime(
+        self,
+        reconcile_tasks: tuple[asyncio.Task[None], ...],
+    ):
         cleanup_errors: list[str] = []
+        overlay_manager = getattr(self, "_overlay", None)
+        suspend_overlay = getattr(overlay_manager, "suspend_starts", None)
+        if callable(suspend_overlay):
+            try:
+                suspend_overlay()
+            except Exception as exc:
+                cleanup_errors.append(f"overlay start suspension failed: {type(exc).__name__}")
+        for reconcile_task in reconcile_tasks:
+            if reconcile_task.done():
+                continue
+            reconcile_task.cancel()
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(reconcile_task),
+                    timeout=_SHUTDOWN_CONFIG_RECONCILE_BUDGET_SECONDS,
+                )
+            except asyncio.CancelledError:
+                pass
+            except TimeoutError:
+                cleanup_errors.append("configuration reconcile task did not stop")
+            except Exception as exc:
+                cleanup_errors.append(
+                    f"configuration reconcile stop failed: {type(exc).__name__}"
+                )
         context_restored = self._restore_context()
         if not context_restored:
             cleanup_errors.append("previous character context restore was rejected")
@@ -346,143 +589,349 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
 
     @lifecycle(id="config_change")
     async def config_change(self, new_config: Any = None, **_: Any):
-        async with self._settings_actions():
-            if isinstance(new_config, Mapping):
-                section = new_config.get(_CONFIG_SECTION)
-                if not isinstance(section, Mapping):
-                    raise RuntimeError("Hearthstone config update is missing its config section")
+        """Accept the host's effective config without blocking its command loop."""
+        section = new_config.get(_CONFIG_SECTION) if isinstance(new_config, Mapping) else None
+        valid = isinstance(section, Mapping)
+        with self._ownership_lock:
+            previous = self.cfg
+            if valid:
                 updated = CompanionConfig.from_mapping(section)
-                context_restored = await self._apply_reloaded_config_locked(updated)
+                if updated.llm_commentary_enabled and not updated.llm_data_consent:
+                    updated.llm_commentary_enabled = False
+                base_errors: tuple[str, ...] = ()
             else:
-                reloaded = await self._reload_config_locked()
-                if not reloaded:
-                    raise RuntimeError("Hearthstone config update could not be loaded")
-                context_restored = True
-        return Ok({"status": "reloaded", "context_restored": context_restored})
+                fail_closed_values = previous.to_dict()
+                fail_closed_values.update(
+                    {"llm_commentary_enabled": False, "llm_data_consent": False}
+                )
+                updated = CompanionConfig.from_mapping(fail_closed_values)
+                base_errors = ("config:invalid_effective_section",)
 
-    async def _reload_config(self) -> bool:
-        async with self._settings_actions():
-            return await self._reload_config_locked()
+            if (
+                getattr(self, "_consent_revocation_pending", False)
+                and updated.llm_data_consent
+            ):
+                fail_closed_values = updated.to_dict()
+                fail_closed_values.update(
+                    {"llm_commentary_enabled": False, "llm_data_consent": False}
+                )
+                updated = CompanionConfig.from_mapping(fail_closed_values)
+            if previous.llm_data_consent and not updated.llm_data_consent:
+                self._consent_request_revision = int(
+                    getattr(self, "_consent_request_revision", 0)
+                ) + 1
 
-    async def _reload_config_locked(self) -> bool:
+            context_target = getattr(self, "_context_target", None)
+            restore_required = context_target is not None and (
+                not updated.llm_data_consent
+                or self._stable_target(updated) != context_target
+                or updated.log_path != previous.log_path
+            )
+            self.cfg = updated
+            self._settings_transition = True
+            self._settings_transition_revision = int(
+                getattr(self, "_settings_transition_revision", 0)
+            ) + 1
+            self._config_transition_revision = self._settings_transition_revision
+            self._config_revision = int(getattr(self, "_config_revision", 0)) + 1
+            revision = self._config_revision
+            self._config_reconcile_previous = previous
+            self._config_reconcile_restore_required = bool(
+                getattr(self, "_config_reconcile_restore_required", False)
+                or restore_required
+            )
+            self._config_reconcile_base_error_codes = base_errors
+            if base_errors:
+                self._config_runtime_error_codes = base_errors
+                self._config_restart_required = True
+
+        scheduled = self._schedule_config_reconcile()
+        return Ok(
+            {
+                "status": "accepted" if valid else "degraded",
+                "revision": revision,
+                "reconcile_scheduled": scheduled,
+                "restart_required": not valid,
+            }
+        )
+
+    async def _read_effective_config(self) -> CompanionConfig:
         try:
             dumped = await self.config.dump(timeout=5.0)
         except Exception as exc:
-            self.logger.warning("Hearthstone config load failed code=%s", type(exc).__name__)
-            return False
-        if not isinstance(dumped, Mapping) or not isinstance(dumped.get(_CONFIG_SECTION), Mapping):
-            self.logger.warning("Hearthstone config load failed code=InvalidSection")
-            return False
-        base = dict(dumped[_CONFIG_SECTION])
-        updated = CompanionConfig.from_mapping(base)
-        await self._apply_reloaded_config_locked(updated)
-        return True
-
-    async def _apply_reloaded_config_locked(self, updated: CompanionConfig) -> bool:
+            raise RuntimeError(
+                f"Hearthstone config load failed: {type(exc).__name__}"
+            ) from exc
+        section = dumped.get(_CONFIG_SECTION) if isinstance(dumped, Mapping) else None
+        if not isinstance(section, Mapping):
+            raise RuntimeError("Hearthstone config load failed: InvalidSection")
+        updated = CompanionConfig.from_mapping(section)
         if updated.llm_commentary_enabled and not updated.llm_data_consent:
             updated.llm_commentary_enabled = False
+        return updated
+
+    def _configure_startup_runtime(
+        self,
+        updated: CompanionConfig,
+        *,
+        expected_config_revision: int,
+    ) -> CompanionConfig:
         with self._ownership_lock:
-            previous = self.cfg
-            resolved_target = self._stable_target(updated)
-            restore_needed = self._context_target is not None and (
-                not updated.llm_data_consent
-                or resolved_target != self._context_target
-                or updated.log_path != previous.log_path
-            )
-            revoking_consent = previous.llm_data_consent and not updated.llm_data_consent
-            overlay_status = getattr(self._overlay, "status", None)
-            current_overlay_status = overlay_status() if callable(overlay_status) else {}
-            overlay_was_running = bool(
-                isinstance(current_overlay_status, Mapping)
-                and current_overlay_status.get("running")
-            )
-            self._settings_transition = True
-            fail_closed_values = updated.to_dict()
-            fail_closed_values.update(
-                {"llm_commentary_enabled": False, "llm_data_consent": False}
-            )
-            fail_closed = CompanionConfig.from_mapping(fail_closed_values)
-        context_restored = True
-        restore_attempted = False
-        try:
-            if revoking_consent:
-                with self._ownership_lock:
-                    self.cfg = fail_closed
-                    if self._monitor is not None:
-                        self._monitor.update_config(fail_closed)
-            restore_attempted = True
-            context_restored = not restore_needed or self._restore_context()
-            if not context_restored and not revoking_consent:
-                raise RuntimeError("could not restore the previous Hearthstone character context")
-            with self._ownership_lock:
+            if int(getattr(self, "_config_revision", 0)) == expected_config_revision:
                 self.cfg = updated
-                catalog = getattr(self, "_catalog", None)
-                if catalog is not None:
-                    catalog.configure(
-                        network_enabled=updated.card_catalog_network_enabled,
-                        refresh_hours=updated.card_catalog_refresh_hours,
+            else:
+                updated = self.cfg
+            self._settings_transition = True
+            self._settings_transition_revision = int(
+                getattr(self, "_settings_transition_revision", 0)
+            ) + 1
+            transition_revision = self._settings_transition_revision
+        errors: list[str] = []
+        monitor = getattr(self, "_monitor", None)
+        if monitor is not None:
+            try:
+                self._update_monitor_config(monitor, updated)
+            except Exception as exc:
+                errors.append(f"monitor:{type(exc).__name__}")
+        catalog = getattr(self, "_catalog", None)
+        if catalog is not None:
+            try:
+                catalog.configure(
+                    network_enabled=updated.card_catalog_network_enabled,
+                    refresh_hours=updated.card_catalog_refresh_hours,
+                )
+            except Exception as exc:
+                errors.append(f"catalog:{type(exc).__name__}")
+        overlay = getattr(self, "_overlay", None)
+        if overlay is not None:
+            try:
+                overlay.configure(updated)
+                resume_overlay = getattr(overlay, "resume_starts", None)
+                if callable(resume_overlay):
+                    resume_overlay()
+            except Exception as exc:
+                errors.append(f"overlay_config:{type(exc).__name__}")
+        with self._ownership_lock:
+            self._config_runtime_error_codes = tuple(errors)
+            self._config_restart_required = bool(errors)
+            if int(getattr(self, "_settings_transition_revision", 0)) == (
+                transition_revision
+            ):
+                self._settings_transition = False
+            if not errors:
+                self._overlay_applied_config = updated
+        if errors:
+            raise RuntimeError(
+                "Hearthstone startup config apply failed: " + "; ".join(errors)
+            )
+        return updated
+
+    async def _reload_config(self) -> bool:
+        async with self._settings_actions():
+            with self._ownership_lock:
+                read_config_revision = int(getattr(self, "_config_revision", 0))
+            try:
+                updated = await self._read_effective_config()
+            except Exception as exc:
+                self.logger.warning("Hearthstone config load failed code=%s", type(exc).__name__)
+                return False
+            with self._ownership_lock:
+                if int(getattr(self, "_config_revision", 0)) != read_config_revision:
+                    return True
+                if (
+                    getattr(self, "_consent_revocation_pending", False)
+                    and updated.llm_data_consent
+                ):
+                    fail_closed_values = updated.to_dict()
+                    fail_closed_values.update(
+                        {"llm_commentary_enabled": False, "llm_data_consent": False}
                     )
-                self._overlay.configure(updated)
-                if self._monitor is not None:
-                    self._monitor.update_config(updated)
-            await self._restart_running_overlay(
+                    updated = CompanionConfig.from_mapping(fail_closed_values)
+                previous = self.cfg
+                restore_required = self._context_target is not None and (
+                    not updated.llm_data_consent
+                    or self._stable_target(updated) != self._context_target
+                    or updated.log_path != previous.log_path
+                )
+                self.cfg = updated
+                self._settings_transition = True
+                self._settings_transition_revision = int(
+                    getattr(self, "_settings_transition_revision", 0)
+                ) + 1
+                transition_revision = self._settings_transition_revision
+            errors, _context_restored = await self._apply_runtime_config_best_effort(
                 previous,
                 updated,
-                was_running=overlay_was_running,
+                restore_required=restore_required,
             )
-        except BaseException:
-            if revoking_consent:
+            with self._ownership_lock:
+                self._config_runtime_error_codes = tuple(errors)
+                self._config_restart_required = bool(errors)
+                if int(getattr(self, "_settings_transition_revision", 0)) == (
+                    transition_revision
+                ):
+                    self._settings_transition = False
+            self._sync_active_game_context()
+            return True
+
+    def _schedule_config_reconcile(self) -> bool:
+        if not getattr(self, "_config_reconcile_accepting", True):
+            return False
+        task = getattr(self, "_config_reconcile_task", None)
+        if task is not None and not task.done():
+            cancelling = getattr(task, "cancelling", None)
+            if not callable(cancelling) or not cancelling():
+                return True
+        task = asyncio.get_running_loop().create_task(
+            self._reconcile_config_changes(),
+            name="hearthstone-config-reconcile",
+        )
+        self._config_reconcile_task = task
+        task.add_done_callback(self._clear_config_reconcile_task)
+        return True
+
+    def _clear_config_reconcile_task(self, completed: asyncio.Task[None]) -> None:
+        with self._ownership_lock:
+            if getattr(self, "_config_reconcile_task", None) is completed:
+                self._config_reconcile_task = None
+
+    async def _wait_for_config_reconcile(self) -> None:
+        task = getattr(self, "_config_reconcile_task", None)
+        if task is not None:
+            await asyncio.shield(task)
+
+    async def _reconcile_config_changes(self) -> None:
+        try:
+            while True:
+                async with self._settings_actions():
+                    with self._ownership_lock:
+                        if not getattr(self, "_config_reconcile_accepting", True):
+                            return
+                        revision = int(getattr(self, "_config_revision", 0))
+                        previous = getattr(self, "_config_reconcile_previous", self.cfg)
+                        updated = self.cfg
+                        restore_required = bool(
+                            getattr(self, "_config_reconcile_restore_required", False)
+                        )
+                        self._config_reconcile_restore_required = False
+                        base_errors = tuple(
+                            getattr(self, "_config_reconcile_base_error_codes", ())
+                        )
+                        transition_revision = int(
+                            getattr(self, "_config_transition_revision", 0)
+                        )
+                    errors, _context_restored = await self._apply_runtime_config_best_effort(
+                        previous,
+                        updated,
+                        restore_required=restore_required,
+                        base_errors=base_errors,
+                    )
+
                 with self._ownership_lock:
-                    self.cfg = fail_closed
+                    self._config_reconciled_revision = max(
+                        int(getattr(self, "_config_reconciled_revision", 0)),
+                        revision,
+                    )
+                    if int(getattr(self, "_config_revision", 0)) != revision:
+                        continue
+                    self._config_runtime_error_codes = tuple(errors)
+                    self._config_restart_required = bool(errors)
+                    if int(getattr(self, "_settings_transition_revision", 0)) == (
+                        transition_revision
+                    ):
+                        self._settings_transition = False
+                if errors:
+                    self.logger.warning(
+                        "Hearthstone config accepted with runtime errors: %s",
+                        "; ".join(errors),
+                    )
+                self._sync_active_game_context()
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            with self._ownership_lock:
+                self._config_runtime_error_codes = (
+                    f"reconcile:{type(exc).__name__}",
+                )
+                self._config_restart_required = True
+                if int(getattr(self, "_settings_transition_revision", 0)) == int(
+                    getattr(self, "_config_transition_revision", 0)
+                ):
+                    self._settings_transition = False
+            self.logger.warning(
+                "Hearthstone config reconcile failed code=%s",
+                type(exc).__name__,
+            )
+
+    async def _apply_runtime_config_best_effort(
+        self,
+        previous: CompanionConfig,
+        updated: CompanionConfig,
+        *,
+        restore_required: bool,
+        base_errors: tuple[str, ...] = (),
+    ) -> tuple[list[str], bool]:
+        errors = list(base_errors)
+        context_restored = True
+        if restore_required:
+            try:
+                context_restored = self._restore_context()
+            except Exception as exc:
+                context_restored = False
+                errors.append(f"context_restore:{type(exc).__name__}")
+            else:
+                if not context_restored:
+                    errors.append("context_restore:rejected")
+
+        monitor = getattr(self, "_monitor", None)
+        if monitor is not None:
+            try:
+                self._update_monitor_config(monitor, updated)
+            except Exception as exc:
+                errors.append(f"monitor:{type(exc).__name__}")
+
+        catalog = getattr(self, "_catalog", None)
+        if catalog is not None:
+            try:
+                catalog.configure(
+                    network_enabled=updated.card_catalog_network_enabled,
+                    refresh_hours=updated.card_catalog_refresh_hours,
+                )
+            except Exception as exc:
+                errors.append(f"catalog:{type(exc).__name__}")
+
+        overlay = getattr(self, "_overlay", None)
+        overlay_configured = False
+        overlay_was_running = False
+        if overlay is not None:
+            try:
+                status = overlay.status()
+                overlay_was_running = bool(
+                    isinstance(status, Mapping) and status.get("running")
+                )
+            except Exception as exc:
+                errors.append(f"overlay_status:{type(exc).__name__}")
+            try:
+                overlay.configure(updated)
+                overlay_configured = True
+            except Exception as exc:
+                errors.append(f"overlay_config:{type(exc).__name__}")
+
+        previous_overlay = getattr(self, "_overlay_applied_config", previous)
+        if overlay_configured:
+            try:
+                await self._restart_running_overlay(
+                    previous_overlay,
+                    updated,
+                    was_running=overlay_was_running,
+                )
+            except Exception as exc:
+                errors.append(f"overlay_runtime:{exc}")
             else:
                 with self._ownership_lock:
-                    self.cfg = previous
-                catalog = getattr(self, "_catalog", None)
-                if catalog is not None:
-                    try:
-                        catalog.configure(
-                            network_enabled=previous.card_catalog_network_enabled,
-                            refresh_hours=previous.card_catalog_refresh_hours,
-                        )
-                    except Exception as rollback_exc:
-                        self.logger.warning(
-                            "Hearthstone catalog config rollback failed code=%s",
-                            type(rollback_exc).__name__,
-                        )
-                try:
-                    self._overlay.configure(previous)
-                except Exception as rollback_exc:
-                    self.logger.warning(
-                        "Hearthstone overlay config rollback failed code=%s",
-                        type(rollback_exc).__name__,
-                    )
-                if self._monitor is not None:
-                    try:
-                        self._monitor.update_config(previous)
-                    except Exception as rollback_exc:
-                        self.logger.warning(
-                            "Hearthstone monitor config rollback failed code=%s",
-                            type(rollback_exc).__name__,
-                        )
-            raise
-        finally:
-            if revoking_consent and restore_needed and not restore_attempted:
-                try:
-                    context_restored = self._restore_context()
-                except Exception as exc:
-                    context_restored = False
-                    self.logger.warning(
-                        "Hearthstone consent cleanup failed code=%s",
-                        type(exc).__name__,
-                    )
-            with self._ownership_lock:
-                self._settings_transition = False
-            self._sync_active_game_context()
-        if not context_restored:
-            self.logger.warning(
-                "Hearthstone consent was revoked but previous context cleanup was rejected"
-            )
-        return context_restored
+                    self._overlay_applied_config = updated
+        return errors, context_restored
 
     async def _load_stats(self) -> None:
         if self._stats_loaded:
@@ -512,6 +961,9 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         return await self.store.set(_BATTLEGROUNDS_STATS_KEY, value)
 
     def _record_battlegrounds_result(self, event: GameEvent, snapshot: GameSnapshot) -> None:
+        access_reason, _revision = _live_state_access(self, require_consent=False)
+        if access_reason:
+            return
         placement = int(event.details.get("placement") or 0)
         variant = str(event.details.get("variant") or "solo")
         hero_id = str(event.details.get("hero_card_id") or "unknown-hero")[:128]
@@ -527,8 +979,33 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 placement=placement,
                 hero_id=hero_id,
             )
-            if not self._store_writer.submit(self._stats.to_store_dict()):
+            recovery_lock = getattr(
+                self,
+                "_stats_recovery_lock",
+                self._stats_submission_lock,
+            )
+            with recovery_lock:
+                recovery_generation = int(
+                    getattr(self, "_stats_recovery_generation", 0)
+                )
+            if not self._store_writer.submit(
+                self._stats.to_store_dict(),
+                on_success=lambda: self._confirm_stats_recovery(recovery_generation),
+            ):
                 self.logger.warning("Battlegrounds statistics Store writer is unavailable")
+
+    def _confirm_stats_recovery(self, generation: int) -> None:
+        recovery_lock = getattr(
+            self,
+            "_stats_recovery_lock",
+            self._stats_submission_lock,
+        )
+        with recovery_lock:
+            if (
+                int(getattr(self, "_stats_recovery_generation", 0)) == generation
+                and self._stats_store_error_code == "stats:clear_compensation_unconfirmed"
+            ):
+                self._stats_store_error_code = ""
 
     def _clear_battlegrounds_stats(self) -> bool:
         with self._stats_submission_lock:
@@ -542,30 +1019,101 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 self._stats.to_store_dict(),
                 timeout=_STATS_CLEAR_WRITE_TIMEOUT_SECONDS,
             ):
-                self._stats_store_error_code = ""
+                recovery_lock = getattr(
+                    self,
+                    "_stats_recovery_lock",
+                    self._stats_submission_lock,
+                )
+                with recovery_lock:
+                    self._stats_store_error_code = ""
                 return True
             self._stats = BattlegroundsStats.from_store_dict(previous)
             if not self._store_writer.write_and_wait(
                 previous,
                 timeout=_STATS_CLEAR_WRITE_TIMEOUT_SECONDS,
             ):
-                self._stats_store_error_code = "stats:clear_compensation_unconfirmed"
+                recovery_lock = getattr(
+                    self,
+                    "_stats_recovery_lock",
+                    self._stats_submission_lock,
+                )
+                with recovery_lock:
+                    self._stats_recovery_generation = (
+                        int(getattr(self, "_stats_recovery_generation", 0)) + 1
+                    )
+                    self._stats_store_error_code = (
+                        "stats:clear_compensation_unconfirmed"
+                    )
                 self.logger.warning("Battlegrounds statistics Store compensation was not confirmed")
             else:
-                self._stats_store_error_code = ""
+                recovery_lock = getattr(
+                    self,
+                    "_stats_recovery_lock",
+                    self._stats_submission_lock,
+                )
+                with recovery_lock:
+                    self._stats_store_error_code = ""
             return False
 
     def _ensure_monitor(self) -> CompanionMonitor:
-        if self._monitor is None:
-            self._monitor = CompanionMonitor(
-                self.cfg,
-                self.logger,
-                on_llm=self._dispatch_llm,
-                on_status=self.report_status,
-                on_result=self._record_battlegrounds_result,
-                on_event=self._observe_game_event,
-            )
-        return self._monitor
+        monitor = getattr(self, "_monitor", None)
+        if monitor is not None:
+            return monitor
+        creation_lock = getattr(self, "_monitor_creation_lock", None)
+        if creation_lock is None:
+            with self._ownership_lock:
+                creation_lock = getattr(self, "_monitor_creation_lock", None)
+                if creation_lock is None:
+                    creation_lock = threading.Lock()
+                    self._monitor_creation_lock = creation_lock
+        with creation_lock:
+            while True:
+                with self._ownership_lock:
+                    monitor = getattr(self, "_monitor", None)
+                    if monitor is not None:
+                        return monitor
+                    config = CompanionConfig.from_mapping(self.cfg.to_dict())
+                candidate = CompanionMonitor(
+                    config,
+                    self.logger,
+                    on_llm=self._dispatch_llm,
+                    on_status=self.report_status,
+                    on_result=self._record_battlegrounds_result,
+                    on_event=self._observe_game_event,
+                )
+                with self._ownership_lock:
+                    monitor = getattr(self, "_monitor", None)
+                    if monitor is not None:
+                        return monitor
+                    if self.cfg.to_dict() != config.to_dict():
+                        continue
+                    self._monitor = candidate
+                    self._monitor_applied_instance = candidate
+                    self._monitor_applied_config = CompanionConfig.from_mapping(
+                        config.to_dict()
+                    )
+                    return candidate
+
+    def _mark_monitor_config_applied(
+        self,
+        monitor: CompanionMonitor,
+        config: CompanionConfig,
+    ) -> bool:
+        applied = CompanionConfig.from_mapping(config.to_dict())
+        with self._ownership_lock:
+            if getattr(self, "_monitor", None) is not monitor:
+                return False
+            self._monitor_applied_instance = monitor
+            self._monitor_applied_config = applied
+            return True
+
+    def _update_monitor_config(
+        self,
+        monitor: CompanionMonitor,
+        config: CompanionConfig,
+    ) -> None:
+        monitor.update_config(config)
+        self._mark_monitor_config_applied(monitor, config)
 
     def _monitor_actions(self) -> asyncio.Lock:
         lock = getattr(self, "_monitor_action_lock", None)
@@ -573,6 +1121,122 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             lock = asyncio.Lock()
             self._monitor_action_lock = lock
         return lock
+
+    def _lifecycle_actions(self) -> asyncio.Lock:
+        lock = getattr(self, "_lifecycle_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._lifecycle_lock = lock
+        return lock
+
+    def _begin_startup(self) -> int:
+        task = asyncio.current_task()
+        with self._ownership_lock:
+            generation = int(getattr(self, "_lifecycle_generation", 0)) + 1
+            self._lifecycle_generation = generation
+            self._startup_task = task
+            self._started = False
+            self._monitor_dispatch_enabled = False
+        return generation
+
+    def _request_lifecycle(self) -> int:
+        with self._ownership_lock:
+            request = int(getattr(self, "_lifecycle_request_sequence", 0)) + 1
+            self._lifecycle_request_sequence = request
+            self._latest_lifecycle_request = request
+            return request
+
+    def _is_current_lifecycle_request(self, request: int) -> bool:
+        with self._ownership_lock:
+            return int(getattr(self, "_latest_lifecycle_request", 0)) == request
+
+    def _is_current_startup(self, generation: int) -> bool:
+        with self._ownership_lock:
+            return int(getattr(self, "_lifecycle_generation", 0)) == generation
+
+    @staticmethod
+    def _worker_accepting(worker: Any, started: Any) -> bool:
+        checker = getattr(worker, "is_accepting", None)
+        if not callable(checker):
+            return bool(started)
+        try:
+            return bool(checker())
+        except Exception:
+            return False
+
+    def _require_current_startup_locked(self, generation: int) -> None:
+        if int(getattr(self, "_lifecycle_generation", 0)) != generation:
+            raise _StartupSuperseded
+
+    def _require_current_startup(self, generation: int) -> None:
+        with self._ownership_lock:
+            self._require_current_startup_locked(generation)
+
+    def _clear_current_startup_task(self) -> None:
+        task = asyncio.current_task()
+        with self._ownership_lock:
+            if getattr(self, "_startup_task", None) is task:
+                self._startup_task = None
+
+    def _finish_current_startup(self, generation: int) -> None:
+        task = asyncio.current_task()
+        with self._ownership_lock:
+            try:
+                self._require_current_startup_locked(generation)
+            finally:
+                if getattr(self, "_startup_task", None) is task:
+                    self._startup_task = None
+
+    def _begin_shutdown(
+        self,
+        *,
+        expected_startup_generation: int | None = None,
+        expected_lifecycle_request: int | None = None,
+    ) -> tuple[bool, asyncio.Task[None] | None]:
+        current_task = asyncio.current_task()
+        with self._ownership_lock:
+            current_generation = int(getattr(self, "_lifecycle_generation", 0))
+            if (
+                expected_startup_generation is not None
+                and current_generation != expected_startup_generation
+            ):
+                return False, None
+            if (
+                expected_lifecycle_request is not None
+                and int(getattr(self, "_latest_lifecycle_request", 0))
+                != expected_lifecycle_request
+            ):
+                return False, None
+            self._lifecycle_generation = current_generation + 1
+            self._started = False
+            self._monitor_dispatch_enabled = False
+            self._settings_transition = True
+            self._config_reconcile_accepting = False
+            startup_task = getattr(self, "_startup_task", None)
+            reconcile_task = getattr(self, "_config_reconcile_task", None)
+        if (
+            startup_task is not None
+            and startup_task is not current_task
+            and not startup_task.done()
+        ):
+            startup_task.cancel()
+        if reconcile_task is not None and not reconcile_task.done():
+            reconcile_task.cancel()
+        return True, reconcile_task
+
+    async def _rollback_startup(self, generation: int) -> None:
+        claimed, reconcile_task = self._begin_shutdown(
+            expected_startup_generation=generation,
+        )
+        if not claimed:
+            return
+        cleanup_task = asyncio.create_task(
+            self._shutdown_runtime(
+                (reconcile_task,) if reconcile_task is not None else (),
+            ),
+            name="hearthstone-startup-rollback",
+        )
+        await self._await_cleanup_despite_cancellation(cleanup_task)
 
     def _settings_actions(self) -> asyncio.Lock:
         lock = getattr(self, "_settings_lock", None)
@@ -588,7 +1252,9 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         *,
         was_running: bool,
     ) -> None:
-        if not was_running or not _overlay_runtime_changed(previous, updated):
+        if not was_running or (
+            updated.overlay_enabled and not _overlay_runtime_changed(previous, updated)
+        ):
             return
         try:
             stopped = await asyncio.to_thread(self._overlay.stop)
@@ -634,6 +1300,57 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             f"{start_error}; previous overlay "
             + ("was restored" if not recovery_error else "could not be restored")
         )
+
+    def _capture_startup_overlay_state(self) -> tuple[CompanionConfig, bool]:
+        with self._ownership_lock:
+            previous = getattr(self, "_overlay_applied_config", self.cfg)
+        status_getter = getattr(getattr(self, "_overlay", None), "status", None)
+        if not callable(status_getter):
+            return previous, False
+        try:
+            status = status_getter()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Hearthstone startup config apply failed: overlay_status:{type(exc).__name__}"
+            ) from exc
+        return previous, bool(isinstance(status, Mapping) and status.get("running"))
+
+    def _restore_startup_context_if_needed(
+        self,
+        previous: CompanionConfig,
+        updated: CompanionConfig,
+    ) -> None:
+        with self._ownership_lock:
+            target = getattr(self, "_context_target", None)
+            restore_required = target is not None and (
+                not updated.llm_data_consent
+                or self._stable_target(updated) != target
+                or updated.log_path != previous.log_path
+            )
+        if restore_required and not self._restore_context():
+            raise RuntimeError(
+                "Hearthstone startup config apply failed: context_restore:rejected"
+            )
+
+    async def _reconcile_startup_overlay(
+        self,
+        previous: CompanionConfig,
+        updated: CompanionConfig,
+        *,
+        was_running: bool,
+    ) -> None:
+        try:
+            await self._restart_running_overlay(
+                previous,
+                updated,
+                was_running=was_running,
+            )
+        except Exception:
+            with self._ownership_lock:
+                self._overlay_applied_config = previous
+            raise
+        with self._ownership_lock:
+            self._overlay_applied_config = updated
 
     @message(id="chat_quiet_window", source="chat")
     async def on_chat_message(self, **_: Any):
@@ -711,6 +1428,11 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
 
     def _observe_game_event(self, event: GameEvent, snapshot: GameSnapshot) -> None:
         with self._ownership_lock:
+            access_reason, _revision = _live_state_access(self)
+            if access_reason:
+                if access_reason == "llm_data_sharing_not_authorized":
+                    self._restore_context()
+                return
             leaving = event.kind in {
                 "source_reset",
                 "state_stale",
@@ -721,10 +1443,8 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 self._restore_context()
                 return
             if (
-                not self.cfg.llm_data_consent
-                or not self._started
+                not self._started
                 or not self._monitor_dispatch_enabled
-                or getattr(self, "_settings_transition", False)
             ):
                 return
             entering = event.kind in {
@@ -738,20 +1458,27 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 self._inject_context()
 
     def _sync_active_game_context(self) -> None:
+        access_reason, transition_revision = _live_state_access(self)
+        if access_reason:
+            if access_reason == "llm_data_sharing_not_authorized":
+                self._restore_context()
+            return
         monitor = getattr(self, "_monitor", None)
-        snapshot_getter = getattr(monitor, "snapshot", None)
-        if not callable(snapshot_getter):
+        if monitor is None:
             return
         try:
-            snapshot = snapshot_getter()
+            snapshot, runtime, _generation = _capture_monitor(monitor)
         except Exception:
             return
-        if not self.cfg.llm_data_consent:
-            self._restore_context()
+        access_reason, _revision = _live_state_access(
+            self,
+            expected_transition_revision=transition_revision,
+        )
+        if access_reason:
+            if access_reason == "llm_data_sharing_not_authorized":
+                self._restore_context()
             return
-        status_getter = getattr(monitor, "status", None)
         try:
-            runtime = status_getter() if callable(status_getter) else None
             freshness = _state_freshness(snapshot, runtime, captured_at=time.time())
         except Exception:
             self._restore_context()
@@ -787,12 +1514,12 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
 
     def _dispatch_llm(self, prompt: str, event: GameEvent, snapshot: GameSnapshot) -> bool:
         with self._ownership_lock:
+            access_reason, _revision = _live_state_access(self)
             if (
-                not self._started
+                access_reason
+                or not self._started
                 or not self._monitor_dispatch_enabled
-                or getattr(self, "_settings_transition", False)
                 or not self.cfg.llm_commentary_enabled
-                or not self.cfg.llm_data_consent
             ):
                 return False
             if (
@@ -853,8 +1580,9 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
 
     def _dashboard_state(self) -> dict[str, Any]:
         monitor = self._ensure_monitor()
-        runtime = monitor.status().to_dict()
-        game = monitor.snapshot().to_public_dict()
+        snapshot, status, _generation = _capture_monitor(monitor)
+        runtime = status.to_dict()
+        game = snapshot.to_public_dict()
         stats_store_error = self._stats_store_error_code
         writer_error = getattr(self._store_writer, "last_error_code", None)
         if not stats_store_error and callable(writer_error):
@@ -868,6 +1596,22 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             "overlay": self._overlay.status(),
             "card_catalog": self._catalog_status(),
             "settings": self.cfg.public_dict(),
+            "configuration": {
+                "reconciling": bool(
+                    getattr(self, "_config_reconcile_task", None)
+                    and not self._config_reconcile_task.done()
+                ),
+                "revision": int(getattr(self, "_config_revision", 0)),
+                "reconciled_revision": int(
+                    getattr(self, "_config_reconciled_revision", 0)
+                ),
+                "restart_required": bool(
+                    getattr(self, "_config_restart_required", False)
+                ),
+                "runtime_error_codes": list(
+                    getattr(self, "_config_runtime_error_codes", ())
+                ),
+            },
             "privacy": {
                 "raw_log_uploaded": False,
                 "player_names_retained": False,
@@ -924,6 +1668,8 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 self._monitor_dispatch_enabled = True
             try:
                 started = monitor.start()
+                if not self._worker_accepting(monitor, started):
+                    raise RuntimeError("Hearthstone log monitor did not start")
             except BaseException:
                 with self._ownership_lock:
                     self._monitor_dispatch_enabled = previous_dispatch
@@ -1156,8 +1902,31 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         }
         if llm_data_consent is False:
             submitted["llm_commentary_enabled"] = False
+        with self._ownership_lock:
+            settings_privacy_revision = int(
+                getattr(self, "_consent_request_revision", 0)
+            )
+            if llm_data_consent is not None:
+                settings_privacy_revision += 1
+                self._consent_request_revision = settings_privacy_revision
+                self._consent_revocation_pending = llm_data_consent is False
+            requested_consent_revocation = bool(
+                llm_data_consent is False and self.cfg.llm_data_consent
+            )
+            if llm_data_consent is False:
+                fail_closed_values = self.cfg.to_dict()
+                fail_closed_values.update(
+                    {"llm_commentary_enabled": False, "llm_data_consent": False}
+                )
+                self.cfg = CompanionConfig.from_mapping(fail_closed_values)
+                self._settings_transition = True
+                self._settings_transition_revision = int(
+                    getattr(self, "_settings_transition_revision", 0)
+                ) + 1
         async with self._settings_actions():
+            runtime_errors: list[str] = []
             with self._ownership_lock:
+                settings_config_revision = int(getattr(self, "_config_revision", 0))
                 previous = self.cfg
                 merged = previous.to_dict()
                 merged.update(submitted)
@@ -1171,22 +1940,33 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 normalized = requested.to_dict()
                 submitted = {key: normalized[key] for key in submitted}
                 resolved_target = self._stable_target(requested)
-                revoking_consent = previous.llm_data_consent and not requested.llm_data_consent
+                revoking_consent = requested_consent_revocation or (
+                    previous.llm_data_consent and not requested.llm_data_consent
+                )
                 restore_needed = self._context_target is not None and (
                     not requested.llm_data_consent
                     or resolved_target != self._context_target
                     or requested.log_path != previous.log_path
                 )
+                self._settings_transition = True
+                self._settings_transition_revision = int(
+                    getattr(self, "_settings_transition_revision", 0)
+                ) + 1
+                transition_revision = self._settings_transition_revision
+            try:
                 overlay_status = self._overlay.status()
                 overlay_was_running = bool(
                     isinstance(overlay_status, Mapping) and overlay_status.get("running")
                 )
-                overlay_runtime_changed = _overlay_runtime_changed(previous, requested)
-                self._settings_transition = True
+            except Exception as exc:
+                overlay_was_running = False
+                runtime_errors.append(f"overlay_status:{type(exc).__name__}")
             context_restored = True
             updated = previous
-            runtime_errors: list[str] = []
+            config_superseded = False
             try:
+                fail_closed_monitor: CompanionMonitor | None = None
+                fail_closed_monitor_config: CompanionConfig | None = None
                 with self._ownership_lock:
                     if revoking_consent:
                         fail_closed = previous.to_dict()
@@ -1194,19 +1974,30 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                             {"llm_commentary_enabled": False, "llm_data_consent": False}
                         )
                         self.cfg = CompanionConfig.from_mapping(fail_closed)
-                        try:
-                            self._ensure_monitor().update_config(self.cfg)
-                        except Exception as exc:
-                            self.logger.warning(
-                                "Hearthstone fail-closed monitor update failed code=%s",
-                                type(exc).__name__,
-                            )
+                        fail_closed_monitor = getattr(self, "_monitor", None)
+                        fail_closed_monitor_config = self.cfg
                     context_restored = not restore_needed or self._restore_context()
                     if not context_restored and not revoking_consent:
                         return Err(
                             SdkError(
                                 "could not restore the previous Hearthstone character context"
                             )
+                        )
+                    if not context_restored:
+                        runtime_errors.append("context_restore:rejected")
+                if (
+                    fail_closed_monitor is not None
+                    and fail_closed_monitor_config is not None
+                ):
+                    try:
+                        self._update_monitor_config(
+                            fail_closed_monitor,
+                            fail_closed_monitor_config,
+                        )
+                    except Exception as exc:
+                        self.logger.warning(
+                            "Hearthstone fail-closed monitor update failed code=%s",
+                            type(exc).__name__,
                         )
                 try:
                     persisted = await self._persist_settings_config(submitted)
@@ -1231,40 +2022,84 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     updated.llm_commentary_enabled = False
 
                 with self._ownership_lock:
-                    self.cfg = updated
-                try:
-                    self._ensure_monitor().update_config(updated)
-                except Exception as exc:
-                    runtime_errors.append(f"monitor:{type(exc).__name__}")
-                catalog = getattr(self, "_catalog", None)
-                if catalog is not None:
+                    config_superseded = int(
+                        getattr(self, "_config_revision", 0)
+                    ) != settings_config_revision
+                    if config_superseded:
+                        updated = self.cfg
+                    else:
+                        if (
+                            int(getattr(self, "_consent_request_revision", 0))
+                            != settings_privacy_revision
+                            and not self.cfg.llm_data_consent
+                        ):
+                            fail_closed = updated.to_dict()
+                            fail_closed.update(
+                                {
+                                    "llm_commentary_enabled": False,
+                                    "llm_data_consent": False,
+                                }
+                            )
+                            updated = CompanionConfig.from_mapping(fail_closed)
+                        self.cfg = updated
+                if not config_superseded:
                     try:
-                        catalog.configure(
-                            network_enabled=updated.card_catalog_network_enabled,
-                            refresh_hours=updated.card_catalog_refresh_hours,
-                        )
+                        self._update_monitor_config(self._ensure_monitor(), updated)
                     except Exception as exc:
-                        runtime_errors.append(f"catalog:{type(exc).__name__}")
-                overlay_configured = False
-                try:
-                    self._overlay.configure(updated)
-                    overlay_configured = True
-                except Exception as exc:
-                    runtime_errors.append(f"overlay_config:{type(exc).__name__}")
-                if overlay_configured and overlay_was_running and overlay_runtime_changed:
+                        runtime_errors.append(f"monitor:{type(exc).__name__}")
+                    catalog = getattr(self, "_catalog", None)
+                    if catalog is not None:
+                        try:
+                            catalog.configure(
+                                network_enabled=updated.card_catalog_network_enabled,
+                                refresh_hours=updated.card_catalog_refresh_hours,
+                            )
+                        except Exception as exc:
+                            runtime_errors.append(f"catalog:{type(exc).__name__}")
+                    overlay_configured = False
+                    overlay_runtime_applied = False
                     try:
-                        await self._restart_running_overlay(
-                            previous,
-                            updated,
-                            was_running=True,
-                        )
+                        self._overlay.configure(updated)
+                        overlay_configured = True
                     except Exception as exc:
-                        runtime_errors.append(f"overlay_runtime:{exc}")
+                        runtime_errors.append(f"overlay_config:{type(exc).__name__}")
+                    if (
+                        overlay_configured
+                        and overlay_was_running
+                        and _overlay_runtime_changed(previous, updated)
+                    ):
+                        try:
+                            await self._restart_running_overlay(
+                                previous,
+                                updated,
+                                was_running=True,
+                            )
+                        except Exception as exc:
+                            runtime_errors.append(f"overlay_runtime:{exc}")
+                        else:
+                            overlay_runtime_applied = True
+                    elif overlay_configured:
+                        overlay_runtime_applied = True
+                    if overlay_runtime_applied:
+                        with self._ownership_lock:
+                            self._overlay_applied_config = updated
             finally:
                 with self._ownership_lock:
-                    self._settings_transition = False
+                    if int(getattr(self, "_settings_transition_revision", 0)) == (
+                        transition_revision
+                    ):
+                        self._settings_transition = False
+                    if (
+                        llm_data_consent is False
+                        and int(getattr(self, "_consent_request_revision", 0))
+                        == settings_privacy_revision
+                    ):
+                        self._consent_revocation_pending = False
                 self._sync_active_game_context()
         if runtime_errors:
+            with self._ownership_lock:
+                self._config_runtime_error_codes = tuple(runtime_errors)
+                self._config_restart_required = True
             self.logger.warning(
                 "Hearthstone settings were saved but runtime apply is incomplete: %s",
                 "; ".join(runtime_errors),
@@ -1275,6 +2110,9 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     f"restart the plugin ({'; '.join(runtime_errors)})"
                 )
             )
+        with self._ownership_lock:
+            self._config_runtime_error_codes = ()
+            self._config_restart_required = False
         if not context_restored:
             return Err(
                 SdkError(
@@ -1394,18 +2232,23 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             "if_asked_which_card_to_play_request_visible_candidates": True,
             "do_not_guess_card_names_or_hidden_information": True,
         }
-        if not self.cfg.llm_data_consent:
+
+        def blocked_payload(reason: str) -> dict[str, Any]:
             return {
                 "available": False,
                 "state": {},
                 "privacy_scope": "public_game_state_only",
-                "reason": "llm_data_sharing_not_authorized",
+                "reason": reason,
                 "answer_contract": answer_contract,
             }
+
+        access_reason, transition_revision = _live_state_access(self)
+        if access_reason:
+            return blocked_payload(access_reason)
         monitor = self._ensure_monitor()
-        snapshot = monitor.snapshot()
+        snapshot, runtime, _generation = _capture_monitor(monitor)
         captured_at = time.time()
-        freshness = _state_freshness(snapshot, monitor.status(), captured_at=captured_at)
+        freshness = _state_freshness(snapshot, runtime, captured_at=captured_at)
         has_state = snapshot.phase != "idle"
         live = freshness["source"] == "live"
         result = {
@@ -1422,6 +2265,12 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 "do_not_answer_strategy_from_this_tool": True,
                 "do_not_answer_as_constructed": True,
             }
+        access_reason, _revision = _live_state_access(
+            self,
+            expected_transition_revision=transition_revision,
+        )
+        if access_reason:
+            return blocked_payload(access_reason)
         return result
 
     @llm_tool(
@@ -1475,10 +2324,10 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             "combat_never_implies_current_shop_visibility": True,
             "tone": "warm_companion_with_data",
         }
-        def unauthorized_payload() -> dict[str, Any]:
+        def blocked_payload(reason: str) -> dict[str, Any]:
             return {
                 "available": False,
-                "reason": "llm_data_sharing_not_authorized",
+                "reason": reason,
                 "game_mode": "battlegrounds",
                 "scope": "hearthstone_battlegrounds_only",
                 "answer_contract": answer_contract,
@@ -1487,15 +2336,41 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 ),
             }
 
-        if not self.cfg.llm_data_consent:
-            return unauthorized_payload()
         allowed_topics = {"current_strategy", "season_meta", "hero_performance", "post_game"}
         selected_topic = topic if topic in allowed_topics else "current_strategy"
+        access_reason, transition_revision = _live_state_access(self)
+        if access_reason:
+            return blocked_payload(access_reason)
         monitor = self._ensure_monitor()
-        snapshot = monitor.snapshot()
-        runtime = monitor.status()
+        snapshot, runtime, _generation = _capture_monitor(monitor)
         captured_at = time.time()
         freshness = _state_freshness(snapshot, runtime, captured_at=captured_at)
+        battlegrounds = snapshot.battlegrounds.to_public_dict() if snapshot.battlegrounds else None
+        live_battlegrounds = bool(
+            snapshot.mode == "battlegrounds"
+            and battlegrounds
+            and freshness["source"] == "live"
+        )
+        battlegrounds_phase = str((battlegrounds or {}).get("phase") or "unknown")
+        catalog = getattr(self, "_catalog", None)
+        should_wait_for_catalog = bool(
+            catalog is not None
+            and selected_topic == "current_strategy"
+            and live_battlegrounds
+            and battlegrounds_phase in {"hero_select", "recruit"}
+            and not catalog.status().get("available")
+        )
+        if should_wait_for_catalog:
+            await asyncio.to_thread(catalog.wait_ready, 1.5)
+            access_reason, _revision = _live_state_access(
+                self,
+                expected_transition_revision=transition_revision,
+            )
+            if access_reason:
+                return blocked_payload(access_reason)
+            snapshot, runtime, _generation = _capture_monitor(monitor)
+            captured_at = time.time()
+            freshness = _state_freshness(snapshot, runtime, captured_at=captured_at)
         season_key = str(self._season.get("key") or "local-unversioned")
         local_stats = self._stats.to_public_dict().get("seasons", {}).get(season_key, {})
         battlegrounds = snapshot.battlegrounds.to_public_dict() if snapshot.battlegrounds else None
@@ -1607,17 +2482,18 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             and freshness.get("age_seconds") is not None
             and float(freshness["age_seconds"]) <= LIVE_STATE_MAX_AGE_SECONDS
         )
-        catalog = getattr(self, "_catalog", None)
         catalog_facts_needed = bool(
             catalog is not None
             and selected_topic == "current_strategy"
             and live_battlegrounds
             and battlegrounds_phase in {"hero_select", "recruit"}
         )
-        if catalog_facts_needed and not catalog.status().get("available"):
-            await asyncio.to_thread(catalog.wait_ready, 1.5)
-        if not self.cfg.llm_data_consent:
-            return unauthorized_payload()
+        access_reason, _revision = _live_state_access(
+            self,
+            expected_transition_revision=transition_revision,
+        )
+        if access_reason:
+            return blocked_payload(access_reason)
         if catalog_facts_needed:
             card_catalog = catalog.facts_for(snapshot.battlegrounds)
         elif catalog is not None:
@@ -1694,8 +2570,12 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 "public_game_state_aggregate_local_stats_and_public_card_metadata"
             ),
         }
-        if not self.cfg.llm_data_consent:
-            return unauthorized_payload()
+        access_reason, _revision = _live_state_access(
+            self,
+            expected_transition_revision=transition_revision,
+        )
+        if access_reason:
+            return blocked_payload(access_reason)
         return result
 
 
