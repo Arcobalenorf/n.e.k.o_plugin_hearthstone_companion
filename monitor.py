@@ -73,6 +73,7 @@ class CompanionMonitor:
         self._status.resolved_log_path = ""
         self._status.source_modified_at = 0.0
         self._status.last_line_at = 0.0
+        self._status.last_state_at = 0.0
         self._status.last_event_at = 0.0
         self._status.last_event_kind = ""
         self._status.last_error_code = ""
@@ -221,6 +222,7 @@ class CompanionMonitor:
                         snapshot = self._snapshot
                     else:
                         snapshot = self._parser.snapshot()
+                        state_changed = snapshot != self._snapshot
                         self._snapshot = snapshot
                         active_snapshot = bool(
                             snapshot.game_number > 0
@@ -230,10 +232,9 @@ class CompanionMonitor:
                             activity_at = float(batch.modified_at or now)
                             self._status.last_line_at = min(now, max(0.0, activity_at))
                             self._state_stale_notified = False
-                        activity_at = max(
-                            self._status.last_line_at,
-                            self._status.last_event_at,
-                        )
+                            if state_changed:
+                                self._status.last_state_at = self._status.last_line_at
+                        activity_at = self._status.last_state_at
                         live_active_snapshot = bool(
                             active_snapshot
                             and activity_at > 0

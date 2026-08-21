@@ -9,6 +9,7 @@ import hearthstone_companion_under_test.monitor as monitor_module
 import pytest
 from hearthstone_companion_under_test.config import CompanionConfig
 from hearthstone_companion_under_test.models import (
+    BattlegroundsAreaSnapshot,
     BattlegroundsSnapshot,
     GameEvent,
     GameSnapshot,
@@ -219,6 +220,7 @@ def test_live_state_emits_stale_edge_after_inactivity() -> None:
     monitor._state_ready_notified = True
     monitor._live_context_generation = monitor._source_generation
     monitor._status.last_line_at = time.time() - 301.0
+    monitor._status.last_state_at = monitor._status.last_line_at
     monitor._tailer = _BatchSequence(
         monitor,
         [TailBatch((), Path("Power.log"), bootstrap_complete=True)],
@@ -230,6 +232,71 @@ def test_live_state_emits_stale_edge_after_inactivity() -> None:
         time.sleep(0.01)
     assert monitor.stop(timeout=2.0)
 
+    assert observed == ["state_stale"]
+
+
+def test_unrelated_log_growth_does_not_refresh_battlegrounds_state() -> None:
+    observed: list[str] = []
+    monitor = CompanionMonitor(
+        CompanionConfig(poll_interval_seconds=0.1),
+        _logger(),
+        on_llm=lambda *_args: False,
+        on_event=lambda event, _snapshot: observed.append(event.kind),
+    )
+    active = GameSnapshot(
+        mode="battlegrounds",
+        phase="playing",
+        game_number=1,
+        battlegrounds=BattlegroundsSnapshot(
+            round=6,
+            phase="recruit",
+            areas={
+                "shop": BattlegroundsAreaSnapshot(
+                    complete=True,
+                    revision=7,
+                    observed_at=time.time() - 301.0,
+                    round=6,
+                    phase="recruit",
+                )
+            },
+        ),
+    )
+    monitor._parser = SimpleNamespace(
+        feed_line=lambda _line_value, *, now: [],
+        snapshot=lambda: active,
+        entity_capacity_exceeded=False,
+    )
+    monitor._snapshot = active
+    monitor._bootstrap_complete = True
+    monitor._state_ready_notified = True
+    monitor._live_context_generation = monitor._source_generation
+    stale_at = time.time() - 301.0
+    monitor._status.last_line_at = stale_at
+    monitor._status.last_state_at = stale_at
+    modified_at = time.time()
+    monitor._tailer = _BatchSequence(
+        monitor,
+        [
+            TailBatch(
+                (_line("unrelated diagnostic line"),),
+                Path("Power.log"),
+                bootstrap_complete=True,
+                modified_at=modified_at,
+            )
+        ],
+    )
+
+    assert monitor.start()
+    deadline = time.monotonic() + 2.0
+    while not monitor._stop.is_set() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert monitor.stop(timeout=2.0)
+
+    status = monitor.status()
+    assert status.last_line_at == modified_at
+    assert status.last_state_at == stale_at
+    assert monitor.snapshot().battlegrounds is not None
+    assert monitor.snapshot().battlegrounds.areas["shop"].revision == 7
     assert observed == ["state_stale"]
 
 
@@ -606,6 +673,7 @@ def test_incremental_live_game_emits_stale_without_bootstrap_state_ready() -> No
             return TailBatch(active_lines, Path("Power.log"), bootstrap_complete=True)
         if calls == 3:
             monitor._status.last_line_at = time.time() - 301.0
+            monitor._status.last_state_at = time.time() - 301.0
             monitor._status.last_event_at = time.time() - 301.0
             return TailBatch((), Path("Power.log"), bootstrap_complete=True)
         monitor._stop.set()

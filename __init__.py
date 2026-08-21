@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+import os
 import threading
 import time
+import urllib.request
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -42,6 +46,14 @@ _STATS_CLEAR_WRITE_TIMEOUT_SECONDS = 3.0
 _SHUTDOWN_THREAD_BUDGET_SECONDS = 0.4
 _SHUTDOWN_WRITER_BUDGET_SECONDS = 0.3
 _SHUTDOWN_CONFIG_RECONCILE_BUDGET_SECONDS = 0.25
+_SHUTDOWN_LLM_TOOL_RECOVERY_BUDGET_SECONDS = 0.25
+_LLM_TOOL_HEALTH_INTERVAL_SECONDS = 15.0
+_LLM_TOOL_HEALTH_HTTP_TIMEOUT_SECONDS = 2.0
+_LLM_TOOL_REGISTRY_MAX_BYTES = 1024 * 1024
+_LLM_TOOL_HANDLER_NAMES = {
+    "hearthstone_current_state": "hearthstone_current_state",
+    "hearthstone_battlegrounds_advice": "hearthstone_battlegrounds_advice",
+}
 _OVERLAY_RUNTIME_FIELDS = (
     "overlay_enabled",
     "overlay_window_titles",
@@ -147,9 +159,11 @@ def _overlay_result_error(
 
 def _state_freshness(snapshot: GameSnapshot, runtime: Any, *, captured_at: float) -> dict[str, Any]:
     last_line_at = float(getattr(runtime, "last_line_at", 0.0) or 0.0)
+    has_state_timestamp = hasattr(runtime, "last_state_at")
+    last_state_at = float(getattr(runtime, "last_state_at", 0.0) or 0.0)
     last_event_at = float(getattr(runtime, "last_event_at", 0.0) or 0.0)
     source_modified_at = float(getattr(runtime, "source_modified_at", 0.0) or 0.0)
-    activity_at = max(last_line_at, last_event_at)
+    activity_at = last_state_at if has_state_timestamp else max(last_line_at, last_event_at)
     age_seconds = round(max(0.0, captured_at - activity_at), 3) if activity_at > 0 else None
     source_state = str(getattr(runtime, "source_state", "waiting") or "waiting")
     monitor_running = bool(getattr(runtime, "monitor_running", True))
@@ -166,6 +180,7 @@ def _state_freshness(snapshot: GameSnapshot, runtime: Any, *, captured_at: float
         "source_state": source_state,
         "captured_at": captured_at,
         "last_line_at": last_line_at or None,
+        "last_state_at": last_state_at or None,
         "last_event_at": last_event_at or None,
         "source_modified_at": source_modified_at or None,
         "age_seconds": age_seconds,
@@ -173,6 +188,187 @@ def _state_freshness(snapshot: GameSnapshot, runtime: Any, *, captured_at: float
         "round": snapshot.battlegrounds.round if snapshot.battlegrounds else None,
         "do_not_treat_cached_as_live": not live,
     }
+
+
+def _battlegrounds_area_evidence(
+    battlegrounds: Mapping[str, Any],
+    area_name: str,
+    *,
+    captured_at: float,
+    require_complete: bool = True,
+) -> tuple[list[str], list[str]]:
+    evidence: list[str] = []
+    missing: list[str] = []
+    areas = battlegrounds.get("areas")
+    area = areas.get(area_name) if isinstance(areas, Mapping) else None
+    if not isinstance(area, Mapping):
+        return evidence, [f"{area_name}_area_not_observed"]
+
+    if not require_complete or area.get("complete") is True:
+        evidence.append(f"{area_name}_area_complete")
+    else:
+        missing.append(f"{area_name}_area_incomplete")
+
+    revision = int(area.get("revision") or 0)
+    if revision > 0:
+        evidence.append(f"{area_name}_area_revision_observed")
+    else:
+        missing.append(f"{area_name}_area_revision_missing")
+
+    current_round = int(battlegrounds.get("round") or 0)
+    area_round = int(area.get("round") or 0)
+    if current_round > 0 and area_round == current_round:
+        evidence.append(f"{area_name}_area_current_round")
+    else:
+        missing.append(f"{area_name}_area_round_mismatch")
+
+    current_phase = str(battlegrounds.get("phase") or "unknown")
+    area_phase = str(area.get("phase") or "unknown")
+    if current_phase != "unknown" and area_phase == current_phase:
+        evidence.append(f"{area_name}_area_current_phase")
+    else:
+        missing.append(f"{area_name}_area_phase_mismatch")
+
+    try:
+        observed_at = float(area.get("observed_at") or 0.0)
+    except (TypeError, ValueError):
+        observed_at = 0.0
+    if (
+        observed_at > 0
+        and max(0.0, captured_at - observed_at) <= LIVE_STATE_MAX_AGE_SECONDS
+    ):
+        evidence.append(f"{area_name}_area_fresh")
+    else:
+        missing.append(f"{area_name}_area_stale_or_unobserved")
+    return evidence, missing
+
+
+def _catalog_coverage_evidence(
+    card_catalog: Mapping[str, Any],
+    candidates: list[Mapping[str, Any]],
+    *,
+    label: str,
+) -> tuple[list[str], list[str], list[str]]:
+    evidence: list[str] = []
+    missing: list[str] = []
+    identifiers: list[str] = []
+    identity_missing = False
+    for candidate in candidates:
+        identifier = str(candidate.get("card_id") or "")
+        if not identifier:
+            identity_missing = True
+            continue
+        if identifier not in identifiers:
+            identifiers.append(identifier)
+    if identity_missing:
+        missing.append(f"{label}_card_identity_missing")
+    if not identifiers:
+        return evidence, [*missing, f"{label}_candidates_not_observed"], []
+    evidence.append(f"{label}_candidate_identities_observed")
+
+    facts = card_catalog.get("observed_card_facts")
+    facts = facts if isinstance(facts, Mapping) else {}
+    unresolved = [identifier for identifier in identifiers if identifier not in facts]
+    if card_catalog.get("available") is not True:
+        missing.append("card_catalog_unavailable")
+    if unresolved:
+        missing.append(f"{label}_catalog_coverage_incomplete")
+    else:
+        evidence.append(f"{label}_catalog_coverage_complete")
+    return evidence, missing, unresolved
+
+
+def _advice_capability(
+    *,
+    phase_available: bool,
+    candidates_observed: bool,
+    primary_evidence: str,
+    evidence: list[str],
+    missing: list[str],
+    unavailable_reason: str,
+    unresolved_catalog_ids: list[str] | None = None,
+    uncertain_evidence: list[str] | None = None,
+) -> dict[str, Any]:
+    unique_missing = list(dict.fromkeys(missing))
+    unique_evidence = list(dict.fromkeys(evidence))
+    if not phase_available or not candidates_observed:
+        status = "unavailable"
+        available = False
+        reason = unavailable_reason
+    elif unique_missing:
+        status = "partial"
+        available = False
+        reason = unique_missing[0]
+    else:
+        status = "available"
+        available = True
+        reason = ""
+    return {
+        "available": available,
+        "status": status,
+        "reason": reason,
+        "evidence": primary_evidence if available else "",
+        "observed_evidence": unique_evidence,
+        "missing_evidence": unique_missing,
+        "uncertain_evidence": list(dict.fromkeys(uncertain_evidence or ())),
+        "unresolved_catalog_ids": list(unresolved_catalog_ids or ()),
+    }
+
+
+def _main_server_tools_url() -> str:
+    raw_port = os.getenv("MAIN_SERVER_PORT", "48911")
+    try:
+        port = int(raw_port)
+    except (TypeError, ValueError):
+        port = 48911
+    if not 1 <= port <= 65535:
+        port = 48911
+    return f"http://127.0.0.1:{port}/api/tools"
+
+
+def _fetch_main_tool_registry() -> dict[str, Any]:
+    request = urllib.request.Request(
+        _main_server_tools_url(),
+        headers={"Accept": "application/json"},
+        method="GET",
+    )
+    with urllib.request.urlopen(  # noqa: S310 - fixed loopback URL only
+        request,
+        timeout=_LLM_TOOL_HEALTH_HTTP_TIMEOUT_SECONDS,
+    ) as response:
+        payload = response.read(_LLM_TOOL_REGISTRY_MAX_BYTES + 1)
+    if len(payload) > _LLM_TOOL_REGISTRY_MAX_BYTES:
+        raise ValueError("main_server tool registry response is too large")
+    decoded = json.loads(payload)
+    if not isinstance(decoded, dict):
+        raise TypeError("main_server tool registry response must be an object")
+    return decoded
+
+
+def _missing_remote_llm_tools(
+    registry: Mapping[str, Any],
+    *,
+    expected_names: set[str],
+    expected_source: str,
+) -> set[str]:
+    tools_by_role = registry.get("tools_by_role")
+    if registry.get("ok") is not True or not isinstance(tools_by_role, Mapping):
+        raise ValueError("main_server tool registry response has an invalid shape")
+    if not tools_by_role:
+        return set(expected_names)
+
+    missing: set[str] = set()
+    for tools in tools_by_role.values():
+        if not isinstance(tools, list):
+            raise ValueError("main_server role tool registry must be a list")
+        registered = {
+            str(item.get("name") or "")
+            for item in tools
+            if isinstance(item, Mapping)
+            and str(item.get("source") or "") == expected_source
+        }
+        missing.update(expected_names - registered)
+    return missing
 
 
 def _capture_monitor(monitor: Any) -> tuple[GameSnapshot, Any, int | None]:
@@ -282,6 +478,148 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         self._config_runtime_error_codes: tuple[str, ...] = ()
         self._config_restart_required = False
         self._overlay_applied_config = self.cfg
+        self._llm_tool_recovery_task: asyncio.Task[None] | None = None
+        self._llm_tool_recovery_specs: dict[str, dict[str, Any]] = {}
+
+    def _local_llm_tool_specs(self) -> dict[str, dict[str, Any]]:
+        cached = dict(getattr(self, "_llm_tool_recovery_specs", {}))
+        list_tools = getattr(self, "list_llm_tools", None)
+        if not callable(list_tools):
+            return cached
+        current = list_tools()
+        if not isinstance(current, list):
+            raise TypeError("list_llm_tools must return a list")
+        for item in current:
+            if not isinstance(item, Mapping):
+                continue
+            name = str(item.get("name") or "")
+            if name not in _LLM_TOOL_HANDLER_NAMES:
+                continue
+            cached[name] = {
+                "name": name,
+                "description": str(item.get("description") or ""),
+                "parameters": dict(item.get("parameters") or {}),
+                "timeout": float(item.get("timeout_seconds") or 30.0),
+                "role": item.get("role") if isinstance(item.get("role"), str) else None,
+            }
+        self._llm_tool_recovery_specs = cached
+        return cached
+
+    def _llm_tool_source(self) -> str:
+        try:
+            plugin_id = str(getattr(self, "plugin_id", "") or "")
+        except Exception:
+            plugin_id = ""
+        if not plugin_id:
+            plugin_id = str(getattr(getattr(self, "ctx", None), "plugin_id", "") or "")
+        return f"plugin:{plugin_id}" if plugin_id else ""
+
+    async def _check_and_recover_llm_tools(self) -> bool:
+        specs = self._local_llm_tool_specs()
+        source = self._llm_tool_source()
+        if not specs or not source:
+            return False
+        registry = await asyncio.to_thread(_fetch_main_tool_registry)
+        missing = _missing_remote_llm_tools(
+            registry,
+            expected_names=set(specs),
+            expected_source=source,
+        )
+        if not missing:
+            return True
+        if not bool(getattr(self, "_started", False)):
+            return False
+
+        unregister = getattr(self, "unregister_llm_tool", None)
+        register = getattr(self, "register_llm_tool", None)
+        if not callable(unregister) or not callable(register):
+            return False
+        recovered = 0
+        for name in sorted(missing):
+            if not bool(getattr(self, "_started", False)):
+                break
+            handler = getattr(self, _LLM_TOOL_HANDLER_NAMES[name], None)
+            if not callable(handler):
+                continue
+            spec = specs[name]
+            unregister(name)
+            register(
+                name=name,
+                description=spec["description"],
+                parameters=spec["parameters"],
+                handler=handler,
+                timeout=spec["timeout"],
+                role=spec["role"],
+            )
+            recovered += 1
+        if recovered:
+            self.logger.info(
+                "Hearthstone LLM tool registration recovery requested count=%s",
+                recovered,
+            )
+        return recovered == len(missing)
+
+    async def _llm_tool_recovery_loop(self) -> None:
+        current_task = asyncio.current_task()
+        try:
+            while bool(getattr(self, "_started", False)):
+                try:
+                    await self._check_and_recover_llm_tools()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.logger.warning(
+                        "Hearthstone LLM tool registry check failed code=%s",
+                        type(exc).__name__,
+                    )
+                await asyncio.sleep(_LLM_TOOL_HEALTH_INTERVAL_SECONDS)
+        finally:
+            if getattr(self, "_llm_tool_recovery_task", None) is current_task:
+                self._llm_tool_recovery_task = None
+
+    def _start_llm_tool_recovery(self) -> bool:
+        current = getattr(self, "_llm_tool_recovery_task", None)
+        if current is not None and not current.done():
+            return True
+        if not all(
+            callable(getattr(self, method, None))
+            for method in ("list_llm_tools", "unregister_llm_tool", "register_llm_tool")
+        ):
+            return False
+        if not self._local_llm_tool_specs() or not self._llm_tool_source():
+            return False
+        self._llm_tool_recovery_task = asyncio.create_task(
+            self._llm_tool_recovery_loop(),
+            name="hearthstone-llm-tool-recovery",
+        )
+        return True
+
+    async def _stop_llm_tool_recovery(self) -> bool:
+        task = getattr(self, "_llm_tool_recovery_task", None)
+        if task is None:
+            return True
+        if task is asyncio.current_task():
+            return False
+        task.cancel()
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=_SHUTDOWN_LLM_TOOL_RECOVERY_BUDGET_SECONDS,
+            )
+        except asyncio.CancelledError:
+            return True
+        except TimeoutError:
+            return False
+        except Exception as exc:
+            self.logger.warning(
+                "Hearthstone LLM tool recovery stop failed code=%s",
+                type(exc).__name__,
+            )
+            return False
+        finally:
+            if getattr(self, "_llm_tool_recovery_task", None) is task and task.done():
+                self._llm_tool_recovery_task = None
+        return True
 
     @lifecycle(id="startup")
     async def startup(self, **_: Any):
@@ -361,6 +699,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 if self.cfg.overlay_enabled and self.cfg.overlay_auto_start:
                     overlay_result = await asyncio.to_thread(self._overlay.start)
                     self._require_current_startup(startup_generation)
+                self._start_llm_tool_recovery()
             except _StartupSuperseded:
                 self._clear_current_startup_task()
                 return Err(SdkError("startup superseded by another lifecycle transition"))
@@ -472,6 +811,8 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         reconcile_tasks: tuple[asyncio.Task[None], ...],
     ):
         cleanup_errors: list[str] = []
+        if not await self._stop_llm_tool_recovery():
+            cleanup_errors.append("LLM tool recovery task did not stop")
         overlay_manager = getattr(self, "_overlay", None)
         suspend_overlay = getattr(overlay_manager, "suspend_starts", None)
         if callable(suspend_overlay):
@@ -2248,6 +2589,10 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             constructed = getattr(snapshot, "constructed", None)
             known_hand = constructed.player.known_hand if constructed is not None else ()
             choice = getattr(snapshot, "choice", None)
+            battlegrounds = getattr(snapshot, "battlegrounds", None)
+            battlegrounds_choice = (
+                getattr(battlegrounds, "current_choice", None) if battlegrounds is not None else None
+            )
             return {
                 "turn_tracking": bool(
                     snapshot is not None and int(getattr(snapshot, "turn", 0)) > 0
@@ -2271,7 +2616,10 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     and known_hand
                     and constructed.player.hand_identities_complete
                 ),
-                "current_choice_options": bool(choice is not None and choice.options),
+                "current_choice_options": bool(
+                    (choice is not None and choice.options)
+                    or (battlegrounds_choice is not None and battlegrounds_choice.options)
+                ),
                 "complete_legal_actions": False,
             }
 
@@ -2320,9 +2668,13 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
     @llm_tool(
         name="hearthstone_battlegrounds_advice",
         description=(
-            "Always call this tool first for Battlegrounds/酒馆/酒馆战棋 strategy or meta questions, including "
-            "流派、阵容、升本、稳血、买什么、卖什么、刷新、冻结. Query the current Battlegrounds public "
-            "state, attributed current-pool card facts, official season rules, and aggregate-only local results. "
+            "Always call this tool first for every Battlegrounds/酒馆/酒馆战棋 question that needs facts or advice, "
+            "including hero selection, triples/discover choices, quests, trinkets, buddies, tavern spells, "
+            "archetypes/流派, warband composition and positioning, transitions, opponent targeting, leveling, "
+            "stabilizing, purchases, sales, refreshes, and freezes. Query the fresh privacy-filtered public state, "
+            "per-area completeness, observed actual costs and current card attributes, attributed current-pool card "
+            "facts, official season rules, and aggregate-only local results. Respect each capability status and "
+            "missing_evidence; never turn partial or unavailable evidence into a specific recommendation. "
             "This tool is Battlegrounds-only: never answer with constructed decks or constructed archetypes. "
             "It never provides unlicensed global win rates."
         ),
@@ -2363,7 +2715,11 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             "catalog_pool_summary_is_not_lobby_specific_or_win_rate_data": True,
             "catalog_metadata_is_best_effort_and_missing_ids_must_not_be_guessed": True,
             "hero_comparison_requires_observed_choices": True,
-            "specific_purchase_requires_fresh_recruit_shop": True,
+            "specific_purchase_requires_complete_current_shop_costs_and_catalog": True,
+            "upgrade_and_refresh_require_observed_actual_costs": True,
+            "choice_comparison_requires_complete_current_options": True,
+            "positioning_requires_complete_current_warband": True,
+            "respect_capability_status_and_missing_evidence": True,
             "combat_commentary_uses_public_boards_only": True,
             "combat_never_implies_current_shop_visibility": True,
             "tone": "warm_companion_with_data",
@@ -2437,52 +2793,355 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         battlegrounds_phase = str((battlegrounds or {}).get("phase") or "unknown")
         hero_choices = list((battlegrounds or {}).get("hero_choices") or [])
         shop = list((battlegrounds or {}).get("shop") or [])
+        hand = list((battlegrounds or {}).get("hand") or [])
         warband = list((battlegrounds or {}).get("warband") or [])
         lobby = list((battlegrounds or {}).get("lobby") or [])
-        has_public_board = bool(warband) or any(
+        current_choice = (battlegrounds or {}).get("current_choice")
+        choice_options = list((current_choice or {}).get("options") or [])
+        economy_state = dict((battlegrounds or {}).get("economy") or {})
+        current_round = int((battlegrounds or {}).get("round") or 0)
+
+        catalog_facts_needed = bool(
+            catalog is not None
+            and selected_topic == "current_strategy"
+            and live_battlegrounds
+            and battlegrounds_phase in {"hero_select", "recruit", "combat"}
+        )
+        access_reason, _revision = _live_state_access(
+            self,
+            expected_transition_revision=transition_revision,
+        )
+        if access_reason:
+            return blocked_payload(access_reason)
+        if catalog_facts_needed:
+            catalog_state = snapshot.battlegrounds
+            if catalog_state is not None and battlegrounds_phase == "combat":
+                catalog_state = replace(
+                    catalog_state,
+                    hero_choices=(),
+                    shop=(),
+                    hand=(),
+                    current_choice=None,
+                )
+            card_catalog = catalog.facts_for(catalog_state)
+        elif catalog is not None:
+            card_catalog = catalog.status()
+        else:
+            card_catalog = HearthstoneCompanionPlugin._catalog_status(self)
+        catalog_mapping = card_catalog if isinstance(card_catalog, Mapping) else {}
+
+        recruit_phase = bool(live_battlegrounds and battlegrounds_phase == "recruit")
+        shop_cards = [item for item in shop if isinstance(item, Mapping)]
+        hand_cards = [item for item in hand if isinstance(item, Mapping)]
+        warband_cards = [item for item in warband if isinstance(item, Mapping)]
+        choice_cards = [item for item in choice_options if isinstance(item, Mapping)]
+        hero_cards = [item for item in hero_choices if isinstance(item, Mapping)]
+
+        def area_evidence(
+            name: str, *, require_complete: bool = True
+        ) -> tuple[list[str], list[str]]:
+            if not live_battlegrounds:
+                return [], ["live_battlegrounds_state"]
+            return _battlegrounds_area_evidence(
+                battlegrounds or {},
+                name,
+                captured_at=captured_at,
+                require_complete=require_complete,
+            )
+
+        shop_evidence, shop_missing = area_evidence("shop")
+        hand_evidence, hand_missing = area_evidence("hand")
+        warband_evidence, warband_missing = area_evidence("warband")
+        economy_evidence, economy_missing = area_evidence(
+            "economy", require_complete=False
+        )
+        choice_evidence, choice_missing = area_evidence("choice")
+
+        hero_catalog_evidence, hero_catalog_missing, hero_unresolved = (
+            _catalog_coverage_evidence(
+                catalog_mapping, hero_cards, label="hero_choice"
+            )
+            if hero_cards
+            else ([], [], [])
+        )
+        hero_choice_capability = _advice_capability(
+            phase_available=bool(
+                live_battlegrounds and battlegrounds_phase == "hero_select"
+            ),
+            candidates_observed=bool(hero_cards),
+            primary_evidence="observed_hero_choices_with_catalog_facts",
+            evidence=["fresh_hero_select", *hero_catalog_evidence],
+            missing=hero_catalog_missing,
+            unavailable_reason="hero_choices_not_observed",
+            unresolved_catalog_ids=hero_unresolved,
+        )
+
+        choice_catalog_evidence, choice_catalog_missing, choice_unresolved = (
+            _catalog_coverage_evidence(
+                catalog_mapping, choice_cards, label="current_choice"
+            )
+            if choice_cards
+            else ([], [], [])
+        )
+        choice_type_missing = (
+            ["choice_card_type_incomplete"]
+            if any(not str(item.get("card_type") or "") for item in choice_cards)
+            else []
+        )
+        choice_capability = _advice_capability(
+            phase_available=bool(
+                live_battlegrounds
+                and battlegrounds_phase in {"hero_select", "recruit"}
+            ),
+            candidates_observed=bool(current_choice and choice_cards),
+            primary_evidence="fresh_complete_battlegrounds_choice",
+            evidence=[*choice_evidence, *choice_catalog_evidence],
+            missing=[*choice_missing, *choice_type_missing, *choice_catalog_missing],
+            unavailable_reason="no_current_battlegrounds_choice",
+            unresolved_catalog_ids=choice_unresolved,
+        )
+
+        recruit_context_cards = [*shop_cards, *hand_cards, *warband_cards]
+        recruit_catalog_evidence, recruit_catalog_missing, recruit_unresolved = (
+            _catalog_coverage_evidence(
+                catalog_mapping,
+                recruit_context_cards,
+                label="recruit_context",
+            )
+            if recruit_context_cards
+            else ([], [], [])
+        )
+        gold_observed = (battlegrounds or {}).get("gold") is not None
+        shop_costs_observed = bool(shop_cards) and all(
+            item.get("current_cost") is not None for item in shop_cards
+        )
+        shop_types_observed = bool(shop_cards) and all(
+            str(item.get("card_type") or "") for item in shop_cards
+        )
+        uncertain_shop_state: list[str] = []
+        if any(item.get("premium") is None for item in shop_cards):
+            uncertain_shop_state.append("shop_premium_state_incomplete")
+        if any(
+            any(value is None for value in dict(item.get("keywords") or {}).values())
+            for item in shop_cards
+        ):
+            uncertain_shop_state.append("shop_current_keyword_state_incomplete")
+        purchase_field_missing: list[str] = []
+        if not gold_observed:
+            purchase_field_missing.append("current_gold_not_observed")
+        if not shop_costs_observed:
+            purchase_field_missing.append("shop_actual_cost_incomplete")
+        if not shop_types_observed:
+            purchase_field_missing.append("shop_card_type_incomplete")
+        purchase_capability = _advice_capability(
+            phase_available=recruit_phase,
+            candidates_observed=bool(shop_cards),
+            primary_evidence="fresh_complete_recruit_context_with_actual_costs",
+            evidence=[
+                "fresh_recruit_phase",
+                *shop_evidence,
+                *hand_evidence,
+                *warband_evidence,
+                *recruit_catalog_evidence,
+                *(["current_gold_observed"] if gold_observed else []),
+                *(["shop_actual_costs_observed"] if shop_costs_observed else []),
+                *(["shop_card_types_observed"] if shop_types_observed else []),
+            ],
+            missing=[
+                *shop_missing,
+                *hand_missing,
+                *warband_missing,
+                *purchase_field_missing,
+                *recruit_catalog_missing,
+            ],
+            unavailable_reason="no_fresh_recruit_shop",
+            unresolved_catalog_ids=recruit_unresolved,
+            uncertain_evidence=uncertain_shop_state,
+        )
+
+        upgrade_cost_observed = economy_state.get("upgrade_cost") is not None
+        refresh_cost_observed = economy_state.get("refresh_cost") is not None
+        affordability_missing = [*economy_missing]
+        if not gold_observed:
+            affordability_missing.append("current_gold_not_observed")
+        if not upgrade_cost_observed:
+            affordability_missing.append("actual_upgrade_cost_not_observed")
+        upgrade_affordability = _advice_capability(
+            phase_available=recruit_phase,
+            candidates_observed=bool(gold_observed or upgrade_cost_observed),
+            primary_evidence="fresh_observed_gold_and_upgrade_cost",
+            evidence=[
+                "fresh_recruit_phase",
+                *economy_evidence,
+                *(["current_gold_observed"] if gold_observed else []),
+                *(
+                    ["actual_upgrade_cost_observed"]
+                    if upgrade_cost_observed
+                    else []
+                ),
+            ],
+            missing=affordability_missing,
+            unavailable_reason="no_fresh_recruit_economy",
+        )
+        upgrade_capability = _advice_capability(
+            phase_available=recruit_phase,
+            candidates_observed=bool(gold_observed or upgrade_cost_observed),
+            primary_evidence="fresh_upgrade_cost_with_complete_hand_and_warband",
+            evidence=[
+                *upgrade_affordability["observed_evidence"],
+                *hand_evidence,
+                *warband_evidence,
+                *recruit_catalog_evidence,
+            ],
+            missing=[
+                *affordability_missing,
+                *hand_missing,
+                *warband_missing,
+                *recruit_catalog_missing,
+            ],
+            unavailable_reason="no_fresh_recruit_economy",
+            unresolved_catalog_ids=recruit_unresolved,
+        )
+
+        refresh_field_missing = [*economy_missing]
+        if not gold_observed:
+            refresh_field_missing.append("current_gold_not_observed")
+        if not refresh_cost_observed:
+            refresh_field_missing.append("actual_refresh_cost_not_observed")
+        refresh_capability = _advice_capability(
+            phase_available=recruit_phase,
+            candidates_observed=bool(shop_cards or refresh_cost_observed),
+            primary_evidence="fresh_refresh_cost_with_complete_shop",
+            evidence=[
+                "fresh_recruit_phase",
+                *economy_evidence,
+                *shop_evidence,
+                *recruit_catalog_evidence,
+                *(["current_gold_observed"] if gold_observed else []),
+                *(
+                    ["actual_refresh_cost_observed"]
+                    if refresh_cost_observed
+                    else []
+                ),
+            ],
+            missing=[
+                *refresh_field_missing,
+                *shop_missing,
+                *recruit_catalog_missing,
+            ],
+            unavailable_reason="no_fresh_recruit_economy",
+            unresolved_catalog_ids=recruit_unresolved,
+        )
+
+        warband_catalog_evidence, warband_catalog_missing, warband_unresolved = (
+            _catalog_coverage_evidence(
+                catalog_mapping, warband_cards, label="warband"
+            )
+            if warband_cards
+            else ([], [], [])
+        )
+        positioning_field_missing: list[str] = []
+        if any(int(item.get("position") or 0) <= 0 for item in warband_cards):
+            positioning_field_missing.append("warband_positions_incomplete")
+        if any(not str(item.get("card_type") or "") for item in warband_cards):
+            positioning_field_missing.append("warband_card_type_incomplete")
+        if any(item.get("premium") is None for item in warband_cards):
+            positioning_field_missing.append("warband_premium_state_incomplete")
+        if any(
+            any(value is None for value in dict(item.get("keywords") or {}).values())
+            for item in warband_cards
+        ):
+            positioning_field_missing.append("warband_current_keyword_state_incomplete")
+        positioning_capability = _advice_capability(
+            phase_available=recruit_phase,
+            candidates_observed=bool(warband_cards),
+            primary_evidence="fresh_complete_positioned_warband",
+            evidence=[
+                "fresh_recruit_phase",
+                *warband_evidence,
+                *warband_catalog_evidence,
+            ],
+            missing=[
+                *warband_missing,
+                *positioning_field_missing,
+                *warband_catalog_missing,
+            ],
+            unavailable_reason="no_fresh_recruit_warband",
+            unresolved_catalog_ids=warband_unresolved,
+        )
+
+        has_public_board = bool(warband_cards) or any(
             bool((item.get("board") or {}).get("count"))
             or bool((item.get("board") or {}).get("cards"))
             for item in lobby
+            if isinstance(item, Mapping)
         )
-        hero_choice_available = bool(
-            live_battlegrounds and battlegrounds_phase == "hero_select" and hero_choices
+        opponent_board_current_round = any(
+            int((item.get("board") or {}).get("observed_round") or 0)
+            == current_round
+            for item in lobby
+            if isinstance(item, Mapping) and not item.get("is_local")
         )
-        purchase_available = bool(
-            live_battlegrounds and battlegrounds_phase == "recruit" and shop
-        )
-        board_strategy_available = bool(
+        recruit_board_current = bool(recruit_phase and not warband_missing)
+        combat_board_current = bool(
             live_battlegrounds
-            and battlegrounds_phase in {"recruit", "combat"}
-            and has_public_board
+            and battlegrounds_phase == "combat"
+            and (bool(warband_cards) or opponent_board_current_round)
         )
-        combat_commentary_available = bool(
-            battlegrounds_phase == "combat" and board_strategy_available
+        board_capability = _advice_capability(
+            phase_available=bool(
+                live_battlegrounds and battlegrounds_phase in {"recruit", "combat"}
+            ),
+            candidates_observed=has_public_board,
+            primary_evidence="public_current_round_board",
+            evidence=["public_current_round_board"]
+            if recruit_board_current or combat_board_current
+            else [],
+            missing=(
+                []
+                if recruit_board_current or combat_board_current
+                else ["board_not_current_round"]
+            ),
+            unavailable_reason="no_live_public_board",
         )
-        current_strategy_available = any(
-            (hero_choice_available, purchase_available, board_strategy_available)
+        combat_capability = _advice_capability(
+            phase_available=bool(
+                live_battlegrounds and battlegrounds_phase == "combat"
+            ),
+            candidates_observed=has_public_board,
+            primary_evidence="public_current_round_combat_board",
+            evidence=["public_current_round_combat_board"]
+            if combat_board_current
+            else [],
+            missing=[] if combat_board_current else ["board_not_current_round"],
+            unavailable_reason="no_live_combat_board",
         )
         capabilities = {
-            "hero_choice_comparison": {
-                "available": hero_choice_available,
-                "reason": "" if hero_choice_available else "hero_choices_not_observed",
-                "evidence": "observed_hero_choices" if hero_choice_available else "",
-            },
-            "specific_purchase_advice": {
-                "available": purchase_available,
-                "reason": "" if purchase_available else "no_fresh_recruit_shop",
-                "evidence": "fresh_recruit_shop" if purchase_available else "",
-            },
-            "board_strategy_commentary": {
-                "available": board_strategy_available,
-                "reason": "" if board_strategy_available else "no_live_public_board",
-                "evidence": "public_warband_or_lobby_board" if board_strategy_available else "",
-            },
-            "combat_commentary": {
-                "available": combat_commentary_available,
-                "reason": "" if combat_commentary_available else "no_live_combat_board",
-                "evidence": "public_warband_or_lobby_board" if combat_commentary_available else "",
-            },
+            "hero_choice_comparison": hero_choice_capability,
+            "current_choice_comparison": choice_capability,
+            "specific_purchase_advice": purchase_capability,
+            "upgrade_affordability": upgrade_affordability,
+            "upgrade_advice": upgrade_capability,
+            "refresh_advice": refresh_capability,
+            "specific_positioning_advice": positioning_capability,
+            "board_strategy_commentary": board_capability,
+            "combat_commentary": combat_capability,
         }
+        current_strategy_available = any(
+            capability["available"] for capability in capabilities.values()
+        )
+        current_strategy_partial = bool(
+            not current_strategy_available
+            and any(
+                capability["status"] == "partial"
+                for capability in capabilities.values()
+            )
+        )
+        shop_current = bool(recruit_phase and shop_cards and not shop_missing)
+        hand_current = bool(recruit_phase and not hand_missing)
+        warband_current_round = bool(recruit_phase and not warband_missing)
+        choice_current = bool(live_battlegrounds and current_choice and not choice_missing)
+        economy_current = bool(recruit_phase and not economy_missing)
         local_player = next((item for item in lobby if item.get("is_local")), None)
         current_hero_id = str((local_player or {}).get("hero_card_id") or "")
         current_hero_name = str((local_player or {}).get("hero_name") or "")
@@ -2526,29 +3185,25 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             and freshness.get("age_seconds") is not None
             and float(freshness["age_seconds"]) <= LIVE_STATE_MAX_AGE_SECONDS
         )
-        catalog_facts_needed = bool(
-            catalog is not None
-            and selected_topic == "current_strategy"
-            and live_battlegrounds
-            and battlegrounds_phase in {"hero_select", "recruit"}
-        )
-        access_reason, _revision = _live_state_access(
-            self,
-            expected_transition_revision=transition_revision,
-        )
-        if access_reason:
-            return blocked_payload(access_reason)
-        if catalog_facts_needed:
-            card_catalog = catalog.facts_for(snapshot.battlegrounds)
-        elif catalog is not None:
-            card_catalog = catalog.status()
-        else:
-            card_catalog = HearthstoneCompanionPlugin._catalog_status(self)
         topic_available = {
             "current_strategy": current_strategy_available,
             "season_meta": season_available,
             "hero_performance": hero_performance_available,
             "post_game": post_game_recent,
+        }
+        topic_status = {
+            "current_strategy": (
+                "available"
+                if current_strategy_available
+                else "partial"
+                if current_strategy_partial
+                else "unavailable"
+            ),
+            "season_meta": "available" if season_available else "unavailable",
+            "hero_performance": (
+                "available" if hero_performance_available else "unavailable"
+            ),
+            "post_game": "available" if post_game_recent else "unavailable",
         }
         topic_reason = {
             "current_strategy": (
@@ -2562,14 +3217,38 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         }
         if selected_topic == "current_strategy" and live_battlegrounds:
             public_state = dict(battlegrounds)
-            if not hero_choice_available:
+            if battlegrounds_phase != "hero_select":
                 public_state["hero_choices"] = []
-            if not purchase_available:
+            if battlegrounds_phase == "hero_select" and not hero_choices:
+                public_state["hero_choices"] = []
+            if battlegrounds_phase == "recruit" and not shop_current:
                 public_state["shop"] = []
-            if battlegrounds_phase == "combat":
+            if battlegrounds_phase == "recruit" and not hand_current:
                 public_state["hand"] = []
+            if battlegrounds_phase == "recruit" and not warband_current_round:
+                public_state["warband"] = []
+            if battlegrounds_phase in {"hero_select", "recruit"} and not choice_current:
+                public_state["current_choice"] = None
+            if battlegrounds_phase == "recruit" and not economy_current:
+                public_state["refresh_cost"] = None
+                public_state["upgrade_cost"] = None
+                public_economy = dict(public_state.get("economy") or {})
+                public_economy["refresh_cost"] = None
+                public_economy["upgrade_cost"] = None
+                public_state["economy"] = public_economy
+            if battlegrounds_phase == "combat":
+                public_state["current_choice"] = None
+                public_state["hero_choices"] = []
+                public_state["hand"] = []
+                public_state["shop"] = []
+                public_state["refresh_cost"] = None
+                public_state["upgrade_cost"] = None
                 public_state["gold"] = None
                 public_state["max_gold"] = None
+                public_economy = dict(public_state.get("economy") or {})
+                public_economy["refresh_cost"] = None
+                public_economy["upgrade_cost"] = None
+                public_state["economy"] = public_economy
         elif selected_topic == "post_game" and post_game_recent and battlegrounds:
             public_state = {
                 "variant": battlegrounds.get("variant"),
@@ -2592,12 +3271,20 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             }
         result = {
             "available": topic_available[selected_topic],
+            "status": topic_status[selected_topic],
             "reason": "" if topic_available[selected_topic] else topic_reason[selected_topic],
             "game_mode": "battlegrounds",
             "scope": "hearthstone_battlegrounds_only",
             "topic": selected_topic,
             "current_public_state": public_state,
             "capabilities": capabilities,
+            "missing_evidence": {
+                name: capability["missing_evidence"]
+                for name, capability in capabilities.items()
+                if capability["missing_evidence"]
+            }
+            if selected_topic == "current_strategy"
+            else {},
             "hero_performance": hero_performance if selected_topic == "hero_performance" else None,
             "freshness": freshness,
             "season_rules": season_rules,

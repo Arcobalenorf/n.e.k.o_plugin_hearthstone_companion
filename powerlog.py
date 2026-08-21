@@ -9,7 +9,10 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 from .models import (
+    BattlegroundsAreaSnapshot,
     BattlegroundsCardSnapshot,
+    BattlegroundsChoiceSnapshot,
+    BattlegroundsEconomySnapshot,
     BattlegroundsHeroChoiceSnapshot,
     BattlegroundsPlayerSnapshot,
     BattlegroundsSnapshot,
@@ -161,6 +164,34 @@ _CONSTRUCTED_STATE_TAGS = (
     ("SILENCED", "silenced"),
     ("DORMANT", "dormant"),
 )
+_BATTLEGROUNDS_KEYWORD_TAGS = (
+    ("TAUNT", "taunt"),
+    ("DIVINE_SHIELD", "divine_shield"),
+    ("REBORN", "reborn"),
+    ("POISONOUS", "poisonous"),
+    ("VENOMOUS", "venomous"),
+    ("STEALTH", "stealth"),
+    ("WINDFURY", "windfury"),
+    ("MEGA_WINDFURY", "mega_windfury"),
+    ("DEATHRATTLE", "deathrattle"),
+    ("BATTLECRY", "battlecry"),
+    ("MAGNETIC", "magnetic"),
+    ("ELUSIVE", "elusive"),
+)
+_BATTLEGROUNDS_REFRESH_COST_TAGS = (
+    "BACON_REFRESH_COST",
+    "BACON_REROLL_COST",
+    "REFRESH_COST",
+    "REROLL_COST",
+    "ROLL_COST",
+)
+_BATTLEGROUNDS_UPGRADE_COST_TAGS = (
+    "BACON_UPGRADE_COST",
+    "PLAYER_TECH_LEVEL_UP_COST",
+    "TECH_LEVEL_UP_COST",
+    "TAVERN_UPGRADE_COST",
+    "UPGRADE_COST",
+)
 _BATTLEGROUNDS_HINT_TAGS = frozenset(
     {
         "BACON_DUMMY_PLAYER",
@@ -254,6 +285,10 @@ class _ChoiceFrame:
     count_max: int
     source_entity_id: int | None = None
     option_entity_ids: list[int] = field(default_factory=list)
+    observed_at: float = 0.0
+    revision: int = 0
+    observed_round: int = 0
+    observed_phase: str = "unknown"
 
 
 class PowerLogParser:
@@ -281,6 +316,7 @@ class PowerLogParser:
         self._pending_player_name_controllers: dict[bytes, int] = {}
         self._choices: dict[int, _ChoiceFrame] = {}
         self._current_choice_id: int | None = None
+        self._public_revision = 0
         self.turn = 0
         self._constructed_setup_done = False
         self._last_emitted_constructed_turn = 0
@@ -291,6 +327,9 @@ class PowerLogParser:
         self.battlegrounds_round = 0
         self.bob_controller: int | None = None
         self.next_opponent_player_id = 0
+        self.current_opponent_player_id = 0
+        self.last_opponent_player_id = 0
+        self.last_opponent_round = 0
         self.result = ""
         self.spectating = False
         self._mulligan_announced = False
@@ -308,7 +347,11 @@ class PowerLogParser:
         self._combat_damage_taken = 0
         self._combat_damage_dealt = 0
         self._combat_bob_stale_entity_ids: set[int] = set()
+        self._recruit_bob_stale_entity_ids: set[int] = set()
         self._last_recruit_warband: tuple[BattlegroundsCardSnapshot, ...] = ()
+        self._last_recruit_warband_area = BattlegroundsAreaSnapshot()
+        self._last_recruit_warband_observed_at = 0.0
+        self._last_recruit_warband_revision = 0
         self._explicit_battlegrounds_phase_signal_seen = False
         self._battlegrounds_counter_highs: dict[tuple[int, str], int] = {}
         self.entity_capacity_exceeded = False
@@ -329,6 +372,7 @@ class PowerLogParser:
         self._pending_player_name_controllers.clear()
         self._choices.clear()
         self._current_choice_id = None
+        self._public_revision = 0
         self.turn = 0
         self._constructed_setup_done = False
         self._last_emitted_constructed_turn = 0
@@ -339,6 +383,9 @@ class PowerLogParser:
         self.battlegrounds_round = 0
         self.bob_controller = None
         self.next_opponent_player_id = 0
+        self.current_opponent_player_id = 0
+        self.last_opponent_player_id = 0
+        self.last_opponent_round = 0
         self.result = ""
         self.spectating = False
         self._mulligan_announced = False
@@ -354,7 +401,11 @@ class PowerLogParser:
         self._combat_damage_taken = 0
         self._combat_damage_dealt = 0
         self._combat_bob_stale_entity_ids.clear()
+        self._recruit_bob_stale_entity_ids.clear()
         self._last_recruit_warband = ()
+        self._last_recruit_warband_area = BattlegroundsAreaSnapshot()
+        self._last_recruit_warband_observed_at = 0.0
+        self._last_recruit_warband_revision = 0
         self._explicit_battlegrounds_phase_signal_seen = False
         self._battlegrounds_counter_highs.clear()
         self.entity_capacity_exceeded = False
@@ -419,7 +470,7 @@ class PowerLogParser:
                 player_info_match.group(2),
             )
             return []
-        if self._consume_choice_line(line):
+        if self._consume_choice_line(line, timestamp):
             return []
 
         game_type_match = _GAME_TYPE_RE.search(line)
@@ -486,6 +537,7 @@ class PowerLogParser:
             entity = self._entity_for_source(entity_id, source)
             if entity:
                 self._set_static_field(entity, "CARDTYPE", "GAME", source)
+                self._touch_entity(entity, timestamp)
             self._set_current_entity(entity_id, source)
             return []
 
@@ -497,6 +549,7 @@ class PowerLogParser:
                 self._set_static_field(entity, "CARDTYPE", "PLAYER", source)
                 self._set_static_field(entity, "CONTROLLER", player_id, source)
                 self._set_static_field(entity, "PLAYER_ID", str(player_id), source)
+                self._touch_entity(entity, timestamp)
                 if source == "GameState" and self._game_boundary_pending:
                     self._pending_game_state_player_entities[player_id] = entity_id
                 elif source == "GameState":
@@ -524,6 +577,7 @@ class PowerLogParser:
                 if entity.card_id and (source != "GameState" or not entity.visibility_revoked):
                     entity.visibility_revoked = False
                 self._mark_battlegrounds_combat_identity(entity)
+                self._touch_entity(entity, timestamp)
             self._set_current_entity(entity_id, source)
             return []
 
@@ -535,6 +589,7 @@ class PowerLogParser:
                 ref,
                 source=source,
                 include_identity=source != "GameState",
+                timestamp=timestamp,
             )
             if entity:
                 identity_updated = source != "GameState" or (
@@ -572,7 +627,7 @@ class PowerLogParser:
             opcode = match.group(1)
             ref = self._parse_entity_ref(match.group(2))
             card_id = _clean(match.group(3), limit=80)
-            entity = self._merge_ref(ref, source=source)
+            entity = self._merge_ref(ref, source=source, timestamp=timestamp)
             if entity:
                 can_reveal = not entity.visibility_revoked or (
                     opcode == "SHOW_ENTITY" and bool(card_id)
@@ -597,7 +652,7 @@ class PowerLogParser:
         match = _HIDE_ENTITY_RE.search(line)
         if match:
             ref = self._parse_entity_ref(match.group(1))
-            entity = self._merge_ref(ref, source=source)
+            entity = self._merge_ref(ref, source=source, timestamp=timestamp)
             if entity:
                 entity.revealed = False
                 entity.hidden = True
@@ -613,7 +668,7 @@ class PowerLogParser:
             if len(self._block_stack) >= 64:
                 self._block_stack.clear()
             ref = self._parse_entity_ref(match.group(2))
-            entity = self._merge_ref(ref, source=source)
+            entity = self._merge_ref(ref, source=source, timestamp=timestamp)
             self._block_stack.append(
                 _BlockFrame(
                     block_type=_clean(match.group(1), limit=32).upper(),
@@ -642,7 +697,7 @@ class PowerLogParser:
                     timestamp,
                     realtime=False,
                 )
-            entity = self._merge_ref(ref, source=source)
+            entity = self._merge_ref(ref, source=source, timestamp=timestamp)
             if entity is None:
                 entity = self._unresolved_tag_entity(match.group(1), match.group(2), match.group(3))
             if entity is None:
@@ -666,6 +721,7 @@ class PowerLogParser:
             if entity:
                 if source == "GameState":
                     self._apply_enrichment_tag(entity, match.group(1), match.group(2))
+                    self._touch_entity(entity, timestamp)
                     return []
                 return self._apply_tag(
                     entity,
@@ -881,6 +937,28 @@ class PowerLogParser:
         self.entities[entity_id] = entity
         return entity
 
+    def _next_public_revision(self) -> int:
+        self._public_revision += 1
+        return self._public_revision
+
+    def _touch_entity(self, entity: Entity | None, timestamp: float) -> None:
+        if entity is None:
+            return
+        entity.last_seen_at = max(entity.last_seen_at, timestamp)
+        entity.last_revision = max(entity.last_revision, self._next_public_revision())
+        if self.mode == "battlegrounds":
+            entity.last_battlegrounds_round = self.battlegrounds_round
+            entity.last_battlegrounds_phase = self.phase
+
+    def _touch_choice(self, frame: _ChoiceFrame | None, timestamp: float) -> None:
+        if frame is None:
+            return
+        frame.observed_at = max(frame.observed_at, timestamp)
+        frame.revision = max(frame.revision, self._next_public_revision())
+        if self.mode == "battlegrounds":
+            frame.observed_round = self.battlegrounds_round
+            frame.observed_phase = self.phase
+
     def _entities_for_source(self, source: str | None) -> dict[int, Entity]:
         if source == "GameState" and self._game_boundary_pending:
             return self._pending_game_state_entities
@@ -1088,7 +1166,7 @@ class PowerLogParser:
             controller = self._pending_player_name_controllers.get(key)
         return key, controller
 
-    def _consume_choice_line(self, line: str) -> bool:
+    def _consume_choice_line(self, line: str, timestamp: float) -> bool:
         match = _CHOICE_HEADER_RE.search(line)
         if match:
             choice_id = int(match.group(1))
@@ -1103,6 +1181,7 @@ class PowerLogParser:
                 count_min=max(0, _int(match.group(4)) or 0),
                 count_max=max(0, _int(match.group(5)) or 0),
             )
+            self._touch_choice(self._choices[choice_id], timestamp)
             self._current_choice_id = choice_id
             return True
 
@@ -1112,6 +1191,7 @@ class PowerLogParser:
             if frame is not None:
                 ref = self._parse_entity_ref(match.group(1))
                 frame.source_entity_id = ref.entity_id
+                self._touch_choice(frame, timestamp)
             return True
 
         match = _CHOICE_ENTITY_RE.search(line)
@@ -1133,7 +1213,8 @@ class PowerLogParser:
             if ref.entity_id is not None and ref.entity_id not in frame.option_entity_ids:
                 frame.option_entity_ids.append(ref.entity_id)
             if frame.controller == self.local_controller and self.local_controller is not None:
-                self._merge_ref(ref, source="GameState")
+                self._merge_ref(ref, source="GameState", timestamp=timestamp)
+            self._touch_choice(frame, timestamp)
             return True
 
         match = _CHOSEN_HEADER_RE.search(line)
@@ -1188,6 +1269,7 @@ class PowerLogParser:
         *,
         source: str | None,
         include_identity: bool = True,
+        timestamp: float = 0.0,
     ) -> Entity | None:
         realtime = source != "GameState"
         entity = self._entity_for_source(ref.entity_id, source)
@@ -1228,6 +1310,8 @@ class PowerLogParser:
             entity.name = ref.name
             if realtime:
                 entity.realtime_fields.add("NAME")
+        if timestamp > 0:
+            self._touch_entity(entity, timestamp)
         return entity
 
     def _apply_tag(
@@ -1256,6 +1340,7 @@ class PowerLogParser:
             value = _normalize_zone(value)
 
         entity.tags[tag] = value
+        self._touch_entity(entity, timestamp)
         events: list[GameEvent] = []
 
         if tag in _BATTLEGROUNDS_HINT_TAGS or tag.startswith("BACON_"):
@@ -1332,7 +1417,7 @@ class PowerLogParser:
                         player_id = self._battlegrounds_player_id(entity)
                         if self._is_local_battlegrounds_entity(entity):
                             self._combat_damage_taken += amount
-                        elif player_id == self._resolved_next_opponent_player_id():
+                        elif player_id == self._active_opponent_player_id():
                             self._combat_damage_dealt += amount
                     priority = 8 if side == "player" and health is not None and health <= 10 else 5
                     if self.mode != "battlegrounds" or self._is_local_battlegrounds_entity(entity):
@@ -1371,7 +1456,7 @@ class PowerLogParser:
                     player_id = self._battlegrounds_player_id(entity)
                     if self._is_local_battlegrounds_entity(entity):
                         self._combat_damage_taken += amount
-                    elif player_id == self._resolved_next_opponent_player_id():
+                    elif player_id == self._active_opponent_player_id():
                         self._combat_damage_dealt += amount
                 if self.mode != "battlegrounds" or self._is_local_battlegrounds_entity(entity):
                     health = entity.health
@@ -1469,7 +1554,7 @@ class PowerLogParser:
                                     timestamp,
                                     {
                                         "round": self.battlegrounds_round,
-                                        "opponent_player_id": self._resolved_next_opponent_player_id(),
+                                        "opponent_player_id": self.current_opponent_player_id,
                                     },
                                 )
                             )
@@ -1576,7 +1661,7 @@ class PowerLogParser:
                             timestamp,
                             {
                                 "round": self.battlegrounds_round,
-                                "opponent_player_id": self._resolved_next_opponent_player_id(),
+                                "opponent_player_id": self.current_opponent_player_id,
                             },
                         )
                     )
@@ -1592,7 +1677,7 @@ class PowerLogParser:
                             timestamp,
                             {
                                 "round": self.battlegrounds_round,
-                                "opponent_player_id": self._resolved_next_opponent_player_id(),
+                                "opponent_player_id": self.current_opponent_player_id,
                             },
                         )
                     )
@@ -1613,7 +1698,9 @@ class PowerLogParser:
 
         elif tag == "NEXT_OPPONENT_PLAYER_ID" and self.mode == "battlegrounds":
             if self._controller(entity) == self.local_controller:
-                self.next_opponent_player_id = max(0, _int(value) or 0)
+                self.next_opponent_player_id = self._sanitize_opponent_player_id(
+                    _int(value) or 0
+                )
 
         elif tag == "PLAYER_TECH_LEVEL" and self.mode == "battlegrounds":
             previous, current = _int(old_value), _int(value)
@@ -1653,6 +1740,7 @@ class PowerLogParser:
                     )
                 )
 
+        self._touch_entity(entity, timestamp)
         self._observe_battlegrounds_combat_marker(entity, tag, value)
         if any(event.kind in _BATTLEGROUNDS_CONTROL_EVENTS for event in events):
             self._block_stack.clear()
@@ -2035,13 +2123,68 @@ class PowerLogParser:
             entity
             for entity in self.entities.values()
             if self._controller(entity) == self.local_controller and entity.zone == "HAND"
+            and entity.card_type in _BATTLEGROUNDS_CARD_TYPES
             and not entity.hidden
         ]
         warband_entities = self._battlegrounds_board_entities(self.local_controller)
+        shop_cards = self._battlegrounds_cards(shop_entities)
+        hand_cards = self._battlegrounds_cards(hand_entities)
         current_warband = self._battlegrounds_cards(warband_entities, maximum=7)
         visible_warband = current_warband
+        warband_area = self._battlegrounds_area(
+            warband_entities,
+            current_warband,
+            allow_empty=self.phase in {"recruit", "combat", "ended"},
+        )
         if not visible_warband and self.phase in {"combat", "ended"}:
             visible_warband = self._last_recruit_warband
+            warband_area = self._last_recruit_warband_area
+
+        current_choice, choice_area = self._battlegrounds_current_choice()
+        economy = self._battlegrounds_economy(local_player, local_hero)
+        areas = {
+            "shop": self._battlegrounds_area(
+                shop_entities,
+                shop_cards,
+                allow_empty=False,
+            ),
+            "hand": self._battlegrounds_area(
+                hand_entities,
+                hand_cards,
+                allow_empty=local_player is not None and self.phase == "recruit",
+                fallback=local_player,
+            ),
+            "warband": warband_area,
+            "choice": choice_area,
+            "economy": BattlegroundsAreaSnapshot(
+                complete=(
+                    gold is not None
+                    and economy.refresh_cost is not None
+                    and economy.upgrade_cost is not None
+                ),
+                revision=economy.revision,
+                observed_at=economy.observed_at,
+                round=max(
+                    (
+                        entity.last_battlegrounds_round
+                        for entity in (local_player, local_hero)
+                        if entity is not None
+                    ),
+                    default=self.battlegrounds_round,
+                ),
+                phase=(
+                    max(
+                        (
+                            (entity.last_seen_at, entity.last_battlegrounds_phase)
+                            for entity in (local_player, local_hero)
+                            if entity is not None
+                        ),
+                        default=(0.0, self.phase),
+                    )[1]
+                    or self.phase
+                ),
+            ),
+        }
 
         mechanics: dict[str, Any] = {}
         game = self.entities.get(self.game_entity_id or -1)
@@ -2076,15 +2219,23 @@ class PowerLogParser:
             phase=self.phase,
             gold=gold,
             max_gold=max_gold,
+            refresh_cost=economy.refresh_cost,
+            upgrade_cost=economy.upgrade_cost,
             tavern_tier=self._battlegrounds_tavern_tier(local_hero, local_player),
             frozen=any(entity.tag_int("FROZEN") > 0 for entity in shop_entities),
             next_opponent_player_id=self._resolved_next_opponent_player_id(),
+            current_opponent_player_id=self.current_opponent_player_id,
+            last_opponent_player_id=self.last_opponent_player_id,
+            last_opponent_round=self.last_opponent_round,
             placement=local_hero.tag_int("PLAYER_LEADERBOARD_PLACE") if local_hero else 0,
             hero_choices=self._battlegrounds_hero_choices(),
-            shop=self._battlegrounds_cards(shop_entities),
-            hand=self._battlegrounds_cards(hand_entities),
+            shop=shop_cards,
+            hand=hand_cards,
             warband=visible_warband,
             lobby=self._battlegrounds_lobby(),
+            current_choice=current_choice,
+            economy=economy,
+            areas=areas,
             mechanics=mechanics,
         )
 
@@ -2099,6 +2250,7 @@ class PowerLogParser:
             and entity.card_type in _BATTLEGROUNDS_CARD_TYPES
             and self._is_battlegrounds_gameplay_entity(entity)
             and not entity.hidden
+            and entity.entity_id not in self._recruit_bob_stale_entity_ids
         ]
         positioned: dict[int, Entity] = {}
         unpositioned: list[Entity] = []
@@ -2127,17 +2279,257 @@ class PowerLogParser:
             label = self._visible_card_label(entity)
             if not label and not entity.card_id:
                 continue
+            if "BACON_OVERRIDE_BG_COST" in entity.tags:
+                current_cost = _int(entity.tags.get("BACON_OVERRIDE_BG_COST"))
+            elif "INTERACTABLE_OBJECT_COST" in entity.tags:
+                current_cost = _int(entity.tags.get("INTERACTABLE_OBJECT_COST"))
+            else:
+                current_cost = _int(entity.tags.get("COST"))
+            premium = (
+                entity.tag_int("PREMIUM") > 0 if "PREMIUM" in entity.tags else None
+            )
+            keywords = {
+                public_name: entity.tag_int(tag) > 0 if tag in entity.tags else None
+                for tag, public_name in _BATTLEGROUNDS_KEYWORD_TAGS
+            }
             cards.append(
                 BattlegroundsCardSnapshot(
                     card_id=entity.card_id[:80],
                     name=label,
+                    card_type=entity.card_type or None,
                     attack=entity.attack,
                     health=entity.health,
                     tier=max(entity.tag_int("TECH_LEVEL"), entity.tag_int("BACON_CARD_TIER")),
                     frozen=entity.tag_int("FROZEN") > 0,
+                    position=entity.tag_int("ZONE_POSITION"),
+                    premium=premium,
+                    current_cost=(
+                        max(0, current_cost) if current_cost is not None else None
+                    ),
+                    keywords=keywords,
                 )
             )
         return tuple(cards[: max(0, maximum)])
+
+    def _battlegrounds_current_choice(
+        self,
+    ) -> tuple[BattlegroundsChoiceSnapshot | None, BattlegroundsAreaSnapshot]:
+        if self.local_controller is None:
+            return None, BattlegroundsAreaSnapshot(round=self.battlegrounds_round)
+        for choice_id in sorted(self._choices, reverse=True):
+            frame = self._choices[choice_id]
+            controller = frame.controller
+            if controller is None and frame.player_key is not None:
+                controller = self._player_name_controllers.get(frame.player_key)
+            if controller != self.local_controller:
+                continue
+            option_entities = [
+                entity
+                for entity_id in frame.option_entity_ids[:16]
+                if (entity := self.entities.get(entity_id)) is not None
+                and not entity.hidden
+            ]
+            options = self._battlegrounds_cards(option_entities, maximum=16)
+            source_entity = self.entities.get(frame.source_entity_id or -1)
+            source_cards = (
+                self._battlegrounds_cards((source_entity,), maximum=1)
+                if source_entity is not None
+                else ()
+            )
+            area = BattlegroundsAreaSnapshot(
+                complete=bool(options) and len(options) == len(frame.option_entity_ids[:16]),
+                revision=max(
+                    (frame.revision, *(entity.last_revision for entity in option_entities)),
+                    default=0,
+                ),
+                observed_at=max(
+                    (frame.observed_at, *(entity.last_seen_at for entity in option_entities)),
+                    default=0.0,
+                )
+                or None,
+                round=max(
+                    (
+                        frame.observed_round,
+                        *(entity.last_battlegrounds_round for entity in option_entities),
+                    ),
+                    default=self.battlegrounds_round,
+                ),
+                phase=(
+                    max(
+                        (
+                            (frame.observed_at, frame.observed_phase),
+                            *(
+                                (entity.last_seen_at, entity.last_battlegrounds_phase)
+                                for entity in option_entities
+                            ),
+                        ),
+                        default=(0.0, "unknown"),
+                    )[1]
+                    or "unknown"
+                ),
+            )
+            return (
+                BattlegroundsChoiceSnapshot(
+                    choice_type=frame.choice_type,
+                    count_min=frame.count_min,
+                    count_max=frame.count_max,
+                    source=source_cards[0] if source_cards else None,
+                    options=options,
+                ),
+                area,
+            )
+        return None, BattlegroundsAreaSnapshot(round=self.battlegrounds_round, phase=self.phase)
+
+    def _battlegrounds_economy(
+        self,
+        local_player: Entity | None,
+        local_hero: Entity | None,
+    ) -> BattlegroundsEconomySnapshot:
+        scoped_entities = [
+            entity
+            for entity in self.entities.values()
+            if entity is local_player
+            or entity is local_hero
+            or self._controller(entity) in {self.local_controller, self.bob_controller}
+        ]
+
+        def tagged_cost(tags: tuple[str, ...]) -> tuple[int | None, Entity | None]:
+            for entity in sorted(
+                scoped_entities,
+                key=lambda candidate: candidate.last_revision,
+                reverse=True,
+            ):
+                for tag in tags:
+                    if tag not in entity.tags:
+                        continue
+                    value = _int(entity.tags.get(tag))
+                    if value is not None:
+                        return max(0, value), entity
+            return None, None
+
+        refresh_cost, refresh_entity = self._battlegrounds_action_button_cost("refresh")
+        upgrade_cost, upgrade_entity = self._battlegrounds_action_button_cost("upgrade")
+        if refresh_cost is None:
+            refresh_cost, refresh_entity = tagged_cost(_BATTLEGROUNDS_REFRESH_COST_TAGS)
+        if upgrade_cost is None:
+            upgrade_cost, upgrade_entity = tagged_cost(_BATTLEGROUNDS_UPGRADE_COST_TAGS)
+        if refresh_cost is None:
+            free_refresh_entities = [
+                entity
+                for entity in scoped_entities
+                if entity.tag_int("BACON_FREE_REFRESH_COUNT") > 0
+            ]
+            if free_refresh_entities:
+                refresh_cost = 0
+                refresh_entity = max(
+                    free_refresh_entities,
+                    key=lambda candidate: candidate.last_revision,
+                )
+        observed_entities = [
+            entity
+            for entity in (refresh_entity, upgrade_entity, local_player)
+            if entity is not None
+        ]
+        return BattlegroundsEconomySnapshot(
+            upgrade_cost=upgrade_cost,
+            refresh_cost=refresh_cost,
+            revision=max(
+                (entity.last_revision for entity in observed_entities),
+                default=0,
+            ),
+            observed_at=max(
+                (entity.last_seen_at for entity in observed_entities),
+                default=0.0,
+            )
+            or None,
+        )
+
+    def _battlegrounds_action_button_cost(
+        self,
+        action: str,
+    ) -> tuple[int | None, Entity | None]:
+        slot = {"refresh": 2, "upgrade": 3}.get(action)
+        needles = {
+            "refresh": ("reroll", "refresh"),
+            "upgrade": ("techup", "tavern tier", "tavernupgrade", "tavern_upgrade"),
+        }.get(action, ())
+        for entity in sorted(
+            self.entities.values(),
+            key=lambda candidate: candidate.last_revision,
+            reverse=True,
+        ):
+            if (
+                entity.card_type != "GAME_MODE_BUTTON"
+                or entity.zone != "PLAY"
+                or entity.hidden
+            ):
+                continue
+            if slot is not None and entity.tag_int("GAME_MODE_BUTTON_SLOT") == slot:
+                for tag in ("BACON_OVERRIDE_BG_COST", "COST"):
+                    if tag in entity.tags and (value := _int(entity.tags.get(tag))) is not None:
+                        return max(0, value), entity
+                return None, entity
+            identifier = f"{entity.card_id} {entity.public_name()}".casefold()
+            if needles and not any(needle in identifier for needle in needles):
+                continue
+            for tag in ("BACON_OVERRIDE_BG_COST", "COST"):
+                if tag in entity.tags and (value := _int(entity.tags.get(tag))) is not None:
+                    return max(0, value), entity
+        return None, None
+
+    def _battlegrounds_area(
+        self,
+        entities: Iterable[Entity],
+        cards: tuple[BattlegroundsCardSnapshot, ...],
+        *,
+        allow_empty: bool,
+        fallback: Entity | None = None,
+    ) -> BattlegroundsAreaSnapshot:
+        visible_entities = [entity for entity in entities if not entity.hidden]
+        observed_entities = [*visible_entities]
+        if fallback is not None:
+            observed_entities.append(fallback)
+        positions = [entity.tag_int("ZONE_POSITION") for entity in visible_entities]
+        positioned_complete = not positions or (
+            all(position > 0 for position in positions)
+            and len(set(positions)) == len(positions)
+        )
+        identities_complete = all(
+            bool(entity.card_id or entity.public_name()) and bool(entity.card_type)
+            for entity in visible_entities
+        )
+        complete = bool(
+            (visible_entities or allow_empty)
+            and len(cards) == len(visible_entities)
+            and positioned_complete
+            and identities_complete
+        )
+        return BattlegroundsAreaSnapshot(
+            complete=complete,
+            revision=max(
+                (entity.last_revision for entity in observed_entities),
+                default=0,
+            ),
+            observed_at=max(
+                (entity.last_seen_at for entity in observed_entities),
+                default=0.0,
+            )
+            or None,
+            round=max(
+                (entity.last_battlegrounds_round for entity in observed_entities),
+                default=self.battlegrounds_round,
+            ),
+            phase=(
+                max(
+                    (
+                        (entity.last_seen_at, entity.last_battlegrounds_phase)
+                        for entity in observed_entities
+                    ),
+                    default=(0.0, self.phase),
+                )[1]
+                or self.phase
+            ),
+        )
 
     def _battlegrounds_hero_choices(self) -> tuple[BattlegroundsHeroChoiceSnapshot, ...]:
         if (
@@ -2203,7 +2595,7 @@ class PowerLogParser:
             position = entity.tag_int("ZONE_POSITION")
             if 1 <= position <= 7:
                 current = positioned.get(position)
-                if current is None or entity.entity_id < current.entity_id:
+                if current is None or entity.entity_id > current.entity_id:
                     positioned[position] = entity
             else:
                 unpositioned.append(entity)
@@ -2214,11 +2606,14 @@ class PowerLogParser:
         return sorted(unpositioned, key=lambda item: item.entity_id)[:7]
 
     def _cache_recruit_warband(self) -> None:
-        cards = self._battlegrounds_cards(
-            self._battlegrounds_board_entities(self.local_controller),
-            maximum=7,
-        )
+        entities = self._battlegrounds_board_entities(self.local_controller)
+        cards = self._battlegrounds_cards(entities, maximum=7)
         self._last_recruit_warband = cards
+        self._last_recruit_warband_area = self._battlegrounds_area(
+            entities,
+            cards,
+            allow_empty=True,
+        )
 
     @staticmethod
     def _is_battlegrounds_gameplay_entity(entity: Entity) -> bool:
@@ -2273,6 +2668,8 @@ class PowerLogParser:
     def _battlegrounds_lobby(self) -> tuple[BattlegroundsPlayerSnapshot, ...]:
         result: list[BattlegroundsPlayerSnapshot] = []
         next_opponent_player_id = self._resolved_next_opponent_player_id()
+        current_opponent_player_id = self.current_opponent_player_id
+        last_opponent_player_id = self.last_opponent_player_id
         local_team_id = self._battlegrounds_team_id(
             self.local_controller or 0,
             self._battlegrounds_local_hero(),
@@ -2312,6 +2709,8 @@ class PowerLogParser:
                     placement=placement,
                     eliminated=eliminated,
                     next_opponent=player_id == next_opponent_player_id,
+                    current_opponent=player_id == current_opponent_player_id,
+                    last_opponent=player_id == last_opponent_player_id,
                     is_teammate=(
                         not is_local
                         and self.battlegrounds_variant == "duos"
@@ -2329,7 +2728,7 @@ class PowerLogParser:
         return tuple(sorted(result, key=lambda item: (item.placement or 99, item.player_id))[:8])
 
     def _capture_observed_opponent_board(self) -> None:
-        player_id = self._resolved_next_opponent_player_id()
+        player_id = self._active_opponent_player_id()
         if player_id <= 0:
             return
         direct_entities = self._battlegrounds_board_entities(player_id)
@@ -2375,8 +2774,8 @@ class PowerLogParser:
         if self.bob_controller is not None and controller == self.bob_controller:
             if entity.entity_id in self._combat_bob_stale_entity_ids:
                 self._combat_bob_stale_entity_ids.clear()
-        next_opponent_player_id = self._resolved_next_opponent_player_id()
-        if controller != self.bob_controller and controller != next_opponent_player_id:
+        opponent_player_id = self._active_opponent_player_id()
+        if controller != self.bob_controller and controller != opponent_player_id:
             return
         self._capture_observed_opponent_board()
 
@@ -2388,6 +2787,8 @@ class PowerLogParser:
         ):
             return False
         self._combat_active_round = round_number
+        self.current_opponent_player_id = self._resolved_next_opponent_player_id()
+        self.next_opponent_player_id = 0
         self._combat_damage_taken = 0
         self._combat_damage_dealt = 0
         self._combat_bob_stale_entity_ids = {
@@ -2404,6 +2805,17 @@ class PowerLogParser:
         round_number = self._combat_active_round
         if round_number <= 0 or self._combat_result_emitted_round == round_number:
             return []
+        if self.current_opponent_player_id > 0:
+            self.last_opponent_player_id = self.current_opponent_player_id
+            self.last_opponent_round = round_number
+        self.current_opponent_player_id = 0
+        self._recruit_bob_stale_entity_ids = {
+            entity.entity_id
+            for entity in self.entities.values()
+            if self._controller(entity) == self.bob_controller
+            and entity.zone == "PLAY"
+            and self._is_battlegrounds_gameplay_entity(entity)
+        }
         self._combat_result_emitted_round = round_number
         if self._combat_damage_taken > 0 and self._combat_damage_dealt == 0:
             outcome, summary = "lost", f"第{round_number}回合战斗失利"
@@ -2485,6 +2897,12 @@ class PowerLogParser:
 
     def _mark_battlegrounds_combat_identity(self, entity: Entity) -> None:
         if (
+            self.phase == "recruit"
+            and entity.card_id
+            and self._controller(entity) == self.bob_controller
+        ):
+            self._recruit_bob_stale_entity_ids.discard(entity.entity_id)
+        if (
             self.phase == "combat"
             and entity.card_id
             and self._controller(entity) == self.bob_controller
@@ -2514,11 +2932,27 @@ class PowerLogParser:
 
     def _resolved_next_opponent_player_id(self) -> int:
         if self.next_opponent_player_id > 0:
-            return self.next_opponent_player_id
+            return self._sanitize_opponent_player_id(self.next_opponent_player_id)
+        if self.current_opponent_player_id > 0 or self.last_opponent_player_id > 0:
+            return 0
         local_player = self.entities.get(
             self.player_entities.get(self.local_controller or -1, -1)
         )
-        return local_player.tag_int("NEXT_OPPONENT_PLAYER_ID") if local_player else 0
+        player_id = local_player.tag_int("NEXT_OPPONENT_PLAYER_ID") if local_player else 0
+        return self._sanitize_opponent_player_id(player_id)
+
+    def _active_opponent_player_id(self) -> int:
+        if self.current_opponent_player_id > 0:
+            return self.current_opponent_player_id
+        return self._resolved_next_opponent_player_id()
+
+    def _sanitize_opponent_player_id(self, player_id: int) -> int:
+        if player_id <= 0 or player_id in {
+            self.local_controller,
+            self.bob_controller,
+        }:
+            return 0
+        return player_id
 
     def _observe_battlegrounds_counter(self, entity: Entity, tag: str, current: int) -> bool:
         player_id = self._battlegrounds_player_id(entity)

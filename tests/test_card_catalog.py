@@ -18,6 +18,7 @@ from hearthstone_companion_under_test.card_catalog import (
 )
 from hearthstone_companion_under_test.models import (
     BattlegroundsCardSnapshot,
+    BattlegroundsChoiceSnapshot,
     BattlegroundsHeroChoiceSnapshot,
     BattlegroundsPlayerSnapshot,
     BattlegroundsSnapshot,
@@ -506,12 +507,22 @@ def test_observed_facts_are_deduplicated_and_keep_zone_order(tmp_path: Path) -> 
                 _raw_card(1, "BG_TID_713", "A", tribes=["Mech"], golden_id=101),
                 _raw_card(2, "BG_HERO", "Hero", card_type="hero", tier=0),
                 _raw_card(3, "BG_HERO_CHOICE", "Choice", card_type="hero", tier=0),
+                _raw_card(
+                    4,
+                    "BG_CHOICE_SPELL",
+                    "Choice Spell",
+                    card_type="spell",
+                    tier=0,
+                ),
             ],
             fetched_at=1000.0,
         ),
     )
     catalog = BattlegroundsCardCatalog(cache, _logger(), network_enabled=False, now=lambda: 1001.0)
     snapshot = BattlegroundsSnapshot(
+        current_choice=BattlegroundsChoiceSnapshot(
+            options=(BattlegroundsCardSnapshot(card_id="BG_CHOICE_SPELL"),),
+        ),
         hero_choices=(BattlegroundsHeroChoiceSnapshot(card_id="BG_HERO_CHOICE"),),
         shop=(BattlegroundsCardSnapshot(card_id="BG_TID_713", attack=9, health=8),),
         hand=(BattlegroundsCardSnapshot(card_id="BG_TID_713"),),
@@ -531,20 +542,50 @@ def test_observed_facts_are_deduplicated_and_keep_zone_order(tmp_path: Path) -> 
     result = catalog.facts_for(snapshot)
 
     assert result["coverage"]["zone_ids"] == {
+        "current_choice": ["BG_CHOICE_SPELL"],
         "hero_choices": ["BG_HERO_CHOICE"],
         "shop": ["BG_TID_713"],
         "hand": ["BG_TID_713"],
         "warband": ["BG_TID_713_G"],
+        "mechanics": [],
         "heroes": ["BG_HERO"],
         "observed_opponent_boards": ["BG_TID_713"],
     }
-    assert result["coverage"]["unique_observed_count"] == 4
-    assert result["coverage"]["resolved_count"] == 4
+    assert result["coverage"]["unique_observed_count"] == 5
+    assert result["coverage"]["queried_count"] == 5
+    assert result["coverage"]["resolved_count"] == 5
     assert result["observed_card_facts"]["BG_HERO_CHOICE"]["card_type"] == "hero"
     assert result["observed_card_facts"]["BG_TID_713"]["golden_observation"] is False
     assert result["observed_card_facts"]["BG_TID_713_G"]["golden_observation"] is True
     assert result["observed_card_facts"]["BG_TID_713_G"]["normal_rules_text"]
     assert "attack" not in result["observed_card_facts"]["BG_TID_713"]
+
+
+def test_catalog_reports_bounded_query_truncation_and_mechanic_ids(tmp_path: Path) -> None:
+    catalog = BattlegroundsCardCatalog(
+        tmp_path / "missing.json.gz",
+        _logger(),
+        network_enabled=False,
+    )
+    snapshot = BattlegroundsSnapshot(
+        shop=tuple(
+            BattlegroundsCardSnapshot(card_id=f"BG_UNKNOWN_{index:02d}")
+            for index in range(41)
+        ),
+        mechanics={
+            "anomaly_dbf_id": 9001,
+            "quest": {"reward_dbf_id": 9002},
+            "trinket_dbf_ids": [9003],
+        },
+    )
+
+    coverage = catalog.facts_for(snapshot)["coverage"]
+
+    assert coverage["unique_observed_count"] == 44
+    assert coverage["queried_count"] == 40
+    assert len(coverage["missing_ids"]) == 40
+    assert coverage["truncated_count"] == 4
+    assert coverage["truncated_ids"] == ["BG_UNKNOWN_40", "9001", "9002", "9003"]
 
 
 def test_missing_catalog_does_not_hide_zone_coverage(tmp_path: Path) -> None:

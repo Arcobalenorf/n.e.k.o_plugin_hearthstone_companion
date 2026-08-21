@@ -90,10 +90,15 @@ type GameState = {
 type BattlegroundsCard = {
   card_id?: string
   name?: string
+  card_type?: string | null
   attack?: number
   health?: number | null
   tier?: number
   frozen?: boolean
+  position?: number
+  premium?: boolean | null
+  current_cost?: number | null
+  keywords?: Record<string, boolean | null>
 }
 
 type BattlegroundsHeroChoice = {
@@ -114,9 +119,11 @@ type BattlegroundsLobbyPlayer = {
   placement?: number
   eliminated?: boolean
   next_opponent?: boolean
+  current_opponent?: boolean
+  last_opponent?: boolean
   is_teammate?: boolean
   last_seen_round?: number
-  board?: BoardState & { is_last_observed?: boolean }
+  board?: BoardState & { observed_in_combat?: boolean; observed_round?: number }
 }
 
 type BattlegroundsState = {
@@ -128,6 +135,9 @@ type BattlegroundsState = {
   tavern_tier?: number
   frozen?: boolean
   next_opponent_player_id?: number
+  current_opponent_player_id?: number
+  last_opponent_player_id?: number
+  last_opponent_round?: number
   placement?: number
   hero_choices?: BattlegroundsHeroChoice[]
   shop?: BattlegroundsCard[]
@@ -284,6 +294,14 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
   const runtime = safeState.runtime || {}
   const game = safeState.game || {}
   const battlegrounds = game.battlegrounds || {}
+  const opponentPlayerId = battlegrounds.current_opponent_player_id
+    || battlegrounds.next_opponent_player_id
+    || battlegrounds.last_opponent_player_id
+  const opponentLabel = battlegrounds.current_opponent_player_id
+    ? t("battlegrounds.currentOpponent")
+    : battlegrounds.next_opponent_player_id
+      ? t("battlegrounds.nextOpponent")
+      : t("battlegrounds.lastOpponent")
   const season = safeState.battlegrounds_season || {}
   const seasonStats = safeState.battlegrounds_stats?.seasons?.[String(season.key || "")] || {}
   const statsStorage = safeState.battlegrounds_stats_storage || {}
@@ -691,7 +709,7 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
                   <StatCard label={t("battlegrounds.gold")} value={battlegrounds.gold == null ? t("common.notAvailable") : `${battlegrounds.gold}/${battlegrounds.max_gold ?? "?"}`} />
                   <StatCard label={t("battlegrounds.tavernTier")} value={battlegrounds.tavern_tier ?? 0} />
                   <StatCard label={t("battlegrounds.warbandSize")} value={battlegrounds.warband?.length ?? 0} />
-                  <StatCard label={t("battlegrounds.nextOpponent")} value={battlegrounds.next_opponent_player_id || t("common.unknown")} />
+                  <StatCard label={opponentLabel} value={opponentPlayerId || t("common.unknown")} />
                 </Grid>
                 <KeyValue
                   items={[
@@ -739,7 +757,7 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
                     { key: "health", label: t("battlegroundsLobby.health"), render: (row) => row.health == null ? t("common.unknown") : `${row.health}+${row.armor ?? 0}` },
                     { key: "tavern_tier", label: t("battlegroundsLobby.tier") },
                     { key: "placement", label: t("battlegroundsLobby.place"), render: (row) => row.placement || t("common.unknown") },
-                    { key: "next_opponent", label: t("battlegroundsLobby.status"), render: (row) => row.is_local ? t("battlegroundsLobby.local") : row.is_teammate ? t("battlegroundsLobby.teammate") : row.next_opponent ? t("battlegroundsLobby.next") : row.eliminated ? t("battlegroundsLobby.eliminated") : t("battlegroundsLobby.alive") },
+                    { key: "next_opponent", label: t("battlegroundsLobby.status"), render: (row) => row.is_local ? t("battlegroundsLobby.local") : row.is_teammate ? t("battlegroundsLobby.teammate") : row.current_opponent ? t("battlegroundsLobby.current") : row.next_opponent ? t("battlegroundsLobby.next") : row.last_opponent ? t("battlegroundsLobby.last") : row.eliminated ? t("battlegroundsLobby.eliminated") : t("battlegroundsLobby.alive") },
                     { key: "last_seen_round", label: t("battlegroundsLobby.observed"), render: (row) => row.last_seen_round ? t("battlegroundsLobby.observedRound", { value: row.last_seen_round }) : t("common.none") },
                   ]}
                 />
@@ -756,6 +774,7 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
                   maxRows={10}
                   emptyText={t("battlegroundsShop.empty")}
                   columns={[
+                    { key: "position", label: t("battlegroundsShop.position"), render: (row) => row.position || t("common.unknown") },
                     { key: "name", label: t("battlegroundsShop.card"), render: (row) => row.name || row.card_id || t("common.unknown") },
                     { key: "tier", label: t("battlegroundsShop.tier"), render: (row) => row.tier || t("common.unknown") },
                     { key: "attack", label: t("battlegroundsShop.stats"), render: (row) => `${row.attack ?? 0}/${row.health ?? 0}` },

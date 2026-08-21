@@ -140,12 +140,39 @@ def _bounded_json_value(
 
 def _compact_card(value: Any) -> dict[str, Any]:
     card = value if isinstance(value, Mapping) else {}
+    keywords = card.get("keywords") if isinstance(card.get("keywords"), Mapping) else {}
     return {
         "id": str(card.get("card_id") or "")[:40],
         "name": str(card.get("name") or "")[:40],
+        "type": str(card.get("card_type") or "")[:32],
         "attack": card.get("attack"),
         "health": card.get("health"),
         "tier": card.get("tier"),
+        "position": card.get("position"),
+        "premium": card.get("premium"),
+        "current_cost": card.get("current_cost"),
+        "keywords": {
+            str(key)[:32]: value
+            for key, value in keywords.items()
+            if value is not None
+        },
+        "unknown_keywords": [
+            str(key)[:32] for key, value in keywords.items() if value is None
+        ][:12],
+    }
+
+
+def _compact_battlegrounds_choice(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    return {
+        "choice_type": value.get("choice_type"),
+        "count_min": value.get("count_min"),
+        "count_max": value.get("count_max"),
+        "source": _compact_card(value.get("source")) if value.get("source") else None,
+        "options": [
+            _compact_card(card) for card in list(value.get("options") or [])[:8]
+        ],
     }
 
 
@@ -154,7 +181,9 @@ def _compact_battlegrounds(value: Any) -> dict[str, Any] | None:
         return None
     lobby = [item for item in list(value.get("lobby") or [])[:8] if isinstance(item, Mapping)]
     local = next((item for item in lobby if item.get("is_local")), None)
-    opponent = next((item for item in lobby if item.get("next_opponent")), None)
+    current_opponent = next((item for item in lobby if item.get("current_opponent")), None)
+    next_opponent = next((item for item in lobby if item.get("next_opponent")), None)
+    last_opponent = next((item for item in lobby if item.get("last_opponent")), None)
 
     def compact_player(player: Mapping[str, Any] | None) -> dict[str, Any] | None:
         if player is None:
@@ -178,6 +207,8 @@ def _compact_battlegrounds(value: Any) -> dict[str, Any] | None:
         "phase": value.get("phase"),
         "gold": value.get("gold"),
         "max_gold": value.get("max_gold"),
+        "refresh_cost": value.get("refresh_cost"),
+        "upgrade_cost": value.get("upgrade_cost"),
         "tavern_tier": value.get("tavern_tier"),
         "frozen": value.get("frozen"),
         "placement": value.get("placement"),
@@ -190,10 +221,20 @@ def _compact_battlegrounds(value: Any) -> dict[str, Any] | None:
             if isinstance(choice, Mapping)
         ],
         "local": compact_player(local),
-        "next_opponent": compact_player(opponent),
+        "current_opponent": compact_player(current_opponent),
+        "next_opponent": compact_player(next_opponent),
+        "last_opponent": compact_player(last_opponent),
+        "last_opponent_round": value.get("last_opponent_round"),
         "shop": [_compact_card(card) for card in list(value.get("shop") or [])[:3]],
         "hand": [_compact_card(card) for card in list(value.get("hand") or [])[:3]],
         "warband": [_compact_card(card) for card in list(value.get("warband") or [])[:7]],
+        "current_choice": _compact_battlegrounds_choice(value.get("current_choice")),
+        "economy": _bounded_json_value(
+            value.get("economy") or {}, string_limit=32, list_limit=4
+        ),
+        "areas": _bounded_json_value(
+            value.get("areas") or {}, string_limit=32, list_limit=6
+        ),
         "mechanics": _bounded_json_value(value.get("mechanics") or {}, string_limit=40, list_limit=4),
     }
 
@@ -314,13 +355,27 @@ def _minimal_battlegrounds(value: Any) -> dict[str, Any] | None:
         "round": value.get("round"),
         "phase": value.get("phase"),
         "gold": value.get("gold"),
+        "refresh_cost": value.get("refresh_cost"),
+        "upgrade_cost": value.get("upgrade_cost"),
         "tavern_tier": value.get("tavern_tier"),
         "placement": value.get("placement"),
         "local": compact_player(next((item for item in lobby if item.get("is_local")), None)),
+        "current_opponent": compact_player(
+            next((item for item in lobby if item.get("current_opponent")), None)
+        ),
         "next_opponent": compact_player(
             next((item for item in lobby if item.get("next_opponent")), None)
         ),
+        "last_opponent": compact_player(
+            next((item for item in lobby if item.get("last_opponent")), None)
+        ),
+        "last_opponent_round": value.get("last_opponent_round"),
         "shop_count": len(list(value.get("shop") or [])),
+        "choice_type": (
+            value.get("current_choice", {}).get("choice_type")
+            if isinstance(value.get("current_choice"), Mapping)
+            else None
+        ),
         "warband_count": len(list(value.get("warband") or [])),
     }
 
@@ -453,6 +508,18 @@ def build_llm_prompt(
                 "summary": str(event_payload["summary"])[:48],
             },
             "state": minimal_state,
+            "emotion_cue": emotion,
+        },
+        {
+            "event": {
+                "kind": event_payload["kind"],
+                "priority": event_payload["priority"],
+            },
+            "state": {
+                key: public_state.get(key)
+                for key in ("mode", "phase", "round", "active_side", "result")
+                if public_state.get(key) is not None
+            },
             "emotion_cue": emotion,
         },
     ]

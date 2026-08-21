@@ -28,7 +28,7 @@ _MAX_CARDS = 5_000
 _MAX_CHILD_RELATIONSHIPS = 32
 _PAGE_SIZE = 100
 _USER_AGENT = (
-    "NEKO-Hearthstone-Companion/0.2.0 "
+    "NEKO-Hearthstone-Companion/0.3.0 "
     "(+https://github.com/Arcobalenorf/n.e.k.o_plugin_hearthstone_companion)"
 )
 
@@ -827,16 +827,44 @@ class BattlegroundsCardCatalog:
         if battlegrounds is None:
             return {
                 **status,
-                "coverage": {"zone_ids": {}, "resolved_count": 0, "missing_ids": []},
+                "coverage": {
+                    "zone_ids": {},
+                    "unique_observed_count": 0,
+                    "queried_count": 0,
+                    "resolved_count": 0,
+                    "missing_ids": [],
+                    "truncated_count": 0,
+                    "truncated_ids": [],
+                },
                 "observed_card_facts": {},
             }
+        mechanics = battlegrounds.mechanics
+        quest = mechanics.get("quest") if isinstance(mechanics.get("quest"), Mapping) else {}
         zone_ids: dict[str, list[str]] = {
+            "current_choice": [
+                card.card_id
+                for card in (
+                    battlegrounds.current_choice.options
+                    if battlegrounds.current_choice is not None
+                    else ()
+                )
+                if card.card_id
+            ],
             "hero_choices": [
                 hero.card_id for hero in battlegrounds.hero_choices if hero.card_id
             ],
             "shop": [card.card_id for card in battlegrounds.shop if card.card_id],
             "hand": [card.card_id for card in battlegrounds.hand if card.card_id],
             "warband": [card.card_id for card in battlegrounds.warband if card.card_id],
+            "mechanics": [
+                str(value)
+                for value in (
+                    mechanics.get("anomaly_dbf_id"),
+                    quest.get("reward_dbf_id") if isinstance(quest, Mapping) else None,
+                    *list(mechanics.get("trinket_dbf_ids") or []),
+                )
+                if _integer(value) > 0
+            ],
             "heroes": [player.hero_card_id for player in battlegrounds.lobby if player.hero_card_id],
             "observed_opponent_boards": [
                 card.card_id
@@ -857,7 +885,9 @@ class BattlegroundsCardCatalog:
             hero_power_index = dict(self._hero_power_by_hero_provider_id)
         facts: dict[str, dict[str, Any]] = {}
         missing: list[str] = []
-        for identifier in ordered_ids[:40]:
+        queried_ids = ordered_ids[:40]
+        truncated_ids = ordered_ids[40:]
+        for identifier in queried_ids:
             match = index.get(identifier)
             if match is None:
                 missing.append(identifier)
@@ -897,8 +927,11 @@ class BattlegroundsCardCatalog:
             "coverage": {
                 "zone_ids": zone_ids,
                 "unique_observed_count": len(ordered_ids),
+                "queried_count": len(queried_ids),
                 "resolved_count": len(facts),
                 "missing_ids": missing,
+                "truncated_count": len(truncated_ids),
+                "truncated_ids": truncated_ids[:20],
             },
             "observed_card_facts": facts,
         }

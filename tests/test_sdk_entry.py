@@ -12,7 +12,9 @@ from typing import Any, Callable
 import pytest
 from hearthstone_companion_under_test.config import CompanionConfig
 from hearthstone_companion_under_test.models import (
+    BattlegroundsAreaSnapshot,
     BattlegroundsCardSnapshot,
+    BattlegroundsEconomySnapshot,
     BattlegroundsHeroChoiceSnapshot,
     BattlegroundsPlayerSnapshot,
     BattlegroundsSnapshot,
@@ -203,6 +205,82 @@ def _make_lifecycle_test_plugin(
         warning=lambda *_args, **_kwargs: None,
     )
     return plugin, workers, calls
+
+
+def _bg_area(
+    *,
+    round: int,
+    phase: str,
+    observed_at: float,
+    revision: int = 1,
+    complete: bool = True,
+) -> BattlegroundsAreaSnapshot:
+    return BattlegroundsAreaSnapshot(
+        complete=complete,
+        revision=revision,
+        observed_at=observed_at,
+        round=round,
+        phase=phase,
+    )
+
+
+def _recruit_snapshot(
+    *,
+    round: int,
+    observed_at: float,
+    shop: tuple[BattlegroundsCardSnapshot, ...],
+    hand: tuple[BattlegroundsCardSnapshot, ...] = (),
+    warband: tuple[BattlegroundsCardSnapshot, ...] = (),
+    gold: int = 5,
+    max_gold: int = 5,
+    refresh_cost: int = 1,
+    upgrade_cost: int = 5,
+    variant: str = "solo",
+) -> BattlegroundsSnapshot:
+    return BattlegroundsSnapshot(
+        variant=variant,
+        round=round,
+        phase="recruit",
+        gold=gold,
+        max_gold=max_gold,
+        refresh_cost=refresh_cost,
+        upgrade_cost=upgrade_cost,
+        shop=shop,
+        hand=hand,
+        warband=warband,
+        economy=BattlegroundsEconomySnapshot(
+            upgrade_cost=upgrade_cost,
+            refresh_cost=refresh_cost,
+            revision=1,
+            observed_at=observed_at,
+        ),
+        areas={
+            "shop": _bg_area(round=round, phase="recruit", observed_at=observed_at),
+            "hand": _bg_area(round=round, phase="recruit", observed_at=observed_at),
+            "warband": _bg_area(round=round, phase="recruit", observed_at=observed_at),
+            "economy": _bg_area(round=round, phase="recruit", observed_at=observed_at),
+        },
+    )
+
+
+def _combat_snapshot(
+    *,
+    round: int,
+    observed_at: float,
+    warband: tuple[BattlegroundsCardSnapshot, ...],
+    shop: tuple[BattlegroundsCardSnapshot, ...] = (),
+    variant: str = "solo",
+) -> BattlegroundsSnapshot:
+    return BattlegroundsSnapshot(
+        variant=variant,
+        round=round,
+        phase="combat",
+        shop=shop,
+        warband=warband,
+        areas={
+            "warband": _bg_area(round=round, phase="combat", observed_at=observed_at),
+        },
+    )
 
 
 async def _return_async(value: Any) -> Any:
@@ -1224,12 +1302,22 @@ def test_llm_tool_descriptions_route_battlegrounds_strategy_exclusively(monkeypa
         assert phrase in current_description
     assert "hearthstone_battlegrounds_advice instead" in current_description
     assert "never answer those questions as constructed" in current_description
-    for keyword in ("酒馆", "流派", "阵容", "升本", "稳血", "买什么"):
+    for keyword in (
+        "Battlegrounds",
+        "hero selection",
+        "tavern spells",
+        "warband composition and positioning",
+        "leveling",
+        "stabilizing",
+        "purchases",
+        "refreshes",
+    ):
         assert keyword in advice_description
     assert "Battlegrounds-only" in advice_description
     assert "never answer with constructed decks" in advice_description
     topic_description = advice_metadata["parameters"]["properties"]["topic"]["description"]
-    assert "现在酒馆玩什么流派" in topic_description
+    assert "live match" in topic_description
+    assert "purchases" in topic_description
     assert "current_strategy" in topic_description
     assert "season_meta" in topic_description
     assert "never composition win-rate rankings" in topic_description
@@ -4977,9 +5065,10 @@ def test_live_tools_fail_closed_while_log_path_change_is_reconciling(
         mode="battlegrounds",
         phase="recruit",
         game_number=3,
-        battlegrounds=BattlegroundsSnapshot(
-            phase="recruit",
-            shop=(BattlegroundsCardSnapshot(card_id="BG_SHOP_1"),),
+        battlegrounds=_recruit_snapshot(
+            round=3,
+            observed_at=now,
+            shop=(BattlegroundsCardSnapshot(card_id="BG_SHOP_1", current_cost=3),),
         ),
     )
 
@@ -5084,11 +5173,11 @@ def test_battlegrounds_advice_separates_local_evidence_from_global_meta(monkeypa
     snapshot = GameSnapshot(
         mode="battlegrounds",
         phase="playing",
-        battlegrounds=BattlegroundsSnapshot(
+        battlegrounds=_recruit_snapshot(
             variant="solo",
             round=7,
-            phase="recruit",
-            shop=(BattlegroundsCardSnapshot(card_id="BG_SHOP_1"),),
+            observed_at=time.time(),
+            shop=(BattlegroundsCardSnapshot(card_id="BG_SHOP_1", current_cost=3),),
         ),
     )
     plugin = types.SimpleNamespace(
@@ -5160,11 +5249,11 @@ def test_battlegrounds_advice_includes_attributed_observed_card_facts(monkeypatc
     snapshot = GameSnapshot(
         mode="battlegrounds",
         phase="playing",
-        battlegrounds=BattlegroundsSnapshot(
+        battlegrounds=_recruit_snapshot(
             variant="solo",
             round=4,
-            phase="recruit",
-            shop=(BattlegroundsCardSnapshot(card_id="BG_TEST"),),
+            observed_at=time.time(),
+            shop=(BattlegroundsCardSnapshot(card_id="BG_TEST", current_cost=3),),
         ),
     )
     facts = {
@@ -5275,18 +5364,20 @@ def test_battlegrounds_advice_recaptures_when_catalog_wait_enters_combat(monkeyp
         mode="battlegrounds",
         phase="recruit",
         game_number=3,
-        battlegrounds=BattlegroundsSnapshot(
-            phase="recruit",
-            shop=(BattlegroundsCardSnapshot(card_id="OLD_SHOP"),),
+        battlegrounds=_recruit_snapshot(
+            round=6,
+            observed_at=now,
+            shop=(BattlegroundsCardSnapshot(card_id="OLD_SHOP", current_cost=3),),
         ),
     )
     combat = GameSnapshot(
         mode="battlegrounds",
         phase="combat",
         game_number=3,
-        battlegrounds=BattlegroundsSnapshot(
-            phase="combat",
-            shop=(BattlegroundsCardSnapshot(card_id="OLD_SHOP"),),
+        battlegrounds=_combat_snapshot(
+            round=6,
+            observed_at=now,
+            shop=(BattlegroundsCardSnapshot(card_id="OLD_SHOP", current_cost=3),),
             warband=(BattlegroundsCardSnapshot(card_id="PUBLIC_BOARD"),),
         ),
     )
@@ -5311,6 +5402,8 @@ def test_battlegrounds_advice_recaptures_when_catalog_wait_enters_combat(monkeyp
     monitor = Monitor()
 
     class Catalog:
+        calls: list[object] = []
+
         def status(self) -> dict[str, Any]:
             return {"available": False, "degraded_reason": "loading"}
 
@@ -5318,8 +5411,18 @@ def test_battlegrounds_advice_recaptures_when_catalog_wait_enters_combat(monkeyp
             monitor.current = combat
             return True
 
-        def facts_for(self, _value: Any) -> dict[str, Any]:
-            raise AssertionError("combat state must not request recruit-shop facts")
+        def facts_for(self, value: Any) -> dict[str, Any]:
+            self.calls.append(value)
+            assert value.phase == "combat"
+            assert value.shop == ()
+            assert value.hand == ()
+            assert value.current_choice is None
+            return {
+                "available": True,
+                "observed_card_facts": {
+                    "PUBLIC_BOARD": {"name": "Public Board", "card_type": "MINION"}
+                },
+            }
 
     plugin = types.SimpleNamespace(
         cfg=CompanionConfig(llm_data_consent=True),
@@ -5340,12 +5443,13 @@ def test_battlegrounds_advice_recaptures_when_catalog_wait_enters_combat(monkeyp
     assert result["available"] is True
     assert result["current_public_state"]["phase"] == "combat"
     assert result["current_public_state"]["shop"] == []
-    assert result["capabilities"]["specific_purchase_advice"] == {
-        "available": False,
-        "reason": "no_fresh_recruit_shop",
-        "evidence": "",
-    }
+    purchase = result["capabilities"]["specific_purchase_advice"]
+    assert purchase["available"] is False
+    assert purchase["reason"] in {"no_fresh_recruit_shop", "insufficient_recruit_evidence"}
+    assert purchase["evidence"] == ""
+    assert purchase["missing_evidence"]
     assert result["capabilities"]["combat_commentary"]["available"] is True
+    assert len(plugin._catalog.calls) == 1
 
 
 def test_battlegrounds_advice_recaptures_freshness_after_catalog_wait(monkeypatch) -> None:
@@ -5465,10 +5569,22 @@ def test_battlegrounds_hero_comparison_requires_live_observed_choices(monkeypatc
                 hero_choices=choices,
             ),
         )
+        catalog = types.SimpleNamespace(
+            status=lambda: {"available": True},
+            facts_for=lambda _value: {
+                "available": True,
+                "observed_card_facts": {
+                    choice.card_id: {"name": choice.name or choice.card_id}
+                    for choice in choices
+                    if choice.card_id
+                },
+            },
+        )
         plugin = types.SimpleNamespace(
             cfg=CompanionConfig(llm_data_consent=True),
             _season={"key": "season-14-36.2", "status": "bundled_static"},
             _stats=BattlegroundsStats(),
+            _catalog=catalog,
             _ensure_monitor=lambda: types.SimpleNamespace(
                 snapshot=lambda: snapshot,
                 status=lambda: types.SimpleNamespace(
@@ -5566,15 +5682,35 @@ def test_battlegrounds_purchase_advice_requires_fresh_recruit_shop(monkeypatch) 
         mode="battlegrounds",
         phase="recruit",
         game_number=2,
-        battlegrounds=BattlegroundsSnapshot(
-            phase="recruit",
-            shop=(BattlegroundsCardSnapshot(card_id="BG_MINION_1", name="Minion One"),),
+        battlegrounds=_recruit_snapshot(
+            round=2,
+            observed_at=now,
+            shop=(
+                BattlegroundsCardSnapshot(
+                    card_id="BG_MINION_1",
+                    name="Minion One",
+                    card_type="MINION",
+                    current_cost=3,
+                ),
+            ),
         ),
+    )
+    catalog = types.SimpleNamespace(
+        status=lambda: {"available": True},
+        facts_for=lambda value: {
+            "available": True,
+            "observed_card_facts": {
+                "BG_MINION_1": {"name": "Minion One", "card_type": "MINION"}
+            },
+        }
+        if value is snapshot.battlegrounds
+        else {"available": False},
     )
     plugin = types.SimpleNamespace(
         cfg=CompanionConfig(llm_data_consent=True),
         _season={"key": "season-14-36.2", "status": "bundled_static"},
         _stats=BattlegroundsStats(),
+        _catalog=catalog,
         _ensure_monitor=lambda: types.SimpleNamespace(
             snapshot=lambda: snapshot,
             status=lambda: types.SimpleNamespace(
@@ -5594,7 +5730,7 @@ def test_battlegrounds_purchase_advice_requires_fresh_recruit_shop(monkeypatch) 
 
     capability = result["capabilities"]["specific_purchase_advice"]
     assert capability["available"] is True
-    assert capability["evidence"] == "fresh_recruit_shop"
+    assert capability["evidence"] == "fresh_complete_recruit_context_with_actual_costs"
     assert result["current_public_state"]["shop"][0]["card_id"] == "BG_MINION_1"
 
 
@@ -5607,8 +5743,9 @@ def test_battlegrounds_combat_contract_hides_shop_and_allows_only_board_commenta
         mode="battlegrounds",
         phase="combat",
         game_number=2,
-        battlegrounds=BattlegroundsSnapshot(
-            phase="combat",
+        battlegrounds=_combat_snapshot(
+            round=8,
+            observed_at=now,
             shop=(BattlegroundsCardSnapshot(card_id="STALE_SHOP", name="Stale Shop"),),
             warband=(BattlegroundsCardSnapshot(card_id="PUBLIC_BOARD", name="Board Minion"),),
         ),
@@ -5645,7 +5782,13 @@ def test_battlegrounds_combat_contract_hides_shop_and_allows_only_board_commenta
     assert result["capabilities"]["specific_purchase_advice"]["available"] is False
     assert result["capabilities"]["combat_commentary"]["available"] is True
     assert result["answer_contract"]["combat_never_implies_current_shop_visibility"] is True
-    assert catalog_calls == []
+    assert len(catalog_calls) == 1
+    catalog_snapshot = catalog_calls[0]
+    assert catalog_snapshot.phase == "combat"
+    assert catalog_snapshot.shop == ()
+    assert catalog_snapshot.hand == ()
+    assert catalog_snapshot.current_choice is None
+    assert catalog_snapshot.hero_choices == ()
 
 
 def test_hero_performance_targets_current_local_hero_sample(monkeypatch) -> None:
@@ -5776,3 +5919,125 @@ def test_post_game_requires_a_recent_ended_snapshot(monkeypatch) -> None:
     assert stale["available"] is False
     assert stale["reason"] == "no_recent_battlegrounds_post_game"
     assert stale["current_public_state"] is None
+
+
+def _llm_recovery_plugin(entry: Any) -> tuple[Any, list[str], list[dict[str, Any]]]:
+    unregistered: list[str] = []
+    registered: list[dict[str, Any]] = []
+    specs = [
+        {
+            "name": name,
+            "description": f"description for {name}",
+            "parameters": {"type": "object", "properties": {}},
+            "timeout_seconds": 5.0,
+            "role": None,
+        }
+        for name in entry._LLM_TOOL_HANDLER_NAMES
+    ]
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.ctx = types.SimpleNamespace(plugin_id="hearthstone_companion")
+    plugin._started = True
+    plugin._llm_tool_recovery_task = None
+    plugin._llm_tool_recovery_specs = {}
+    plugin.list_llm_tools = lambda: [dict(item) for item in specs]
+    plugin.unregister_llm_tool = lambda name: unregistered.append(name) or True
+    plugin.register_llm_tool = lambda **kwargs: registered.append(kwargs) or True
+    plugin.logger = types.SimpleNamespace(
+        info=lambda *_args, **_kwargs: None,
+        warning=lambda *_args, **_kwargs: None,
+    )
+    return plugin, unregistered, registered
+
+
+def _remote_registry(
+    entry: Any,
+    *,
+    names: set[str],
+    roles: tuple[str, ...] = ("lanlan-a",),
+) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "tools_by_role": {
+            role: [
+                {
+                    "name": name,
+                    "source": "plugin:hearthstone_companion",
+                    "is_remote": True,
+                }
+                for name in sorted(names)
+            ]
+            for role in roles
+        },
+    }
+
+
+def test_llm_tool_recovery_restores_tools_missing_after_initial_registration_race(
+    monkeypatch,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    plugin, unregistered, registered = _llm_recovery_plugin(entry)
+    monkeypatch.setattr(
+        entry,
+        "_fetch_main_tool_registry",
+        lambda: _remote_registry(entry, names=set()),
+    )
+
+    assert asyncio.run(plugin._check_and_recover_llm_tools()) is True
+
+    expected = sorted(entry._LLM_TOOL_HANDLER_NAMES)
+    assert unregistered == expected
+    assert sorted(item["name"] for item in registered) == expected
+    assert all(callable(item["handler"]) for item in registered)
+
+
+def test_llm_tool_recovery_detects_main_server_registry_restart(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    plugin, unregistered, registered = _llm_recovery_plugin(entry)
+    expected = set(entry._LLM_TOOL_HANDLER_NAMES)
+    registries = [
+        _remote_registry(entry, names=expected, roles=("lanlan-a", "lanlan-b")),
+        _remote_registry(entry, names=set(), roles=("lanlan-a", "lanlan-b")),
+    ]
+    monkeypatch.setattr(entry, "_fetch_main_tool_registry", lambda: registries.pop(0))
+
+    async def scenario() -> None:
+        assert await plugin._check_and_recover_llm_tools() is True
+        assert registered == []
+        assert await plugin._check_and_recover_llm_tools() is True
+
+    asyncio.run(scenario())
+
+    assert set(unregistered) == expected
+    assert {item["name"] for item in registered} == expected
+
+
+def test_llm_tool_recovery_does_not_duplicate_healthy_registration(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    plugin, unregistered, registered = _llm_recovery_plugin(entry)
+    expected = set(entry._LLM_TOOL_HANDLER_NAMES)
+    monkeypatch.setattr(
+        entry,
+        "_fetch_main_tool_registry",
+        lambda: _remote_registry(entry, names=expected, roles=("lanlan-a", "lanlan-b")),
+    )
+
+    assert asyncio.run(plugin._check_and_recover_llm_tools()) is True
+    assert unregistered == []
+    assert registered == []
+
+
+def test_shutdown_stops_llm_tool_recovery_task(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    plugin, _unregistered, _registered = _llm_recovery_plugin(entry)
+
+    async def scenario() -> tuple[bool, asyncio.Task[None]]:
+        task = asyncio.create_task(asyncio.sleep(3600))
+        plugin._llm_tool_recovery_task = task
+        stopped = await plugin._stop_llm_tool_recovery()
+        return stopped, task
+
+    stopped, task = asyncio.run(scenario())
+
+    assert stopped is True
+    assert task.cancelled()
+    assert plugin._llm_tool_recovery_task is None

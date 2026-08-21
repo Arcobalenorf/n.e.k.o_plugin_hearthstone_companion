@@ -43,7 +43,7 @@ hsbg.cards public API --> fixed-origin background GET --> atomic cache --> obser
 
 `PowerLogTailer` 以 100 ms 周期增量跟随最新 `Power.log`，处理轮换、截断和首次接入上限。首次恢复默认且最多读取末尾 64 MiB，并从窗口内最新的完整 `GameState CREATE_GAME` 边界开始，兼容 LF 与 CRLF；恢复字节只在本机逐行解析，不会进入模型请求。`PowerLogParser` 解析实体和 tag 变化，`CompanionMonitor` 是状态唯一写入者；UI、工具和统计只取得不可变快照。Hosted UI 打开时每 500 ms 串行拉取一次不可变状态，刷新失败不会覆盖用户尚未保存的草稿。
 
-每次日志换源、读取器重建或停止后重启都会进入新的 source generation，并清空上一代的行/事件时间。bootstrap 只恢复当前公开状态，不重放主动解说、终局事件或统计；日志超过实时窗口后会退出角色场景，只有同一代来源重新出现新数据才恢复。工具可用性与场景 context 使用同一套新鲜度判定，旧来源时间不能让历史快照冒充实时局势。
+每次日志换源、读取器重建或停止后重启都会进入新的 source generation，并清空上一代的行/事件时间。bootstrap 只恢复当前公开状态，不重放主动解说、终局事件或统计；日志超过实时窗口后会退出角色场景，只有同一代来源重新出现新数据才恢复。工具可用性与场景 context 使用同一套新鲜度判定，并以不可变 `GameSnapshot` 的实际变化时间为准；无关日志增长只更新 `last_line_at`，不会给旧商店或旧战团续命。
 
 实时链路按日志职责合并而不是二选一：`PowerTaskList.DebugPrintPower` 是动态实体、tag 和 block 的权威实时流；`GameState.DebugPrintGame` 提供模式元数据；`GameState.DebugPrintPower` 只提供最早的新局边界、受限静态实体补全和 `STATE=COMPLETE`/终局 `PLAYSTATE`。新局静态包先进入隔离暂存区，直到 PowerTaskList 确认 `CREATE_GAME` 后才提交；进行中的静态补全只能填空，不能覆盖 PowerTaskList 已观察字段，也不能恢复被 `HIDE_ENTITY` 撤销的可见性。
 
@@ -51,7 +51,7 @@ hsbg.cards public API --> fixed-origin background GET --> atomic cache --> obser
 
 战棋实现不假设本地 `PlayerID=1`。Bob 通过 `BACON_DUMMY_PLAYER` 识别；大厅由带 `PLAYER_ID` 的英雄实体组成；单排和双排分别使用可验证的战斗状态 tag；最终名次来自本地英雄的 `PLAYER_LEADERBOARD_PLACE`。
 
-对手战团是过去战斗中看到的公开信息，快照始终携带 `last_seen_round` 和 `is_last_observed`，禁止把它描述成当前阵容。战斗边沿只隔离上一轮 Bob 商店；只有实体出现明确的 `ATTACKING/DEFENDING` 战斗标记后，才在每场公开战斗开始时冻结首次确认的阵容。插件按对手保留最近一次观察，同一场战斗中产生的召唤物、变形或死亡不会改写这份记录。记录保留随从 CardID、名称、攻血和星级，供后续陪伴回忆和规则事实查询。缺失 `CARDTYPE` 的实体必须额外具备合法站位或攻血联合证据，内部效果实体不能仅凭 CardID 进入公开战团。`snapshot()` 与 `to_public_dict()` 必须保持纯读，UI 刷新或工具查询频率不能改变解析结果。
+对手关系按阶段拆成 `next`、`current` 和 `last`，本地玩家与 Bob 永远不能成为对手；战斗开始时锁定本轮对手，结束后再转为带回合号的上轮对手。对手战团是战斗中看到的公开信息，快照始终携带 `last_seen_round`、`observed_in_combat` 和 `observed_round`，禁止把历史阵容描述成当前阵容。战斗开始时隔离上一轮 Bob 商店，战斗结束时也隔离 Bob 控制器下的战斗镜像，直到招募日志明确刷新对应实体后才重新进入当前商店。只有实体出现明确的 `ATTACKING/DEFENDING` 战斗标记后，才在每场公开战斗开始时冻结首次确认的阵容。插件按对手保留最近一次观察，同一场战斗中产生的召唤物、变形或死亡不会改写这份记录。记录保留随从 CardID、名称、攻血、星级和站位，供后续陪伴回忆和规则事实查询。缺失 `CARDTYPE` 的实体必须额外具备合法站位或攻血联合证据，内部效果实体不能仅凭 CardID 进入公开战团。`snapshot()` 与 `to_public_dict()` 必须保持纯读，UI 刷新或工具查询频率不能改变解析结果。
 
 英雄选择快照只收集 `Power.log` 明确归属于本地 controller、未隐藏、未锁定且带可选/皮肤标记的英雄。候选持续保留到本地玩家明确出现 `MULLIGAN_STATE=DONE`；选择完成标记在一局内单调，迟到的 INPUT/DEALING 镜像不会重新打开候选，普通招募阶段信号也不会提前清空。它不根据卡池、远端玩家或缺失日志补猜候选；选择完成后的我方英雄仍由大厅实体识别。
 
@@ -91,6 +91,10 @@ hsbg.cards public API --> fixed-origin background GET --> atomic cache --> obser
 数据同意开启后工具即可使用，不要求同时开启主动解说。这让用户可以安静游玩，只在主动提问时获得角色回答。
 
 `current_strategy` 在新鲜的英雄选择阶段可以依据实际观测候选和带来源的英雄规则回答“这几个英雄选哪个”，但必须说明没有授权的全局胜率。只有新鲜招募阶段才允许把当前商店用于具体购买、刷新、冻结或升本建议；战斗阶段没有当前商店决策，缓存状态也只能用于说明最近观察，均不得输出成可执行的即时购买建议。赛季规则、本机英雄聚合表现和对局复盘使用各自独立的可用性条件，不能用其他历史样本冒充当前英雄或刚结束的一局。
+
+酒馆卡牌快照保存日志实际观测的 `card_type`、`current_cost`、`premium`、当前位置和当前关键词；刷新/升本费用优先读取对应 `GAME_MODE_BUTTON_SLOT` 按钮实体。商店、手牌、战团、经济和 Choice 分别携带完整度、revision、回合、阶段与观测时间。未观测的动态值保持 `null`，不使用公共目录或默认规则补猜。购买、升本可负担性、升本策略、刷新、Choice 与站位都有独立 capability；只有 `available=true` 才能给对应具体建议，`partial` 只能陈述事实、缺口和条件式思路。
+
+两个 `@llm_tool` 仍由 SDK 在插件构造时自动注册。插件启动后另起有界后台任务，按官方 Tool Calling 文档定期读取 loopback `GET /api/tools`；若首启竞态或 main server 重启导致任一角色缺少本插件工具，则通过公开的 `unregister_llm_tool` / `register_llm_tool` 重新发出注册。健康注册不会重复写入，shutdown 会先取消恢复任务。
 
 卡牌目录不做流派评分、胜率排序或本地推荐。远端 `rules_text` 经过 HTML 清洗和长度限制，仍被标记为不可信参考数据；角色必须核对 provider、patch、checked_at、stale 和覆盖率。常规 `*_G` 金卡会映射到金色规则，少量旧式或不规则 CardID 会进入 `missing_ids`，角色不得猜测缺失元数据。目录不可用不会令实时局势整体不可用。
 
