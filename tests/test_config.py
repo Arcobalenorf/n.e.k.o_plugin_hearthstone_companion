@@ -25,5 +25,5 @@ def test_missing_boolean_settings_keep_declared_defaults() -> None:
     assert config.monitor_on_start is True
     assert config.card_catalog_network_enabled is True
     assert config.overlay_enabled is True
-    assert config.llm_data_consent is False
+    assert config.llm_data_consent is True
     assert config.initial_read_max_bytes == 64 * 1024 * 1024

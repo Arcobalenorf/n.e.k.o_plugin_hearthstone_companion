@@ -25,12 +25,12 @@ def test_smoke_parse_fixture_into_public_snapshot() -> None:
     assert "111" not in repr(public)
 
 
-def test_smoke_default_config_is_privacy_preserving() -> None:
+def test_smoke_default_config_enables_questions_not_proactive_commentary() -> None:
     config = CompanionConfig()
 
     assert config.monitor_on_start is True
     assert config.llm_commentary_enabled is False
-    assert config.llm_data_consent is False
+    assert config.llm_data_consent is True
 
 
 def test_manifest_is_passive_so_admin_entries_do_not_enter_agent_routing() -> None:

@@ -114,7 +114,7 @@ Plugin Store 长期只保存赛季/模式/英雄维度的聚合计数。N.E.K.O 
 | --- | --- | --- |
 | `monitor_on_start` | `true` | 启动后监听日志 |
 | `initial_read_max_bytes` | `67108864` | 首次本地恢复最多读取 64 MiB |
-| `llm_data_consent` | `false` | 允许工具/上下文读取过滤后的玩家可见局势 |
+| `llm_data_consent` | `true` | 允许工具/上下文读取过滤后的玩家可见局势；用户可显式关闭 |
 | `llm_commentary_enabled` | `false` | 允许角色主动解说 |
 | `llm_min_priority` | `5` | 主动事件最低优先级 |
 | `llm_cooldown_seconds` | `25` | 普通主动解说冷却 |

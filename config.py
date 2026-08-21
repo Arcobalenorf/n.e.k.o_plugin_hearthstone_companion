@@ -35,7 +35,7 @@ class CompanionConfig:
     poll_interval_seconds: float = 0.1
     initial_read_max_bytes: int = 64 * 1024 * 1024
     llm_commentary_enabled: bool = False
-    llm_data_consent: bool = False
+    llm_data_consent: bool = True
     llm_min_priority: int = 5
     llm_cooldown_seconds: float = 25.0
     llm_critical_cooldown_seconds: float = 8.0
@@ -62,7 +62,7 @@ class CompanionConfig:
                 data.get("initial_read_max_bytes"), 64 * 1024 * 1024, 1024 * 1024, 64 * 1024 * 1024
             ),
             llm_commentary_enabled=_strict_bool(data, "llm_commentary_enabled", False),
-            llm_data_consent=_strict_bool(data, "llm_data_consent", False),
+            llm_data_consent=_strict_bool(data, "llm_data_consent", True),
             llm_min_priority=_bounded_int(data.get("llm_min_priority"), 5, 1, 10),
             llm_cooldown_seconds=_bounded_float(data.get("llm_cooldown_seconds"), 25.0, 5.0, 300.0),
             llm_critical_cooldown_seconds=_bounded_float(

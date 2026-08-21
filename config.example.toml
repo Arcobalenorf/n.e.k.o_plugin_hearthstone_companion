@@ -5,7 +5,7 @@ monitor_on_start = true
 
 # 数据同意允许问答工具读取过滤后的玩家可见局势；主动解说只处理有情绪价值的关键事件。
 llm_commentary_enabled = false
-llm_data_consent = false
+llm_data_consent = true
 llm_min_priority = 5
 llm_cooldown_seconds = 25
 llm_critical_cooldown_seconds = 8

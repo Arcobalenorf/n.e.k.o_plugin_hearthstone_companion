@@ -241,7 +241,7 @@ type ActionOutcome = {
 
 const DEFAULT_SETTINGS: SettingsDraft = {
   llm_commentary_enabled: false,
-  llm_data_consent: false,
+  llm_data_consent: true,
   target_lanlan: "",
   card_catalog_network_enabled: true,
   overlay_enabled: true,
@@ -251,9 +251,10 @@ const DEFAULT_SETTINGS: SettingsDraft = {
 }
 
 function asSettingsDraft(value?: SettingsState): SettingsDraft {
+  const dataSharingEnabled = value?.llm_data_consent !== false
   return {
-    llm_commentary_enabled: Boolean(value?.llm_commentary_enabled && value?.llm_data_consent),
-    llm_data_consent: Boolean(value?.llm_data_consent),
+    llm_commentary_enabled: Boolean(value?.llm_commentary_enabled && dataSharingEnabled),
+    llm_data_consent: dataSharingEnabled,
     target_lanlan: String(value?.target_lanlan || ""),
     card_catalog_network_enabled: value?.card_catalog_network_enabled !== false,
     overlay_enabled: value?.overlay_enabled !== false,

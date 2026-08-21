@@ -43,6 +43,16 @@ def test_manifest_initial_read_default_matches_runtime() -> None:
     assert manifest["hearthstone_companion"]["initial_read_max_bytes"] == runtime_default
 
 
+def test_manifest_enables_game_state_questions_by_default() -> None:
+    from hearthstone_companion_under_test.config import CompanionConfig
+
+    with (ROOT / "plugin.toml").open("rb") as handle:
+        manifest = tomllib.load(handle)
+
+    assert CompanionConfig.from_mapping({}).llm_data_consent is True
+    assert manifest["hearthstone_companion"]["llm_data_consent"] is True
+
+
 def test_panel_literal_translation_keys_exist() -> None:
     translations = _load_locale("en.json")
     panel_source = (ROOT / "ui" / "panel.tsx").read_text(encoding="utf-8")
@@ -86,6 +96,8 @@ def test_primary_setup_is_offline_first_and_keeps_log_details_in_diagnostics() -
     assert "settings.logPath" not in setup_source
     assert "actions.enable_companion.questionsOnly" in panel_source
     assert "actions.enable_companion.withCommentary" in panel_source
+    assert "llm_data_consent: true" in panel_source
+    assert "value?.llm_data_consent !== false" in panel_source
 
 
 def test_successful_action_is_not_reclassified_when_followup_refresh_fails() -> None:
