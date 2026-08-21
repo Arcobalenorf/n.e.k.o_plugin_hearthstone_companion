@@ -138,12 +138,22 @@ def _bounded_json_value(
     return " ".join(str(value).split())[:string_limit]
 
 
-def _compact_card(value: Any) -> dict[str, Any]:
+def _compact_card(
+    value: Any,
+    *,
+    string_limit: int = 40,
+    keyword_limit: int = 12,
+) -> dict[str, Any]:
     card = value if isinstance(value, Mapping) else {}
     keywords = card.get("keywords") if isinstance(card.get("keywords"), Mapping) else {}
+    known_keywords = [
+        (str(key)[:32], keyword_value)
+        for key, keyword_value in keywords.items()
+        if keyword_value is not None
+    ][: max(0, int(keyword_limit))]
     return {
-        "id": str(card.get("card_id") or "")[:40],
-        "name": str(card.get("name") or "")[:40],
+        "id": str(card.get("card_id") or "")[:string_limit],
+        "name": str(card.get("name") or "")[:string_limit],
         "type": str(card.get("card_type") or "")[:32],
         "attack": card.get("attack"),
         "health": card.get("health"),
@@ -151,14 +161,10 @@ def _compact_card(value: Any) -> dict[str, Any]:
         "position": card.get("position"),
         "premium": card.get("premium"),
         "current_cost": card.get("current_cost"),
-        "keywords": {
-            str(key)[:32]: value
-            for key, value in keywords.items()
-            if value is not None
-        },
+        "keywords": dict(known_keywords),
         "unknown_keywords": [
             str(key)[:32] for key, value in keywords.items() if value is None
-        ][:12],
+        ][: max(0, int(keyword_limit))],
     }
 
 
@@ -380,6 +386,654 @@ def _minimal_battlegrounds(value: Any) -> dict[str, Any] | None:
     }
 
 
+_LIVE_CARD_TYPE_CODES = {
+    "MINION": "M",
+    "SPELL": "S",
+    "BATTLEGROUND_SPELL": "BS",
+    "HERO": "H",
+    "HERO_POWER": "HP",
+}
+_LIVE_KEYWORD_CODES = (
+    ("t", "taunt"),
+    ("d", "divine_shield"),
+    ("r", "reborn"),
+    ("p", "poisonous"),
+    ("v", "venomous"),
+    ("s", "stealth"),
+    ("w", "windfury"),
+    ("W", "mega_windfury"),
+    ("x", "deathrattle"),
+    ("b", "battlecry"),
+    ("m", "magnetic"),
+    ("e", "elusive"),
+)
+
+
+def _live_text(value: Any, *, limit: int) -> str:
+    return " ".join(str(value or "").replace("|", "/").split())[:limit]
+
+
+def _live_scalar(value: Any) -> str:
+    if value is None:
+        return "?"
+    if value is True:
+        return "1"
+    if value is False:
+        return "0"
+    return str(value)
+
+
+def _live_battlegrounds(
+    value: Any,
+    *,
+    include_names: bool,
+    name_limit: int,
+    include_choice_cards: bool,
+    include_players: bool,
+    include_mechanics: bool,
+    include_observation_details: bool,
+) -> tuple[dict[str, Any], dict[str, Any], list[str]] | None:
+    if not isinstance(value, Mapping):
+        return None
+    lobby = [item for item in list(value.get("lobby") or [])[:8] if isinstance(item, Mapping)]
+    keyword_sets: list[str] = []
+    keyword_set_indexes: dict[str, int] = {}
+
+    card_fields = ["id"]
+    if include_names:
+        card_fields.append("name")
+    card_fields.extend(
+        (
+            "type",
+            "attack",
+            "health",
+            "tier",
+            "position",
+            "premium",
+            "current_cost",
+            "keyword_set_index",
+        )
+    )
+
+    def compact_card(card_value: Any) -> str:
+        card = card_value if isinstance(card_value, Mapping) else {}
+        keywords = card.get("keywords") if isinstance(card.get("keywords"), Mapping) else {}
+        keyword_set = "".join(
+            code for code, name in _LIVE_KEYWORD_CODES if keywords.get(name) is True
+        ) or "?"
+        keyword_index = keyword_set_indexes.get(keyword_set)
+        if keyword_index is None:
+            keyword_index = len(keyword_sets)
+            keyword_set_indexes[keyword_set] = keyword_index
+            keyword_sets.append(keyword_set)
+        raw_type = _live_text(card.get("card_type"), limit=32)
+        fields: list[Any] = [_live_text(card.get("card_id"), limit=40)]
+        if include_names:
+            fields.append(_live_text(card.get("name"), limit=max(1, int(name_limit))))
+        fields.extend(
+            (
+                _LIVE_CARD_TYPE_CODES.get(raw_type, raw_type or None),
+                card.get("attack"),
+                card.get("health"),
+                card.get("tier"),
+                card.get("position"),
+                card.get("premium"),
+                card.get("current_cost"),
+                keyword_index,
+            )
+        )
+        return "|".join(_live_scalar(field) for field in fields)
+
+    def compact_cards(key: str, limit: int) -> list[str]:
+        return [compact_card(card) for card in list(value.get(key) or [])[:limit]]
+
+    def compact_player(player: Mapping[str, Any] | None) -> str | None:
+        if player is None:
+            return None
+        board = player.get("board") if isinstance(player.get("board"), Mapping) else {}
+        fields = (
+            _live_text(player.get("hero_card_id"), limit=40),
+            player.get("health"),
+            player.get("armor"),
+            player.get("tavern_tier"),
+            player.get("placement"),
+            player.get("last_seen_round"),
+            board.get("count"),
+            board.get("attack"),
+            board.get("health"),
+            board.get("observed_round"),
+        )
+        return "|".join(_live_scalar(field) for field in fields)
+
+    current_choice = value.get("current_choice")
+    choice: dict[str, Any] | None = None
+    if isinstance(current_choice, Mapping):
+        choice = {
+            "type": current_choice.get("choice_type"),
+            "min": current_choice.get("count_min"),
+            "max": current_choice.get("count_max"),
+        }
+        options = list(current_choice.get("options") or [])[:8]
+        if include_choice_cards:
+            choice["source"] = (
+                compact_card(current_choice.get("source"))
+                if current_choice.get("source")
+                else None
+            )
+            choice["options"] = [compact_card(card) for card in options]
+            choice["detail_status"] = "complete"
+        else:
+            choice["option_count"] = len(options)
+            choice["detail_status"] = "tool_required"
+
+    economy = value.get("economy") if isinstance(value.get("economy"), Mapping) else {}
+    areas = value.get("areas") if isinstance(value.get("areas"), Mapping) else {}
+    if include_observation_details:
+        costs = [
+            value.get("refresh_cost"),
+            value.get("upgrade_cost"),
+            economy.get("revision"),
+            economy.get("observed_at"),
+        ]
+        area_fields = "complete|revision|observed_at|round|phase"
+        compact_areas = {
+            str(key)[:24]: "|".join(
+                _live_scalar(item)
+                for item in (
+                    area.get("complete"),
+                    area.get("revision"),
+                    area.get("observed_at"),
+                    area.get("round"),
+                    area.get("phase"),
+                )
+            )
+            for key, area in list(areas.items())[:6]
+            if isinstance(area, Mapping)
+        }
+        cost_fields = "refresh|upgrade|revision|observed_at"
+    else:
+        costs = [value.get("refresh_cost"), value.get("upgrade_cost")]
+        area_fields = "complete|round|phase"
+        compact_areas = {
+            str(key)[:24]: "|".join(
+                _live_scalar(item)
+                for item in (area.get("complete"), area.get("round"), area.get("phase"))
+            )
+            for key, area in list(areas.items())[:6]
+            if isinstance(area, Mapping)
+        }
+        cost_fields = "refresh|upgrade"
+
+    result = {
+        "variant": value.get("variant"),
+        "round": value.get("round"),
+        "phase": value.get("phase"),
+        "gold": [value.get("gold"), value.get("max_gold")],
+        "tier": value.get("tavern_tier"),
+        "frozen": value.get("frozen"),
+        "placement": value.get("placement"),
+        "costs": costs,
+        "areas": compact_areas,
+        "shop": compact_cards("shop", 7),
+        "hand": compact_cards("hand", 10),
+        "warband": compact_cards("warband", 7),
+        "current_choice": choice,
+    }
+    omitted: list[str] = []
+    if include_players:
+        result["players"] = {
+            "local": compact_player(next((item for item in lobby if item.get("is_local")), None)),
+            "current": compact_player(
+                next((item for item in lobby if item.get("current_opponent")), None)
+            ),
+            "next": compact_player(next((item for item in lobby if item.get("next_opponent")), None)),
+            "last": compact_player(next((item for item in lobby if item.get("last_opponent")), None)),
+            "last_opponent_round": value.get("last_opponent_round"),
+        }
+    else:
+        omitted.append("players")
+    if include_mechanics:
+        result["mechanics"] = _bounded_json_value(
+            value.get("mechanics") or {}, string_limit=40, list_limit=8
+        )
+    else:
+        omitted.append("mechanics")
+    if not include_names:
+        omitted.append("names")
+    if not include_choice_cards and choice is not None:
+        omitted.append("choice_details")
+    if not include_observation_details:
+        omitted.append("revisions")
+    if omitted:
+        result["omitted"] = omitted
+
+    schema = {
+        "card": "|".join(card_fields),
+        "types": "M=minion,S=spell,BS=BG_spell,H=hero,HP=hero_power",
+        "keyword_codes": ",".join(f"{code}={name}" for code, name in _LIVE_KEYWORD_CODES),
+        "keyword_sets": "observed active only; ?=none observed",
+        "costs": cost_fields,
+        "area": area_fields,
+    }
+    if include_players:
+        schema["player"] = (
+            "hero_id|health|armor|tier|placement|last_seen_round|board_count|"
+            "board_attack|board_health|board_observed_round"
+        )
+    return result, schema, keyword_sets
+
+
+_LIVE_STATE_PREFIX = """\
+仅用于炉石问题，无关勿提；缺失不猜。费用/金色/关键词以快照为准；?=未知。
+过滤后的实时局势 JSON："""
+
+
+def build_live_state_context(
+    snapshot: GameSnapshot,
+    *,
+    observed_at: float | None = None,
+    max_prompt_chars: int = 2600,
+) -> str:
+    """Build a bounded, filtered snapshot for the next ordinary chat turn."""
+    limit = int(max_prompt_chars)
+    if limit <= len(_LIVE_STATE_PREFIX) + 128:
+        raise ValueError("max_prompt_chars is too small for the live-state contract")
+    public_state = copy.deepcopy(snapshot.to_public_dict())
+    captured_at = time.time() if observed_at is None else float(observed_at)
+
+    battlegrounds = public_state.get("battlegrounds")
+    if isinstance(battlegrounds, Mapping):
+        variants = (
+            (True, 24, True, True, True, True),
+            (True, 20, True, False, False, True),
+            (True, 12, False, False, False, True),
+            (False, 1, True, False, False, False),
+            (False, 1, False, False, False, False),
+        )
+    else:
+        variants = ()
+
+    for (
+        include_names,
+        name_limit,
+        include_choice_cards,
+        include_players,
+        include_mechanics,
+        include_observation_details,
+    ) in variants:
+        compact = _live_battlegrounds(
+            battlegrounds,
+            include_names=include_names,
+            name_limit=name_limit,
+            include_choice_cards=include_choice_cards,
+            include_players=include_players,
+            include_mechanics=include_mechanics,
+            include_observation_details=include_observation_details,
+        )
+        if compact is None:
+            continue
+        compact_battlegrounds, schema, keyword_sets = compact
+        state = {
+            "mode": public_state.get("mode"),
+            "game_number": public_state.get("game_number"),
+            "turn": public_state.get("turn"),
+            "battlegrounds": compact_battlegrounds,
+            "choice": _compact_choice(public_state.get("choice")),
+        }
+        state = {key: value for key, value in state.items() if value is not None}
+        payload = {
+            "kind": "hearthstone_live_state",
+            "observed_at": round(captured_at, 3),
+            "schema": schema,
+            "keyword_sets": keyword_sets,
+            "state": state,
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        prompt = _LIVE_STATE_PREFIX + encoded
+        if len(prompt) <= limit:
+            return prompt
+
+    constructed = public_state.get("constructed")
+    if isinstance(constructed, Mapping):
+        for compact_constructed in (
+            _compact_constructed(constructed),
+            _minimal_constructed(constructed),
+        ):
+            state = {
+                "mode": public_state.get("mode"),
+                "phase": public_state.get("phase"),
+                "game_number": public_state.get("game_number"),
+                "turn": public_state.get("turn"),
+                "round": public_state.get("round"),
+                "active_side": public_state.get("active_side"),
+                "constructed": compact_constructed,
+                "choice": _compact_choice(public_state.get("choice")),
+            }
+            state = {key: value for key, value in state.items() if value is not None}
+            payload = {
+                "kind": "hearthstone_live_state",
+                "scope": "filtered_current_game_state",
+                "observed_at": round(captured_at, 3),
+                "state": state,
+            }
+            encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            prompt = _LIVE_STATE_PREFIX + encoded
+            if len(prompt) <= limit:
+                return prompt
+
+    state = {
+        "mode": public_state.get("mode"),
+        "phase": public_state.get("phase"),
+        "game_number": public_state.get("game_number"),
+        "turn": public_state.get("turn"),
+        "round": public_state.get("round"),
+        "active_side": public_state.get("active_side"),
+        "details": "not_observed",
+    }
+    payload = {
+        "kind": "hearthstone_live_state",
+        "observed_at": round(captured_at, 3),
+        "state": state,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    prompt = _LIVE_STATE_PREFIX + encoded
+    if len(prompt) <= limit:
+        return prompt
+    raise ValueError("live Hearthstone state exceeds max_prompt_chars")
+
+
+_LIVE_DELIVERY_PREFIX = "HS capability routing only:"
+_LIVE_DELIVERY_AREA_CODES = (
+    ("shop", "S"),
+    ("hand", "H"),
+    ("warband", "W"),
+    ("economy", "E"),
+    ("choice", "C"),
+)
+
+
+def _live_delivery_schema(
+    card_schema: str,
+    *,
+    segment: str,
+    keyword_sets: list[str],
+) -> str:
+    compact_card_schema = (
+        card_schema.replace("attack", "atk")
+        .replace("health", "hp")
+        .replace("position", "pos")
+        .replace("premium", "golden")
+        .replace("current_cost", "cost")
+        .replace("keyword_set_index", "kw#")
+    )
+    state_schema = "m=mode,r=round,p=phase"
+    if segment == "core":
+        state_schema += (
+            ",g=gold/max,t=tier,f=frozen,l=placement,c=refresh/upgrade,"
+            "a=complete areas:S shop/H hand/W warband/E economy/C choice,"
+            "S=shop,q=choice(type|min|max|count|C/T)"
+        )
+    elif segment == "hand":
+        state_schema += ",H=hand"
+    else:
+        state_schema += ",W=warband,H=hand when present"
+    used_keyword_codes = {
+        code
+        for keyword_set in keyword_sets
+        if keyword_set != "?"
+        for code in keyword_set
+    }
+    keyword_schema = ",".join(
+        f"{code} {name}"
+        for code, name in _LIVE_KEYWORD_CODES
+        if code in used_keyword_codes
+    )
+    schema = (
+        f"{state_schema};card={compact_card_schema};"
+        "type=M minion,S spell,BS tavern_spell;kw# indexes kw;"
+        f"kw={keyword_schema or '? none/unknown'}"
+    )
+    return schema
+
+
+def _live_delivery_choice(value: Any) -> Any:
+    if not isinstance(value, Mapping) or value.get("detail_status") != "tool_required":
+        return value
+    return [
+        value.get("type"),
+        value.get("min"),
+        value.get("max"),
+        value.get("option_count"),
+        "T",
+    ]
+
+
+def _live_delivery_prompt(
+    *,
+    segment: str,
+    observed_at: float,
+    state: Mapping[str, Any],
+    keyword_sets: list[str],
+    card_schema: str,
+    segment_count: int,
+) -> str:
+    payload = {
+        "segment": segment,
+        "of": segment_count,
+        "at": round(observed_at, 3),
+        "state": state,
+        "kw": keyword_sets,
+        "schema": _live_delivery_schema(
+            card_schema,
+            segment=segment,
+            keyword_sets=keyword_sets,
+        ),
+    }
+    return _LIVE_DELIVERY_PREFIX + json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _live_delivery_area_set(compact_battlegrounds: Mapping[str, Any]) -> str:
+    areas = (
+        compact_battlegrounds.get("areas")
+        if isinstance(compact_battlegrounds.get("areas"), Mapping)
+        else {}
+    )
+    return "".join(
+        code
+        for area_name, code in _LIVE_DELIVERY_AREA_CODES
+        if str(areas.get(area_name) or "").split("|", 1)[0] == "1"
+    )
+
+
+def _build_battlegrounds_live_state_contexts(
+    public_state: Mapping[str, Any],
+    *,
+    observed_at: float,
+    max_prompt_bytes: int,
+) -> tuple[str, ...]:
+    battlegrounds = public_state.get("battlegrounds")
+    if not isinstance(battlegrounds, Mapping):
+        raise ValueError("battlegrounds state is not available")
+
+    variants = (
+        (True, 24, True),
+        (True, 12, True),
+        (False, 1, True),
+        (False, 1, False),
+    )
+    three_segment_fallback: tuple[str, ...] | None = None
+    for include_names, name_limit, include_choice_cards in variants:
+        compact = _live_battlegrounds(
+            battlegrounds,
+            include_names=include_names,
+            name_limit=name_limit,
+            include_choice_cards=include_choice_cards,
+            include_players=False,
+            include_mechanics=False,
+            include_observation_details=False,
+        )
+        if compact is None:
+            continue
+        compact_battlegrounds, schema, keyword_sets = compact
+        common = {
+            "m": public_state.get("mode"),
+            "r": compact_battlegrounds.get("round"),
+            "p": compact_battlegrounds.get("phase"),
+        }
+        core_state = {
+            **common,
+            "g": compact_battlegrounds.get("gold"),
+            "t": compact_battlegrounds.get("tier"),
+            "f": compact_battlegrounds.get("frozen"),
+            "l": compact_battlegrounds.get("placement"),
+            "c": list(compact_battlegrounds.get("costs") or [])[:2],
+            "a": _live_delivery_area_set(compact_battlegrounds),
+            "S": list(compact_battlegrounds.get("shop") or [])[:7],
+            "q": _live_delivery_choice(compact_battlegrounds.get("current_choice")),
+        }
+        hand_state = {
+            **common,
+            "H": list(compact_battlegrounds.get("hand") or [])[:10],
+        }
+        board_state = {
+            **common,
+            "W": list(compact_battlegrounds.get("warband") or [])[:7],
+        }
+        combined_board_state = {
+            **common,
+            "H": hand_state["H"],
+            "W": board_state["W"],
+        }
+        two_prompts = (
+            _live_delivery_prompt(
+                segment="core",
+                observed_at=observed_at,
+                state=core_state,
+                keyword_sets=keyword_sets,
+                card_schema=schema["card"],
+                segment_count=2,
+            ),
+            _live_delivery_prompt(
+                segment="board",
+                observed_at=observed_at,
+                state=combined_board_state,
+                keyword_sets=keyword_sets,
+                card_schema=schema["card"],
+                segment_count=2,
+            ),
+        )
+        two_sizes = [len(prompt.encode("utf-8")) for prompt in two_prompts]
+        if (
+            all(size <= max_prompt_bytes for size in two_sizes)
+            and sum(2 * size + 48 for size in two_sizes) <= 3000
+        ):
+            return two_prompts
+
+        three_prompts = (
+            _live_delivery_prompt(
+                segment="core",
+                observed_at=observed_at,
+                state=core_state,
+                keyword_sets=keyword_sets,
+                card_schema=schema["card"],
+                segment_count=3,
+            ),
+            _live_delivery_prompt(
+                segment="board",
+                observed_at=observed_at,
+                state=board_state,
+                keyword_sets=keyword_sets,
+                card_schema=schema["card"],
+                segment_count=3,
+            ),
+            _live_delivery_prompt(
+                segment="hand",
+                observed_at=observed_at,
+                state=hand_state,
+                keyword_sets=keyword_sets,
+                card_schema=schema["card"],
+                segment_count=3,
+            ),
+        )
+        if three_segment_fallback is None and all(
+            len(prompt.encode("utf-8")) <= max_prompt_bytes for prompt in three_prompts
+        ):
+            three_segment_fallback = three_prompts
+    if three_segment_fallback is not None:
+        return three_segment_fallback
+    raise ValueError("live Battlegrounds state exceeds max_prompt_bytes")
+
+
+def _build_minimal_live_state_context(
+    public_state: Mapping[str, Any],
+    *,
+    observed_at: float,
+    max_prompt_bytes: int,
+) -> str:
+    state = {
+        "mode": public_state.get("mode"),
+        "phase": public_state.get("phase"),
+        "game_number": public_state.get("game_number"),
+        "turn": public_state.get("turn"),
+        "round": public_state.get("round"),
+        "active_side": public_state.get("active_side"),
+    }
+    constructed = public_state.get("constructed")
+    if isinstance(constructed, Mapping):
+        state["constructed"] = _minimal_constructed(constructed)
+    choice = _compact_choice(public_state.get("choice"))
+    if choice is not None:
+        state["choice"] = choice
+    prompt = _LIVE_DELIVERY_PREFIX + json.dumps(
+        {
+            "segment": "core",
+            "of": 1,
+            "at": round(observed_at, 3),
+            "state": {key: value for key, value in state.items() if value is not None},
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    if len(prompt.encode("utf-8")) <= max_prompt_bytes:
+        return prompt
+    raise ValueError("minimal live Hearthstone state exceeds max_prompt_bytes")
+
+
+def build_live_state_contexts(
+    _snapshot: GameSnapshot,
+    *,
+    observed_at: float | None = None,
+    max_prompt_bytes: int = 900,
+) -> tuple[str, ...]:
+    """Build a static routing cue without serializing any game or permission state."""
+    del observed_at
+    limit = int(max_prompt_bytes)
+    payload = {
+        "kind": "hearthstone_tool_routing",
+        "tools": [
+            "hearthstone_current_state",
+            "hearthstone_battlegrounds_advice",
+        ],
+        "rule": (
+            "Call the relevant tool for current Hearthstone facts or advice. "
+            "This notice contains no game facts or permission state; never infer either from it. "
+            "The current tool result is authoritative and may deny access."
+        ),
+    }
+    prompt = _LIVE_DELIVERY_PREFIX + json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    if len(prompt.encode("utf-8")) > limit:
+        raise ValueError("Hearthstone capability notice exceeds max_prompt_bytes")
+    return (prompt,)
+
+
 def _prompt_prefix(
     max_reply_chars: int,
     *,
@@ -531,4 +1185,10 @@ def build_llm_prompt(
     raise AssertionError("minimal commentary payload exceeded max_prompt_chars")
 
 
-__all__ = ["CommentaryArbiter", "build_emotion_cue", "build_llm_prompt"]
+__all__ = [
+    "CommentaryArbiter",
+    "build_emotion_cue",
+    "build_live_state_context",
+    "build_live_state_contexts",
+    "build_llm_prompt",
+]

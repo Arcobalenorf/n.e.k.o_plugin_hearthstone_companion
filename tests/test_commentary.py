@@ -6,14 +6,20 @@ import pytest
 from hearthstone_companion_under_test.commentary import (
     CommentaryArbiter,
     build_emotion_cue,
+    build_live_state_context,
+    build_live_state_contexts,
     build_llm_prompt,
 )
 from hearthstone_companion_under_test.config import CompanionConfig
 from hearthstone_companion_under_test.models import (
+    BattlegroundsAreaSnapshot,
     BattlegroundsCardSnapshot,
+    BattlegroundsChoiceSnapshot,
+    BattlegroundsEconomySnapshot,
     BattlegroundsHeroChoiceSnapshot,
     BattlegroundsPlayerSnapshot,
     BattlegroundsSnapshot,
+    ChoiceSnapshot,
     ConstructedCardSnapshot,
     ConstructedSideSnapshot,
     ConstructedSnapshot,
@@ -334,3 +340,311 @@ def test_llm_prompt_is_valid_json_and_never_exceeds_hard_limit() -> None:
 def test_llm_prompt_rejects_impossible_limit_instead_of_truncating_json() -> None:
     with pytest.raises(ValueError, match="too small"):
         build_llm_prompt(event(), GameSnapshot(), max_prompt_chars=100)
+
+
+def test_live_battlegrounds_context_preserves_decision_critical_runtime_fields() -> None:
+    snapshot = GameSnapshot(
+        mode="battlegrounds",
+        phase="recruit",
+        game_number=9,
+        round=7,
+        battlegrounds=BattlegroundsSnapshot(
+            round=7,
+            phase="recruit",
+            gold=8,
+            max_gold=10,
+            tavern_tier=4,
+            frozen=True,
+            refresh_cost=0,
+            upgrade_cost=7,
+            shop=(
+                BattlegroundsCardSnapshot(
+                    card_id="BG_SPELL_001",
+                    name="测试酒馆法术",
+                    card_type="SPELL",
+                    tier=3,
+                    position=1,
+                    premium=False,
+                    current_cost=1,
+                    keywords={"taunt": False, "divine_shield": None},
+                ),
+            ),
+            hand=(
+                BattlegroundsCardSnapshot(
+                    card_id="BG_MINION_HAND",
+                    name="手牌随从",
+                    card_type="MINION",
+                    attack=6,
+                    health=7,
+                    tier=4,
+                    position=1,
+                    premium=True,
+                    current_cost=2,
+                    keywords={"reborn": True},
+                ),
+            ),
+            warband=(
+                BattlegroundsCardSnapshot(
+                    card_id="BG_MINION_BOARD",
+                    name="战团随从",
+                    card_type="MINION",
+                    attack=12,
+                    health=13,
+                    tier=5,
+                    position=1,
+                    premium=False,
+                    keywords={"taunt": True, "divine_shield": True},
+                ),
+            ),
+            economy=BattlegroundsEconomySnapshot(
+                upgrade_cost=7,
+                refresh_cost=0,
+                revision=11,
+                observed_at=1234.5,
+            ),
+            areas={
+                "shop": BattlegroundsAreaSnapshot(
+                    complete=True,
+                    revision=12,
+                    observed_at=1234.5,
+                    round=7,
+                    phase="recruit",
+                )
+            },
+        ),
+    )
+
+    prompt = build_live_state_context(snapshot, observed_at=1235.0)
+    payload = json.loads(prompt.split("过滤后的实时局势 JSON：", 1)[1])
+    battlegrounds = payload["state"]["battlegrounds"]
+    card_fields = payload["schema"]["card"].split("|")
+
+    def card_at(zone: str, index: int) -> dict[str, str]:
+        return dict(zip(card_fields, battlegrounds[zone][index].split("|"), strict=True))
+
+    cost_fields = payload["schema"]["costs"].split("|")
+    costs = dict(zip(cost_fields, battlegrounds["costs"], strict=True))
+    area_fields = payload["schema"]["area"].split("|")
+    shop_area = dict(
+        zip(area_fields, battlegrounds["areas"]["shop"].split("|"), strict=True)
+    )
+
+    assert payload["kind"] == "hearthstone_live_state"
+    assert payload["observed_at"] == 1235.0
+    assert costs["refresh"] == 0
+    assert costs["upgrade"] == 7
+    assert costs["revision"] == 11
+    assert shop_area["complete"] == "1"
+    assert shop_area["round"] == "7"
+    assert card_at("shop", 0) == {
+        "id": "BG_SPELL_001",
+        "name": "测试酒馆法术",
+        "type": "S",
+        "attack": "0",
+        "health": "?",
+        "tier": "3",
+        "position": "1",
+        "premium": "0",
+        "current_cost": "1",
+        "keyword_set_index": "0",
+    }
+    assert payload["keyword_sets"][0] == "?"
+    assert card_at("hand", 0)["premium"] == "1"
+    assert card_at("hand", 0)["current_cost"] == "2"
+    assert payload["keyword_sets"][int(card_at("hand", 0)["keyword_set_index"])] == "r"
+    assert payload["keyword_sets"][int(card_at("warband", 0)["keyword_set_index"])] == "td"
+
+
+def test_live_constructed_context_never_shares_hand_or_choice_identities() -> None:
+    snapshot = GameSnapshot(
+        mode="constructed",
+        phase="playing",
+        game_number=4,
+        constructed=ConstructedSnapshot(
+            player=ConstructedSideSnapshot(
+                known_hand=(
+                    ConstructedCardSnapshot(
+                        card_id="PRIVATE_HAND_SENTINEL",
+                        name="私有手牌",
+                        card_type="SPELL",
+                        cost=4,
+                    ),
+                ),
+                hand_count=1,
+                hand_identities_complete=True,
+            )
+        ),
+        choice=ChoiceSnapshot(
+            choice_type="discover",
+            options=(
+                ConstructedCardSnapshot(
+                    card_id="PRIVATE_CHOICE_SENTINEL",
+                    name="私有发现选项",
+                ),
+            ),
+        ),
+    )
+
+    prompt = build_live_state_context(snapshot, observed_at=1235.0)
+
+    assert "PRIVATE_HAND_SENTINEL" not in prompt
+    assert "PRIVATE_CHOICE_SENTINEL" not in prompt
+    assert '"count":1' in prompt
+    assert '"choice_type":"discover"' in prompt
+
+
+def test_live_state_context_is_valid_json_and_respects_host_safe_hard_limit() -> None:
+    oversized = "超长不可信卡名" * 200
+    cards = tuple(
+        BattlegroundsCardSnapshot(
+            card_id=f"BG_{index}_{oversized}",
+            name=oversized,
+            card_type="MINION",
+            attack=999,
+            health=999,
+            tier=6,
+            position=index + 1,
+            premium=True,
+            current_cost=99,
+            keywords={f"keyword_{item}_{oversized}": True for item in range(20)},
+        )
+        for index in range(10)
+    )
+    snapshot = GameSnapshot(
+        mode="battlegrounds",
+        phase="recruit",
+        game_number=1,
+        battlegrounds=BattlegroundsSnapshot(
+            phase="recruit",
+            shop=cards[:7],
+            hand=cards,
+            warband=cards[:7],
+            current_choice=BattlegroundsChoiceSnapshot(
+                choice_type="discover",
+                count_min=1,
+                count_max=1,
+                source=cards[0],
+                options=cards[:8],
+            ),
+        ),
+    )
+
+    prompt = build_live_state_context(snapshot, observed_at=1235.0, max_prompt_chars=2600)
+
+    assert len(prompt) <= 2600
+    payload = json.loads(prompt.split("过滤后的实时局势 JSON：", 1)[1])
+    battlegrounds = payload["state"]["battlegrounds"]
+    assert len(battlegrounds["shop"]) == 7
+    assert len(battlegrounds["hand"]) == 10
+    assert len(battlegrounds["warband"]) == 7
+    assert battlegrounds["current_choice"]["option_count"] == 8
+    assert battlegrounds["current_choice"]["detail_status"] == "tool_required"
+    assert "choice_details" in battlegrounds["omitted"]
+    assert "id" in payload["schema"]["card"].split("|")
+    assert "current_cost" in payload["schema"]["card"].split("|")
+
+
+def test_capability_notice_survives_packaged_host_byte_fallback_without_game_facts() -> None:
+    oversized = "超长不可信卡名" * 200
+    cards = tuple(
+        BattlegroundsCardSnapshot(
+            card_id=f"BG_RUNTIME_CARD_{index}",
+            name=oversized,
+            card_type="BATTLEGROUND_SPELL" if index == 0 else "MINION",
+            attack=999,
+            health=999,
+            tier=6,
+            position=index + 1,
+            premium=index % 2 == 0,
+            current_cost=index,
+            keywords={
+                "taunt": index % 2 == 0,
+                "divine_shield": index % 3 == 0,
+                "reborn": index % 5 == 0,
+            },
+        )
+        for index in range(10)
+    )
+    snapshot = GameSnapshot(
+        mode="battlegrounds",
+        phase="recruit",
+        game_number=1,
+        turn=12,
+        battlegrounds=BattlegroundsSnapshot(
+            round=6,
+            phase="recruit",
+            gold=8,
+            max_gold=10,
+            tavern_tier=4,
+            frozen=True,
+            refresh_cost=0,
+            upgrade_cost=6,
+            shop=cards[:7],
+            hand=cards,
+            warband=cards[:7],
+            current_choice=BattlegroundsChoiceSnapshot(
+                choice_type="discover",
+                count_min=1,
+                count_max=1,
+                source=cards[0],
+                options=cards[:8],
+            ),
+        ),
+    )
+
+    prompts = build_live_state_contexts(
+        snapshot,
+        observed_at=1235.0,
+        max_prompt_bytes=900,
+    )
+
+    assert len(prompts) == 1
+    prompt = prompts[0]
+    encoded = prompt.encode("utf-8")
+    assert len(encoded) <= 900
+    # Packaged N.E.K.O falls back to one token per UTF-8 byte. The ambient
+    # notice must remain untouched by its 1000-token passive-message limit.
+    assert encoded[:1000] == encoded
+
+    payload = json.loads(prompt.split(":", 1)[1])
+    assert payload["kind"] == "hearthstone_tool_routing"
+    assert payload["tools"] == [
+        "hearthstone_current_state",
+        "hearthstone_battlegrounds_advice",
+    ]
+    assert "no game facts or permission state" in payload["rule"]
+    assert set(payload) == {"kind", "tools", "rule"}
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert "BG_RUNTIME_CARD" not in serialized
+    assert oversized not in serialized
+    assert "recruit" not in serialized
+    assert '"state"' not in serialized
+    assert '"at"' not in serialized
+
+
+def test_capability_notice_is_identical_across_modes_and_observation_times() -> None:
+    constructed_prompt = build_live_state_contexts(
+        GameSnapshot(mode="constructed", phase="playing", game_number=3, turn=5),
+        observed_at=1235.0,
+        max_prompt_bytes=900,
+    )[0]
+    battlegrounds_prompt = build_live_state_contexts(
+        GameSnapshot(
+            mode="battlegrounds",
+            phase="recruit",
+            game_number=99,
+            battlegrounds=BattlegroundsSnapshot(
+                round=12,
+                phase="recruit",
+                gold=10,
+                refresh_cost=0,
+                upgrade_cost=1,
+                shop=(BattlegroundsCardSnapshot(card_id="PRIVATE_RUNTIME_CARD"),),
+            ),
+        ),
+        observed_at=9999.0,
+        max_prompt_bytes=900,
+    )[0]
+
+    assert constructed_prompt == battlegrounds_prompt
+    assert "PRIVATE_RUNTIME_CARD" not in battlegrounds_prompt

@@ -36,15 +36,15 @@ Get-ChildItem "$env:LOCALAPPDATA\Blizzard\Hearthstone" -Filter Power.log -Recurs
 
 ## 主动解说关闭后还能问酒馆问题吗
 
-可以。保持 `llm_data_consent=true`，当前角色仍可调用 `hearthstone_battlegrounds_advice`。主动解说开关只控制插件是否主动发起角色回复。
+可以。保持 `llm_data_consent=true`；被动提示只声明可用工具，不提供任何当前事实。任何酒馆当前事实或建议都必须调用 `hearthstone_battlegrounds_advice` 读取本轮完整状态。主动解说开关只控制插件是否主动发起角色回复。
 
 若工具返回 `llm_data_sharing_not_authorized`，说明数据同意未开启。若 `current_public_state` 为空，确认已经进入酒馆且日志正在增长。
 
 ## 为什么候选英雄不完整或不能给出具体出牌
 
-候选列表只显示 `Power.log` 明确归属于本地玩家、未隐藏且未锁定的英雄。日志尚未建立本地 controller、某个选项未公开或选择阶段已经结束时，列表可能为空；插件不会根据常见候选数或卡池补猜。列表可用时，角色可以结合公共英雄规则和本机样本比较，但不会提供没有来源的全局胜率。“买哪个随从”等即时酒馆建议还要求处于招募阶段并有正在更新的当前商店；战斗阶段或缓存状态只能解释已观察信息。
+候选列表只显示 `Power.log` 明确归属于本地玩家、未隐藏且未锁定的英雄。日志尚未建立本地 controller、某个选项未公开或选择阶段已经结束时，列表可能为空；插件不会根据常见候选数或卡池补猜。列表可用时，`hearthstone_battlegrounds_advice` 可以结合公共英雄规则和本机样本供角色比较，但不会提供没有来源的全局胜率。“哪张更值得考虑”等定性酒馆建议要求工具当次读到招募阶段、正在更新的完整商店和规则证据；个别费用缺失不会关闭定性比较。若询问可负担性、剩余金币或购买顺序，当前金币和商店所有卡牌的实际费用也必须完整，角色不得用默认 3 费补算，也不得在金币为 0 时把未知费用卡牌直接判为买不起。战斗阶段或缓存状态只能解释已观察信息。
 
-普通对战会在用户主动提问时共享本地玩家当前可见的具体手牌。若角色仍答不出回合或手牌，先确认局势问答授权已开启、状态为实时，再明确询问“现在第几回合”或“根据当前手牌应该出什么牌”，让角色调用 `hearthstone_current_state`。工具不会提供完整合法操作与目标枚举；字段缺失时应如实说明。对手隐藏手牌、奥秘身份和牌序是永久边界，重新配置日志也不会开放。
+普通对战会在用户主动提问时通过 `hearthstone_current_state` 共享本地玩家当前可见的具体手牌。若角色仍答不出回合或手牌，先确认局势问答授权已开启、状态为实时，再明确询问“现在第几回合”或“根据当前手牌应该出什么牌”；这类当前问题必须调用该工具，不能仅凭被动提示回答。工具不会提供完整合法操作与目标枚举；字段缺失时应如实说明。对手隐藏手牌、奥秘身份和牌序是永久边界，重新配置日志也不会开放。
 
 ## 为什么没有全服胜率
 
@@ -52,7 +52,7 @@ Get-ChildItem "$env:LOCALAPPDATA\Blizzard\Hearthstone" -Filter Power.log -Recurs
 
 ## 卡牌目录不可用或已陈旧
 
-查看 `card_catalog.degraded_reason`、`dataset.patch`、`checked_at` 和 `stale`。首次安装需要短暂下载公共当前卡池；超时、HTTP 429/5xx 或离线时，插件会保留旧缓存，不会中断日志监听。确认网络允许访问 `https://hsbg.cards`，并检查 `card_catalog_network_enabled=true`。不希望插件直连该服务时可关闭此项，角色仍能读取实时局势，但卡牌规则依据会减少。少量旧式或不规则金卡 CardID 可能出现在 `missing_ids`；这表示没有可靠规则补全，不影响 Power.log 中的实时身材。
+查看 `card_catalog.degraded_reason`、`dataset.patch`、`checked_at` 和 `stale`。首次安装需要短暂下载公共当前卡池；超时、HTTP 429/5xx 或离线时，插件会保留旧缓存，不会中断日志监听。确认网络允许访问 `https://hsbg.cards`，并检查 `card_catalog_network_enabled=true`。不希望插件直连该服务时可关闭此项；`hearthstone_battlegrounds_advice` 仍会返回日志实际观测的实时局势，但卡牌规则依据会减少。少量旧式或不规则金卡 CardID 可能出现在 `missing_ids`；这表示没有可靠规则补全，不影响 Power.log 中的实时身材。
 
 ## 对手阵容看起来过时
 

@@ -15,7 +15,9 @@ OutputCallback = Callable[[str, GameEvent, GameSnapshot], bool]
 StatusCallback = Callable[[dict[str, Any]], None]
 ResultCallback = Callable[[GameEvent, GameSnapshot], None]
 EventCallback = Callable[[GameEvent, GameSnapshot], None]
+StateCallback = Callable[[GameSnapshot], None]
 LIVE_STATE_MAX_AGE_SECONDS = 300.0
+LIVE_STATE_PUBLISH_INTERVAL_SECONDS = 2.0
 
 
 class CompanionMonitor:
@@ -35,6 +37,7 @@ class CompanionMonitor:
         on_status: StatusCallback | None = None,
         on_result: ResultCallback | None = None,
         on_event: EventCallback | None = None,
+        on_state: StateCallback | None = None,
     ) -> None:
         self.config = config
         self.logger = logger
@@ -42,6 +45,7 @@ class CompanionMonitor:
         self._on_status = on_status
         self._on_result = on_result
         self._on_event = on_event
+        self._on_state = on_state
         self._parser = PowerLogParser()
         self._tailer = PowerLogTailer(
             PowerLogLocator(config.log_path), initial_read_max_bytes=config.initial_read_max_bytes
@@ -60,6 +64,7 @@ class CompanionMonitor:
         self._bootstrap_complete = False
         self._state_ready_notified = False
         self._state_stale_notified = False
+        self._next_state_publish_at = 0.0
 
     def _begin_source_generation_locked(self) -> None:
         self._source_generation += 1
@@ -67,6 +72,7 @@ class CompanionMonitor:
         self._bootstrap_complete = False
         self._state_ready_notified = False
         self._state_stale_notified = False
+        self._next_state_publish_at = 0.0
         self._status.source_state = (
             "waiting_for_log" if self._status.monitor_running else "waiting"
         )
@@ -174,6 +180,18 @@ class CompanionMonitor:
         with self._lock:
             return self._snapshot, replace(self._status), self._source_generation
 
+    def try_capture(
+        self, *, timeout_seconds: float = 0.05
+    ) -> tuple[GameSnapshot, RuntimeStatus, int] | None:
+        """Return a coherent view without making latency-sensitive callers wait on parsing."""
+        acquired = self._lock.acquire(timeout=max(0.0, float(timeout_seconds)))
+        if not acquired:
+            return None
+        try:
+            return self._snapshot, replace(self._status), self._source_generation
+        finally:
+            self._lock.release()
+
     def _run(self, stop_event: threading.Event) -> None:
         with self._lock:
             self._status.monitor_running = True
@@ -183,6 +201,8 @@ class CompanionMonitor:
             state_ready = False
             state_stale = False
             state_resumed = False
+            state_unavailable = False
+            publish_state = False
             try:
                 now = time.time()
                 with self._lock:
@@ -223,6 +243,10 @@ class CompanionMonitor:
                     else:
                         snapshot = self._parser.snapshot()
                         state_changed = snapshot != self._snapshot
+                        previous_active_snapshot = bool(
+                            self._snapshot.game_number > 0
+                            and self._snapshot.phase not in {"idle", "ended", "spectator"}
+                        )
                         self._snapshot = snapshot
                         active_snapshot = bool(
                             snapshot.game_number > 0
@@ -240,6 +264,17 @@ class CompanionMonitor:
                             and activity_at > 0
                             and now - activity_at <= LIVE_STATE_MAX_AGE_SECONDS
                         )
+                        publish_state = bool(
+                            live_active_snapshot
+                            and (
+                                state_changed
+                                or now >= self._next_state_publish_at
+                            )
+                        )
+                        if publish_state:
+                            self._next_state_publish_at = (
+                                now + LIVE_STATE_PUBLISH_INTERVAL_SECONDS
+                            )
                         state_ready = bool(
                             batch.bootstrap
                             and self._bootstrap_complete
@@ -258,6 +293,9 @@ class CompanionMonitor:
                         if processed_lines and not batch.bootstrap and live_active_snapshot:
                             self._live_context_generation = self._source_generation
                         if not active_snapshot:
+                            state_unavailable = bool(
+                                state_changed and previous_active_snapshot
+                            )
                             self._live_context_generation = None
                             self._state_stale_notified = False
                         stale_active_snapshot = bool(
@@ -342,10 +380,31 @@ class CompanionMonitor:
                         snapshot,
                         source_generation=tick_generation,
                     )
+                if state_unavailable:
+                    self._notify_event(
+                        GameEvent(
+                            "state_unavailable",
+                            0,
+                            "当前局势已离开可用对局",
+                            now,
+                            {
+                                "mode": snapshot.mode,
+                                "phase": snapshot.phase,
+                                "game_number": snapshot.game_number,
+                            },
+                        ),
+                        snapshot,
+                        source_generation=tick_generation,
+                    )
                 if not batch.bootstrap and self._bootstrap_complete:
                     self._handle_batch(
                         emissions,
                         now,
+                        source_generation=tick_generation,
+                    )
+                if publish_state:
+                    self._notify_state(
+                        snapshot,
                         source_generation=tick_generation,
                     )
                 if not stop_event.is_set() and now >= next_report:
@@ -357,8 +416,21 @@ class CompanionMonitor:
                     # poll() may advance its file cursor before raising, so
                     # even a failure before it returns invalidates the reader.
                     self._reset_reader_locked()
+                    snapshot = self._snapshot
+                    tick_generation = self._source_generation
                     self._status.source_state = "degraded"
                     self._status.last_error_code = code
+                self._notify_event(
+                    GameEvent(
+                        "source_reset",
+                        0,
+                        "日志来源已重置",
+                        time.time(),
+                        {"reason": "monitor_error"},
+                    ),
+                    snapshot,
+                    source_generation=tick_generation,
+                )
                 try:
                     self.logger.warning("Hearthstone monitor tick failed code=%s", code)
                 except Exception:
@@ -481,6 +553,31 @@ class CompanionMonitor:
                     type(exc).__name__,
                 )
 
+    def _notify_state(
+        self,
+        snapshot: GameSnapshot,
+        *,
+        source_generation: int | None = None,
+    ) -> None:
+        if self._on_state is None:
+            return
+        with self._emission_lock:
+            with self._lock:
+                if (
+                    source_generation is not None
+                    and source_generation != self._source_generation
+                ):
+                    return
+            try:
+                self._on_state(snapshot)
+            except Exception as exc:
+                with self._lock:
+                    self._status.last_error_code = f"state:{type(exc).__name__}"
+                self.logger.warning(
+                    "Hearthstone live-state hook failed code=%s",
+                    type(exc).__name__,
+                )
+
     def _safe_output(
         self,
         callback: OutputCallback,
@@ -512,4 +609,8 @@ class CompanionMonitor:
             pass
 
 
-__all__ = ["CompanionMonitor", "LIVE_STATE_MAX_AGE_SECONDS"]
+__all__ = [
+    "CompanionMonitor",
+    "LIVE_STATE_MAX_AGE_SECONDS",
+    "LIVE_STATE_PUBLISH_INTERVAL_SECONDS",
+]

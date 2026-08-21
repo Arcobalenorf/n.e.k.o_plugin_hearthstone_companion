@@ -101,6 +101,29 @@ type BattlegroundsCard = {
   keywords?: Record<string, boolean | null>
 }
 
+type BattlegroundsChoice = {
+  choice_type?: string
+  count_min?: number
+  count_max?: number
+  source?: BattlegroundsCard | null
+  options?: BattlegroundsCard[]
+}
+
+type BattlegroundsEconomy = {
+  upgrade_cost?: number | null
+  refresh_cost?: number | null
+  revision?: number
+  observed_at?: number | null
+}
+
+type BattlegroundsArea = {
+  complete?: boolean
+  revision?: number
+  observed_at?: number | null
+  round?: number
+  phase?: string
+}
+
 type BattlegroundsHeroChoice = {
   card_id?: string
   name?: string
@@ -139,11 +162,16 @@ type BattlegroundsState = {
   last_opponent_player_id?: number
   last_opponent_round?: number
   placement?: number
+  refresh_cost?: number | null
+  upgrade_cost?: number | null
   hero_choices?: BattlegroundsHeroChoice[]
   shop?: BattlegroundsCard[]
   hand?: BattlegroundsCard[]
   warband?: BattlegroundsCard[]
   lobby?: BattlegroundsLobbyPlayer[]
+  current_choice?: BattlegroundsChoice | null
+  economy?: BattlegroundsEconomy
+  areas?: Record<string, BattlegroundsArea>
   mechanics?: Record<string, unknown>
   source?: string
 }
@@ -417,6 +445,27 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
     })),
     [battlegrounds.shop],
   )
+  const handRows = useMemo(
+    () => (battlegrounds.hand || []).map((card, index) => ({
+      ...card,
+      _key: `${card.card_id || card.name || "hand"}:${index}`,
+    })),
+    [battlegrounds.hand],
+  )
+  const warbandRows = useMemo(
+    () => (battlegrounds.warband || []).map((card, index) => ({
+      ...card,
+      _key: `${card.card_id || card.name || "warband"}:${index}`,
+    })),
+    [battlegrounds.warband],
+  )
+  const currentChoiceRows = useMemo(
+    () => (battlegrounds.current_choice?.options || []).map((card, index) => ({
+      ...card,
+      _key: `${card.card_id || card.name || "choice"}:${index}`,
+    })),
+    [battlegrounds.current_choice],
+  )
   const seasonMechanics = useMemo(
     () => (season.mechanics || []).map((mechanic, index) => ({
       ...mechanic,
@@ -462,6 +511,44 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
 
   function percentage(value?: number | null, games?: number): string {
     return games && value != null ? `${value}%` : t("common.insufficientData")
+  }
+
+  function numberLabel(value?: number | null): string {
+    return value == null ? t("common.unknown") : String(value)
+  }
+
+  function battlegroundsStatsLabel(card: BattlegroundsCard): string {
+    if ((card.attack == null || card.attack === 0) && card.health == null) return t("common.notAvailable")
+    return `${card.attack ?? 0}/${card.health ?? 0}`
+  }
+
+  function battlegroundsKeywordsLabel(value?: Record<string, boolean | null>): string {
+    const entries = Object.entries(value || {})
+    if (!entries.length) return t("common.none")
+    return entries
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(
+        ([keyword, active]) =>
+          `${keyword}:${active == null ? t("common.unknown") : active ? t("common.yes") : t("common.no")}`,
+      )
+      .join(", ")
+  }
+
+  function battlegroundsAreaLabel(value?: BattlegroundsArea): string {
+    if (!value) return t("common.notAvailable")
+    const fragments = [
+      yesNo(value.complete),
+      value.phase ? localized("status.phase", value.phase) : "",
+      value.round ? t("battlegrounds.round", { value: value.round }) : "",
+    ].filter(Boolean)
+    return fragments.length ? fragments.join(" · ") : t("common.unknown")
+  }
+
+  function battlegroundsChoiceCountLabel(value?: BattlegroundsChoice | null): string {
+    if (!value) return t("common.unknown")
+    const min = Number(value.count_min ?? 0)
+    const max = Number(value.count_max ?? 0)
+    return min === max ? String(max) : `${min}-${max}`
   }
 
   function updateDraft(patch: Partial<SettingsDraft>) {
@@ -637,6 +724,29 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
     : draft.llm_commentary_enabled
       ? "actions.enable_companion.withCommentary"
       : "actions.enable_companion.questionsOnly"
+  const shopArea = battlegrounds.areas?.shop
+  const handArea = battlegrounds.areas?.hand
+  const warbandArea = battlegrounds.areas?.warband
+  const economyArea = battlegrounds.areas?.economy
+  const currentChoiceArea = battlegrounds.areas?.choice || battlegrounds.areas?.current_choice
+  const sharedBattlegroundsColumns = [
+    { key: "name", label: t("battlegroundsShop.card"), render: (row: BattlegroundsCard) => row.name || row.card_id || t("common.unknown") },
+    { key: "card_type", label: t("battlegroundsCards.cardType"), render: (row: BattlegroundsCard) => row.card_type || t("common.unknown") },
+    { key: "tier", label: t("battlegroundsShop.tier"), render: (row: BattlegroundsCard) => row.tier || t("common.unknown") },
+    { key: "attack", label: t("battlegroundsShop.stats"), render: (row: BattlegroundsCard) => battlegroundsStatsLabel(row) },
+    { key: "current_cost", label: t("battlegroundsCards.cost"), render: (row: BattlegroundsCard) => numberLabel(row.current_cost) },
+    { key: "premium", label: t("battlegroundsCards.premium"), render: (row: BattlegroundsCard) => yesNo(row.premium ?? undefined) },
+    { key: "keywords", label: t("battlegroundsCards.keywords"), render: (row: BattlegroundsCard) => battlegroundsKeywordsLabel(row.keywords) },
+  ]
+  const shopColumns = [
+    { key: "position", label: t("battlegroundsShop.position"), render: (row: BattlegroundsCard) => row.position || t("common.unknown") },
+    ...sharedBattlegroundsColumns,
+    { key: "frozen", label: t("battlegroundsShop.frozen"), render: (row: BattlegroundsCard) => yesNo(row.frozen) },
+  ]
+  const rosterColumns = [
+    { key: "position", label: t("battlegroundsShop.position"), render: (row: BattlegroundsCard) => row.position || t("common.unknown") },
+    ...sharedBattlegroundsColumns,
+  ]
 
   return (
     <Page title={t("panel.title")} subtitle={t("panel.subtitle")}>
@@ -715,8 +825,12 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
                 <KeyValue
                   items={[
                     { key: "frozen", label: t("battlegrounds.shopFrozen"), value: yesNo(battlegrounds.frozen) },
-                    { key: "hand", label: t("battlegrounds.hand"), value: boardCards((battlegrounds.hand || []).map((card) => card.name || card.card_id || t("common.unknown"))) },
-                    { key: "warband", label: t("battlegrounds.warband"), value: boardCards((battlegrounds.warband || []).map((card) => card.name || card.card_id || t("common.unknown"))) },
+                    { key: "refresh_cost", label: t("battlegrounds.refreshCost"), value: numberLabel(battlegrounds.refresh_cost ?? battlegrounds.economy?.refresh_cost) },
+                    { key: "upgrade_cost", label: t("battlegrounds.upgradeCost"), value: numberLabel(battlegrounds.upgrade_cost ?? battlegrounds.economy?.upgrade_cost) },
+                    { key: "shop_area", label: t("battlegrounds.shopObserved"), value: battlegroundsAreaLabel(shopArea) },
+                    { key: "hand_area", label: t("battlegrounds.handObserved"), value: battlegroundsAreaLabel(handArea) },
+                    { key: "warband_area", label: t("battlegrounds.warbandObserved"), value: battlegroundsAreaLabel(warbandArea) },
+                    { key: "economy_area", label: t("battlegrounds.economyObserved"), value: battlegroundsAreaLabel(economyArea) },
                     { key: "source", label: t("battlegrounds.source"), value: t("battlegrounds.powerLogSource") },
                   ]}
                 />
@@ -767,6 +881,32 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
               )}
             </Card>
 
+            {battlegrounds.current_choice || currentChoiceRows.length > 0 ? (
+              <Card title={t("sections.battlegroundsChoice.title")}>
+                <Stack>
+                  <KeyValue
+                    items={[
+                      { key: "type", label: t("battlegroundsChoice.type"), value: battlegrounds.current_choice?.choice_type || t("common.unknown") },
+                      { key: "count", label: t("battlegroundsChoice.count"), value: battlegroundsChoiceCountLabel(battlegrounds.current_choice) },
+                      { key: "source", label: t("battlegroundsChoice.source"), value: battlegrounds.current_choice?.source?.name || battlegrounds.current_choice?.source?.card_id || t("common.none") },
+                      { key: "observed", label: t("battlegroundsChoice.observed"), value: battlegroundsAreaLabel(currentChoiceArea) },
+                    ]}
+                  />
+                  {currentChoiceRows.length ? (
+                    <DataTable
+                      data={currentChoiceRows}
+                      rowKey="_key"
+                      maxRows={8}
+                      emptyText={t("battlegroundsChoice.empty")}
+                      columns={rosterColumns}
+                    />
+                  ) : (
+                    <EmptyState title={t("battlegroundsChoice.empty")} description={t("battlegroundsChoice.emptyHelp")} />
+                  )}
+                </Stack>
+              </Card>
+            ) : null}
+
             <Card title={t("sections.battlegroundsShop.title")}>
               {shopRows.length ? (
                 <DataTable
@@ -774,16 +914,38 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
                   rowKey="_key"
                   maxRows={10}
                   emptyText={t("battlegroundsShop.empty")}
-                  columns={[
-                    { key: "position", label: t("battlegroundsShop.position"), render: (row) => row.position || t("common.unknown") },
-                    { key: "name", label: t("battlegroundsShop.card"), render: (row) => row.name || row.card_id || t("common.unknown") },
-                    { key: "tier", label: t("battlegroundsShop.tier"), render: (row) => row.tier || t("common.unknown") },
-                    { key: "attack", label: t("battlegroundsShop.stats"), render: (row) => `${row.attack ?? 0}/${row.health ?? 0}` },
-                    { key: "frozen", label: t("battlegroundsShop.frozen"), render: (row) => yesNo(row.frozen) },
-                  ]}
+                  columns={shopColumns}
                 />
               ) : (
                 <EmptyState title={t("battlegroundsShop.empty")} description={t("battlegroundsShop.emptyHelp")} />
+              )}
+            </Card>
+
+            <Card title={t("sections.battlegroundsHand.title")}>
+              {handRows.length ? (
+                <DataTable
+                  data={handRows}
+                  rowKey="_key"
+                  maxRows={10}
+                  emptyText={t("battlegroundsHand.empty")}
+                  columns={rosterColumns}
+                />
+              ) : (
+                <EmptyState title={t("battlegroundsHand.empty")} description={t("battlegroundsHand.emptyHelp")} />
+              )}
+            </Card>
+
+            <Card title={t("sections.battlegroundsWarband.title")}>
+              {warbandRows.length ? (
+                <DataTable
+                  data={warbandRows}
+                  rowKey="_key"
+                  maxRows={10}
+                  emptyText={t("battlegroundsWarband.empty")}
+                  columns={rosterColumns}
+                />
+              ) : (
+                <EmptyState title={t("battlegroundsWarband.empty")} description={t("battlegroundsWarband.emptyHelp")} />
               )}
             </Card>
 

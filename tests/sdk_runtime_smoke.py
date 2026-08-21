@@ -170,6 +170,13 @@ def _load_plugin(plugin_root: Path) -> types.ModuleType:
 async def _exercise_lifecycle(plugin: Any, unwrap_or: Any) -> None:
     shutdown: dict[str, Any] = {}
     try:
+        tools = {item["name"] for item in plugin.list_llm_tools()}
+        expected_tools = {
+            "hearthstone_current_state",
+            "hearthstone_battlegrounds_advice",
+        }
+        if tools != expected_tools:
+            raise RuntimeError(f"stable SDK did not auto-register LLM tools: {tools!r}")
         startup = unwrap_or(await plugin.startup(), {})
         if startup.get("status") != "ready":
             raise RuntimeError(f"unexpected startup result: {startup!r}")
@@ -181,6 +188,7 @@ async def _exercise_lifecycle(plugin: Any, unwrap_or: Any) -> None:
             await plugin.save_settings(
                 llm_data_consent=True,
                 llm_commentary_enabled=True,
+                target_lanlan="stable-sdk-smoke-role",
             ),
             {},
         )

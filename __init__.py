@@ -2,11 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
-import os
 import threading
 import time
-import urllib.request
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping
@@ -27,7 +24,7 @@ from plugin.sdk.plugin import (
 )
 
 from .card_catalog import BattlegroundsCardCatalog
-from .commentary import build_llm_prompt
+from .commentary import build_live_state_contexts, build_llm_prompt
 from .config import CompanionConfig
 from .instructions import HEARTHSTONE_CONTEXT_INSTRUCTIONS, HEARTHSTONE_RESTORE_INSTRUCTIONS
 from .log_config import ensure_power_log_config
@@ -42,18 +39,12 @@ _CONFIG_SECTION = "hearthstone_companion"
 _BATTLEGROUNDS_STATS_KEY = "battlegrounds_stats_v1"
 _CHAT_QUIET_BYPASS_PRIORITY = 9
 _LLM_DELIVERY_MAX_CHARS = 1800
+_LIVE_STATE_DELIVERY_MAX_BYTES = 900
+_LIVE_STATE_SEGMENTS = ("core",)
 _STATS_CLEAR_WRITE_TIMEOUT_SECONDS = 3.0
 _SHUTDOWN_THREAD_BUDGET_SECONDS = 0.4
 _SHUTDOWN_WRITER_BUDGET_SECONDS = 0.3
 _SHUTDOWN_CONFIG_RECONCILE_BUDGET_SECONDS = 0.25
-_SHUTDOWN_LLM_TOOL_RECOVERY_BUDGET_SECONDS = 0.25
-_LLM_TOOL_HEALTH_INTERVAL_SECONDS = 15.0
-_LLM_TOOL_HEALTH_HTTP_TIMEOUT_SECONDS = 2.0
-_LLM_TOOL_REGISTRY_MAX_BYTES = 1024 * 1024
-_LLM_TOOL_HANDLER_NAMES = {
-    "hearthstone_current_state": "hearthstone_current_state",
-    "hearthstone_battlegrounds_advice": "hearthstone_battlegrounds_advice",
-}
 _OVERLAY_RUNTIME_FIELDS = (
     "overlay_enabled",
     "overlay_window_titles",
@@ -315,63 +306,91 @@ def _advice_capability(
     }
 
 
-def _main_server_tools_url() -> str:
-    raw_port = os.getenv("MAIN_SERVER_PORT", "48911")
-    try:
-        port = int(raw_port)
-    except (TypeError, ValueError):
-        port = 48911
-    if not 1 <= port <= 65535:
-        port = 48911
-    return f"http://127.0.0.1:{port}/api/tools"
-
-
-def _fetch_main_tool_registry() -> dict[str, Any]:
-    request = urllib.request.Request(
-        _main_server_tools_url(),
-        headers={"Accept": "application/json"},
-        method="GET",
-    )
-    with urllib.request.urlopen(  # noqa: S310 - fixed loopback URL only
-        request,
-        timeout=_LLM_TOOL_HEALTH_HTTP_TIMEOUT_SECONDS,
-    ) as response:
-        payload = response.read(_LLM_TOOL_REGISTRY_MAX_BYTES + 1)
-    if len(payload) > _LLM_TOOL_REGISTRY_MAX_BYTES:
-        raise ValueError("main_server tool registry response is too large")
-    decoded = json.loads(payload)
-    if not isinstance(decoded, dict):
-        raise TypeError("main_server tool registry response must be an object")
-    return decoded
-
-
-def _missing_remote_llm_tools(
-    registry: Mapping[str, Any],
+def _battlegrounds_purchase_decision(
+    shop_cards: list[Mapping[str, Any]],
     *,
-    expected_names: set[str],
-    expected_source: str,
-) -> set[str]:
-    tools_by_role = registry.get("tools_by_role")
-    if registry.get("ok") is not True or not isinstance(tools_by_role, Mapping):
-        raise ValueError("main_server tool registry response has an invalid shape")
-    if not tools_by_role:
-        return set(expected_names)
+    gold: Any,
+    qualitative_allowed: bool,
+    affordability_allowed: bool,
+    exact_sequence_allowed: bool,
+) -> dict[str, Any]:
+    """Build a compact, conservative decision surface for the current shop."""
 
-    missing: set[str] = set()
-    for tools in tools_by_role.values():
-        if not isinstance(tools, list):
-            raise ValueError("main_server role tool registry must be a list")
-        registered = {
-            str(item.get("name") or "")
-            for item in tools
-            if isinstance(item, Mapping)
-            and str(item.get("source") or "") == expected_source
-        }
-        missing.update(expected_names - registered)
-    return missing
+    gold_is_observed = isinstance(gold, int) and not isinstance(gold, bool) and gold >= 0
+    cards: list[dict[str, Any]] = []
+    known_affordable = 0
+    unknown_affordability = 0
+    for card in shop_cards:
+        raw_cost = card.get("current_cost")
+        cost_is_observed = (
+            isinstance(raw_cost, int) and not isinstance(raw_cost, bool) and raw_cost >= 0
+        )
+        if not cost_is_observed:
+            affordability = "unknown_cost_may_be_zero"
+            unknown_affordability += 1
+        elif not gold_is_observed:
+            affordability = "unknown_gold_not_observed"
+            unknown_affordability += 1
+        elif raw_cost <= gold:
+            affordability = "known_affordable"
+            known_affordable += 1
+        else:
+            affordability = "known_unaffordable"
+        cards.append(
+            {
+                "position": card.get("position"),
+                "card_id": str(card.get("card_id") or ""),
+                "name": str(card.get("name") or ""),
+                "card_type": card.get("card_type"),
+                "current_cost": raw_cost if cost_is_observed else None,
+                "affordability": affordability,
+            }
+        )
+
+    if not shop_cards:
+        whole_shop_affordability = "not_available"
+    elif known_affordable:
+        whole_shop_affordability = "known_affordable_card_present"
+    elif unknown_affordability:
+        whole_shop_affordability = "unknown"
+    else:
+        whole_shop_affordability = "known_no_shop_card_affordable"
+
+    result = {
+        "scope": "current_recruit_shop_only",
+        "current_gold": gold if gold_is_observed else None,
+        "whole_shop_affordability": whole_shop_affordability,
+        "qualitative_shop_priority_allowed": qualitative_allowed,
+        "whole_shop_affordability_allowed": affordability_allowed,
+        "exact_purchase_sequence_allowed": exact_sequence_allowed,
+        "legal_actions_enumerated": False,
+        "cards": cards,
+    }
+    if unknown_affordability:
+        result.update(
+            {
+                "required_answer_zh_CN": (
+                    "部分商品实际费用未知，其中可能有 0 费商品；可以做定性选牌，但无法判断整家商店"
+                    "是否有可购买商品，也不能据此断言只能空过。"
+                ),
+                "forbidden_whole_turn_conclusion": True,
+            }
+        )
+    else:
+        result["forbidden_whole_turn_conclusion"] = True
+    return result
 
 
-def _capture_monitor(monitor: Any) -> tuple[GameSnapshot, Any, int | None]:
+def _capture_monitor(
+    monitor: Any, *, timeout_seconds: float | None = None
+) -> tuple[GameSnapshot, Any, int | None]:
+    if timeout_seconds is not None:
+        try_capture = getattr(monitor, "try_capture", None)
+        if callable(try_capture):
+            captured = try_capture(timeout_seconds=timeout_seconds)
+            if captured is None:
+                raise TimeoutError("monitor state refresh is in progress")
+            return captured
     capture = getattr(monitor, "capture", None)
     if callable(capture):
         return capture()
@@ -451,7 +470,12 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         self._stats_recovery_lock = threading.RLock()
         self._store_writer = AsyncStoreWriter(self._persist_stats, self.logger)
         self._context_target: str | None = None
+        self._live_state_shared = False
+        self._live_state_target = ""
+        self._live_state_segment_count = 0
+        self._live_state_game_number = 0
         self._ownership_lock = threading.RLock()
+        self._delivery_lock = threading.RLock()
         self._settings_lock = asyncio.Lock()
         self._monitor_action_lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
@@ -478,148 +502,6 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         self._config_runtime_error_codes: tuple[str, ...] = ()
         self._config_restart_required = False
         self._overlay_applied_config = self.cfg
-        self._llm_tool_recovery_task: asyncio.Task[None] | None = None
-        self._llm_tool_recovery_specs: dict[str, dict[str, Any]] = {}
-
-    def _local_llm_tool_specs(self) -> dict[str, dict[str, Any]]:
-        cached = dict(getattr(self, "_llm_tool_recovery_specs", {}))
-        list_tools = getattr(self, "list_llm_tools", None)
-        if not callable(list_tools):
-            return cached
-        current = list_tools()
-        if not isinstance(current, list):
-            raise TypeError("list_llm_tools must return a list")
-        for item in current:
-            if not isinstance(item, Mapping):
-                continue
-            name = str(item.get("name") or "")
-            if name not in _LLM_TOOL_HANDLER_NAMES:
-                continue
-            cached[name] = {
-                "name": name,
-                "description": str(item.get("description") or ""),
-                "parameters": dict(item.get("parameters") or {}),
-                "timeout": float(item.get("timeout_seconds") or 30.0),
-                "role": item.get("role") if isinstance(item.get("role"), str) else None,
-            }
-        self._llm_tool_recovery_specs = cached
-        return cached
-
-    def _llm_tool_source(self) -> str:
-        try:
-            plugin_id = str(getattr(self, "plugin_id", "") or "")
-        except Exception:
-            plugin_id = ""
-        if not plugin_id:
-            plugin_id = str(getattr(getattr(self, "ctx", None), "plugin_id", "") or "")
-        return f"plugin:{plugin_id}" if plugin_id else ""
-
-    async def _check_and_recover_llm_tools(self) -> bool:
-        specs = self._local_llm_tool_specs()
-        source = self._llm_tool_source()
-        if not specs or not source:
-            return False
-        registry = await asyncio.to_thread(_fetch_main_tool_registry)
-        missing = _missing_remote_llm_tools(
-            registry,
-            expected_names=set(specs),
-            expected_source=source,
-        )
-        if not missing:
-            return True
-        if not bool(getattr(self, "_started", False)):
-            return False
-
-        unregister = getattr(self, "unregister_llm_tool", None)
-        register = getattr(self, "register_llm_tool", None)
-        if not callable(unregister) or not callable(register):
-            return False
-        recovered = 0
-        for name in sorted(missing):
-            if not bool(getattr(self, "_started", False)):
-                break
-            handler = getattr(self, _LLM_TOOL_HANDLER_NAMES[name], None)
-            if not callable(handler):
-                continue
-            spec = specs[name]
-            unregister(name)
-            register(
-                name=name,
-                description=spec["description"],
-                parameters=spec["parameters"],
-                handler=handler,
-                timeout=spec["timeout"],
-                role=spec["role"],
-            )
-            recovered += 1
-        if recovered:
-            self.logger.info(
-                "Hearthstone LLM tool registration recovery requested count=%s",
-                recovered,
-            )
-        return recovered == len(missing)
-
-    async def _llm_tool_recovery_loop(self) -> None:
-        current_task = asyncio.current_task()
-        try:
-            while bool(getattr(self, "_started", False)):
-                try:
-                    await self._check_and_recover_llm_tools()
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    self.logger.warning(
-                        "Hearthstone LLM tool registry check failed code=%s",
-                        type(exc).__name__,
-                    )
-                await asyncio.sleep(_LLM_TOOL_HEALTH_INTERVAL_SECONDS)
-        finally:
-            if getattr(self, "_llm_tool_recovery_task", None) is current_task:
-                self._llm_tool_recovery_task = None
-
-    def _start_llm_tool_recovery(self) -> bool:
-        current = getattr(self, "_llm_tool_recovery_task", None)
-        if current is not None and not current.done():
-            return True
-        if not all(
-            callable(getattr(self, method, None))
-            for method in ("list_llm_tools", "unregister_llm_tool", "register_llm_tool")
-        ):
-            return False
-        if not self._local_llm_tool_specs() or not self._llm_tool_source():
-            return False
-        self._llm_tool_recovery_task = asyncio.create_task(
-            self._llm_tool_recovery_loop(),
-            name="hearthstone-llm-tool-recovery",
-        )
-        return True
-
-    async def _stop_llm_tool_recovery(self) -> bool:
-        task = getattr(self, "_llm_tool_recovery_task", None)
-        if task is None:
-            return True
-        if task is asyncio.current_task():
-            return False
-        task.cancel()
-        try:
-            await asyncio.wait_for(
-                asyncio.shield(task),
-                timeout=_SHUTDOWN_LLM_TOOL_RECOVERY_BUDGET_SECONDS,
-            )
-        except asyncio.CancelledError:
-            return True
-        except TimeoutError:
-            return False
-        except Exception as exc:
-            self.logger.warning(
-                "Hearthstone LLM tool recovery stop failed code=%s",
-                type(exc).__name__,
-            )
-            return False
-        finally:
-            if getattr(self, "_llm_tool_recovery_task", None) is task and task.done():
-                self._llm_tool_recovery_task = None
-        return True
 
     @lifecycle(id="startup")
     async def startup(self, **_: Any):
@@ -699,7 +581,6 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 if self.cfg.overlay_enabled and self.cfg.overlay_auto_start:
                     overlay_result = await asyncio.to_thread(self._overlay.start)
                     self._require_current_startup(startup_generation)
-                self._start_llm_tool_recovery()
             except _StartupSuperseded:
                 self._clear_current_startup_task()
                 return Err(SdkError("startup superseded by another lifecycle transition"))
@@ -811,8 +692,6 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         reconcile_tasks: tuple[asyncio.Task[None], ...],
     ):
         cleanup_errors: list[str] = []
-        if not await self._stop_llm_tool_recovery():
-            cleanup_errors.append("LLM tool recovery task did not stop")
         overlay_manager = getattr(self, "_overlay", None)
         suspend_overlay = getattr(overlay_manager, "suspend_starts", None)
         if callable(suspend_overlay):
@@ -962,12 +841,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     getattr(self, "_consent_request_revision", 0)
                 ) + 1
 
-            context_target = getattr(self, "_context_target", None)
-            restore_required = context_target is not None and (
-                not updated.llm_data_consent
-                or self._stable_target(updated) != context_target
-                or updated.log_path != previous.log_path
-            )
+            restore_required = self._context_restore_required(previous, updated)
             self.cfg = updated
             self._settings_transition = True
             self._settings_transition_revision = int(
@@ -1089,11 +963,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     )
                     updated = CompanionConfig.from_mapping(fail_closed_values)
                 previous = self.cfg
-                restore_required = self._context_target is not None and (
-                    not updated.llm_data_consent
-                    or self._stable_target(updated) != self._context_target
-                    or updated.log_path != previous.log_path
-                )
+                restore_required = self._context_restore_required(previous, updated)
                 self.cfg = updated
                 self._settings_transition = True
                 self._settings_transition_revision = int(
@@ -1421,6 +1291,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     on_status=self.report_status,
                     on_result=self._record_battlegrounds_result,
                     on_event=self._observe_game_event,
+                    on_state=self._publish_live_state,
                 )
                 with self._ownership_lock:
                     monitor = getattr(self, "_monitor", None)
@@ -1662,12 +1533,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         updated: CompanionConfig,
     ) -> None:
         with self._ownership_lock:
-            target = getattr(self, "_context_target", None)
-            restore_required = target is not None and (
-                not updated.llm_data_consent
-                or self._stable_target(updated) != target
-                or updated.log_path != previous.log_path
-            )
+            restore_required = self._context_restore_required(previous, updated)
         if restore_required and not self._restore_context():
             raise RuntimeError(
                 "Hearthstone startup config apply failed: context_restore:rejected"
@@ -1697,15 +1563,60 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
     async def on_chat_message(self, **_: Any):
         with self._ownership_lock:
             self._last_user_chat_at = time.time()
-        return Ok({"status": "observed"})
+        return Ok(
+            {
+                "status": "observed",
+                "target_configured": bool(self._stable_target()),
+            }
+        )
 
     def _stable_target(self, config: CompanionConfig | None = None) -> str:
         return (config or self.cfg).target_lanlan.strip()[:80]
+
+    def _delivery_guard(self) -> threading.RLock:
+        return getattr(self, "_delivery_lock", self._ownership_lock)
+
+    def _delivery_target(self) -> str:
+        with self._ownership_lock:
+            return self._stable_target()
+
+    def _context_restore_required(
+        self,
+        previous: CompanionConfig,
+        updated: CompanionConfig,
+    ) -> bool:
+        previous_target = self._stable_target(previous)
+        updated_target = self._stable_target(updated)
+        source_changed = updated.log_path != previous.log_path
+        access_revoked = not updated.llm_data_consent
+        configured_target_changed = previous_target != updated_target
+        context_target = getattr(self, "_context_target", None)
+        live_state_shared = bool(getattr(self, "_live_state_shared", False))
+        return bool(
+            context_target is not None
+            and (
+                access_revoked
+                or source_changed
+                or configured_target_changed
+                or updated_target != context_target
+            )
+            or live_state_shared
+            and (access_revoked or source_changed or configured_target_changed)
+        )
 
     @staticmethod
     def _context_key(target: str) -> str:
         digest = hashlib.sha256(target.encode("utf-8")).hexdigest()[:16]
         return f"hearthstone:context:{digest}"
+
+    @staticmethod
+    def _live_state_key(target: str, segment: str = "core") -> str:
+        if not target:
+            base = "hearthstone:live-state:active-session"
+        else:
+            digest = hashlib.sha256(target.encode("utf-8")).hexdigest()[:16]
+            base = f"hearthstone:live-state:{digest}"
+        return base if segment == "core" else f"{base}:{segment}"
 
     def _push_context(self, text: str, *, target_lanlan: str, expired: bool) -> bool:
         kwargs: dict[str, Any] = {
@@ -1735,68 +1646,272 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             return False
 
     def _inject_context(self, target_lanlan: str | None = None) -> bool:
-        with self._ownership_lock:
-            stable_target = self._stable_target()
-            if not stable_target:
-                return self._context_target is None
-            target = stable_target if target_lanlan is None else target_lanlan
-            if target != stable_target:
-                return False
-            if self._context_target is not None:
-                return self._context_target == target
+        with self._delivery_guard():
+            with self._ownership_lock:
+                stable_target = self._stable_target()
+                if not stable_target:
+                    return self._context_target is None
+                target = stable_target if target_lanlan is None else target_lanlan
+                if target != stable_target:
+                    return False
+                if self._context_target is not None:
+                    return self._context_target == target
             if not self._push_context(
                 HEARTHSTONE_CONTEXT_INSTRUCTIONS,
                 target_lanlan=target,
                 expired=False,
             ):
                 return False
-            self._context_target = target
+            with self._ownership_lock:
+                self._context_target = target
+                access_reason, _revision = _live_state_access(self)
+                if (
+                    not access_reason
+                    and self._stable_target() == target
+                ):
+                    return True
+            restored = self._push_context(
+                HEARTHSTONE_RESTORE_INSTRUCTIONS,
+                target_lanlan=target,
+                expired=True,
+            )
+            if restored:
+                with self._ownership_lock:
+                    if self._context_target == target:
+                        self._context_target = None
+            return False
+
+    def _push_live_state(
+        self,
+        text: str,
+        *,
+        target_lanlan: str,
+        expired: bool,
+        segment: str,
+    ) -> bool:
+        kwargs: dict[str, Any] = {
+            "visibility": [],
+            "ai_behavior": "read",
+            "parts": [{"type": "text", "text": text}],
+            "source": "hearthstone_companion",
+            "metadata": {
+                "kind": "game_live_state_expired" if expired else "game_live_state",
+                "context_type": "hearthstone_companion_live_state",
+                "delivery_intent": "passive_context",
+                "context_expired": expired,
+                "privacy_scope": "capability_routing_only",
+                "segment": segment,
+            },
+            "priority": 0,
+            "coalesce_key": self._live_state_key(target_lanlan, segment),
+        }
+        if target_lanlan:
+            kwargs["target_lanlan"] = target_lanlan
+        try:
+            return _submitted(self.push_message(**kwargs))
+        except Exception as exc:
+            self.logger.warning(
+                "Hearthstone live-state delivery failed code=%s",
+                type(exc).__name__,
+            )
+            return False
+
+    def _publish_live_state(self, snapshot: GameSnapshot) -> bool:
+        return self._share_live_state(snapshot)
+
+    def _share_live_state(self, snapshot: GameSnapshot) -> bool:
+        with self._delivery_guard():
+            access_reason, _revision = _live_state_access(self)
+            with self._ownership_lock:
+                blocked = bool(
+                    access_reason
+                    or not self._started
+                    or not self._monitor_dispatch_enabled
+                    or snapshot.game_number <= 0
+                    or snapshot.phase in {"idle", "ended", "spectator"}
+                )
+            if blocked:
+                return False
+            target = self._delivery_target()
+            with self._ownership_lock:
+                already_shared = bool(
+                    getattr(self, "_live_state_shared", False)
+                    and getattr(self, "_live_state_target", "") == target
+                    and int(getattr(self, "_live_state_game_number", 0) or 0)
+                    == snapshot.game_number
+                )
+                target_changed = bool(
+                    getattr(self, "_live_state_shared", False)
+                    and getattr(self, "_live_state_target", "") != target
+                )
+                game_changed = bool(
+                    getattr(self, "_live_state_shared", False)
+                    and int(getattr(self, "_live_state_game_number", 0) or 0)
+                    != snapshot.game_number
+                )
+            if already_shared:
+                return True
+            if (target_changed or game_changed) and not self._expire_live_state():
+                return False
+            with self._ownership_lock:
+                if (
+                    getattr(self, "_live_state_shared", False)
+                    and getattr(self, "_live_state_target", "") == target
+                ):
+                    return True
+            try:
+                texts = build_live_state_contexts(
+                    snapshot,
+                    observed_at=time.time(),
+                    max_prompt_bytes=_LIVE_STATE_DELIVERY_MAX_BYTES,
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "Hearthstone live-state serialization failed code=%s",
+                    type(exc).__name__,
+                )
+                return False
+            segment_names = _LIVE_STATE_SEGMENTS
+            with self._ownership_lock:
+                previous_count = int(
+                    getattr(self, "_live_state_segment_count", 0) or 0
+                )
+                segment_count_changed = bool(
+                    getattr(self, "_live_state_shared", False)
+                    and previous_count != len(texts)
+                )
+            if segment_count_changed and not self._expire_live_state():
+                return False
+            with self._ownership_lock:
+                previous_count = int(
+                    getattr(self, "_live_state_segment_count", 0) or 0
+                )
+            for index, text in enumerate(texts):
+                access_reason, _revision = _live_state_access(self)
+                with self._ownership_lock:
+                    delivery_invalid = bool(
+                        access_reason
+                        or not self._started
+                        or not self._monitor_dispatch_enabled
+                        or self._delivery_target() != target
+                    )
+                if delivery_invalid:
+                    if getattr(self, "_live_state_shared", False):
+                        self._expire_live_state()
+                    return False
+                if not self._push_live_state(
+                    text,
+                    target_lanlan=target,
+                    expired=False,
+                    segment=segment_names[index],
+                ):
+                    if previous_count > 0:
+                        self._expire_live_state()
+                    return False
+                with self._ownership_lock:
+                    self._live_state_shared = True
+                    self._live_state_target = target
+                    self._live_state_segment_count = max(previous_count, index + 1)
+                    self._live_state_game_number = snapshot.game_number
+                access_reason, _revision = _live_state_access(self)
+                if access_reason or self._delivery_target() != target:
+                    self._expire_live_state()
+                    return False
+            return True
+
+    @staticmethod
+    def _live_state_expired_text() -> str:
+        return (
+            "# 炉石工具能力提示已失效\n"
+            "不得从之前的静态提示推断当前权限或局势。"
+            "如果主人继续询问当前对局，请调用炉石工具；工具拒绝或不可用时如实说明。"
+        )
+
+    def _expire_live_state(self) -> bool:
+        with self._delivery_guard():
+            with self._ownership_lock:
+                if not getattr(self, "_live_state_shared", False):
+                    return True
+                target = str(getattr(self, "_live_state_target", "") or "")
+                segment_names = _LIVE_STATE_SEGMENTS
+                segment_count = max(
+                    1,
+                    min(
+                        len(segment_names),
+                        int(getattr(self, "_live_state_segment_count", 1) or 1),
+                    ),
+                )
+            text = self._live_state_expired_text()
+            for segment in segment_names[:segment_count]:
+                if not self._push_live_state(
+                    text,
+                    target_lanlan=target,
+                    expired=True,
+                    segment=segment,
+                ):
+                    return False
+            with self._ownership_lock:
+                if (
+                    getattr(self, "_live_state_shared", False)
+                    and getattr(self, "_live_state_target", "") == target
+                    and int(getattr(self, "_live_state_segment_count", 0) or 0)
+                    == segment_count
+                ):
+                    self._live_state_shared = False
+                    self._live_state_target = ""
+                    self._live_state_segment_count = 0
+                    self._live_state_game_number = 0
             return True
 
     def _restore_context(self) -> bool:
-        with self._ownership_lock:
-            if self._context_target is None:
-                return True
-            target = self._context_target
+        with self._delivery_guard():
+            live_state_restored = self._expire_live_state()
+            with self._ownership_lock:
+                target = self._context_target
+            if target is None:
+                return live_state_restored
             if not self._push_context(
                 HEARTHSTONE_RESTORE_INSTRUCTIONS,
                 target_lanlan=target,
                 expired=True,
             ):
                 return False
-            self._context_target = None
-            return True
+            with self._ownership_lock:
+                if self._context_target == target:
+                    self._context_target = None
+            return live_state_restored
 
     def _observe_game_event(self, event: GameEvent, snapshot: GameSnapshot) -> None:
+        action = ""
         with self._ownership_lock:
             access_reason, _revision = _live_state_access(self)
             if access_reason:
                 if access_reason == "llm_data_sharing_not_authorized":
-                    self._restore_context()
-                return
-            leaving = event.kind in {
-                "source_reset",
-                "state_stale",
-                "battlegrounds_game_ended",
-                "game_ended",
-            }
-            if snapshot.phase == "spectator" or leaving:
-                self._restore_context()
-                return
-            if (
-                not self._started
-                or not self._monitor_dispatch_enabled
-            ):
-                return
-            entering = event.kind in {
-                "state_ready",
-                "state_resumed",
-                "battlegrounds_detected",
-                "mulligan",
-                "turn_started",
-            }
-            if entering:
-                self._inject_context()
+                    action = "restore"
+            else:
+                leaving = event.kind in {
+                    "source_reset",
+                    "state_stale",
+                    "state_unavailable",
+                    "battlegrounds_game_ended",
+                    "game_ended",
+                }
+                if snapshot.phase == "spectator" or leaving:
+                    action = "restore"
+                elif self._started and self._monitor_dispatch_enabled:
+                    entering = event.kind in {
+                        "state_ready",
+                        "state_resumed",
+                        "battlegrounds_detected",
+                        "mulligan",
+                        "turn_started",
+                    }
+                    if entering:
+                        action = "inject"
+        if action == "restore":
+            self._restore_context()
+        elif action == "inject":
+            self._inject_context()
 
     def _sync_active_game_context(self) -> None:
         access_reason, transition_revision = _live_state_access(self)
@@ -1808,7 +1923,11 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         if monitor is None:
             return
         try:
-            snapshot, runtime, _generation = _capture_monitor(monitor)
+            snapshot, runtime, _generation = _capture_monitor(
+                monitor, timeout_seconds=0.05
+            )
+        except TimeoutError:
+            return
         except Exception:
             return
         access_reason, _revision = _live_state_access(
@@ -1846,6 +1965,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 ),
                 snapshot,
             )
+            self._publish_live_state(snapshot)
         except Exception as exc:
             logger = getattr(self, "logger", None)
             if logger is not None:
@@ -1854,29 +1974,36 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 )
 
     def _dispatch_llm(self, prompt: str, event: GameEvent, snapshot: GameSnapshot) -> bool:
-        with self._ownership_lock:
+        with self._delivery_guard():
             access_reason, _revision = _live_state_access(self)
-            if (
-                access_reason
-                or not self._started
-                or not self._monitor_dispatch_enabled
-                or not self.cfg.llm_commentary_enabled
-            ):
+            with self._ownership_lock:
+                config = self.cfg
+                if (
+                    access_reason
+                    or not self._started
+                    or not self._monitor_dispatch_enabled
+                    or not config.llm_commentary_enabled
+                ):
+                    return False
+                if (
+                    event.priority < _CHAT_QUIET_BYPASS_PRIORITY
+                    and time.time() - self._last_user_chat_at
+                    < config.user_chat_quiet_window_seconds
+                ):
+                    return False
+                stable_target = self._stable_target()
+                context_target = self._context_target
+            target = self._delivery_target()
+            if not target:
                 return False
-            if (
-                event.priority < _CHAT_QUIET_BYPASS_PRIORITY
-                and time.time() - self._last_user_chat_at < self.cfg.user_chat_quiet_window_seconds
-            ):
-                return False
-            target = self._stable_target()
-            if self._context_target is not None and self._context_target != target:
+            if context_target is not None and context_target != stable_target:
                 if not self._restore_context():
                     return False
-            if target and not self._inject_context(target):
+            if stable_target and not self._inject_context(stable_target):
                 return False
             terminal = event.kind in {"battlegrounds_game_ended", "game_ended"}
             response_prompt = prompt
-            if terminal or not target:
+            if terminal or not stable_target:
                 heading = "# 本次终局事件" if terminal else "# 本次公开事件"
                 prompt_budget = (
                     _LLM_DELIVERY_MAX_CHARS
@@ -1888,7 +2015,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     prompt = build_llm_prompt(
                         event,
                         snapshot,
-                        max_reply_chars=self.cfg.llm_max_reply_chars,
+                        max_reply_chars=config.llm_max_reply_chars,
                         max_prompt_chars=prompt_budget,
                         context_already_included=True,
                     )
@@ -1896,6 +2023,14 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     f"{HEARTHSTONE_CONTEXT_INSTRUCTIONS}\n\n"
                     f"{heading}\n"
                     f"{prompt}"
+                )
+            elif len(prompt) > _LLM_DELIVERY_MAX_CHARS:
+                response_prompt = build_llm_prompt(
+                    event,
+                    snapshot,
+                    max_reply_chars=config.llm_max_reply_chars,
+                    max_prompt_chars=_LLM_DELIVERY_MAX_CHARS,
+                    context_already_included=True,
                 )
             kwargs: dict[str, Any] = {
                 "visibility": [],
@@ -1908,13 +2043,23 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     "context_type": "hearthstone_companion",
                     "privacy_scope": "player_visible_game_state",
                     "reply_contract": "single_short_line",
-                    "max_reply_chars": self.cfg.llm_max_reply_chars,
+                    "max_reply_chars": config.llm_max_reply_chars,
                 },
                 "priority": event.priority,
             }
-            if target:
-                kwargs["target_lanlan"] = target
-                kwargs["coalesce_key"] = f"hearthstone:llm:{self._context_key(target)}"
+            kwargs["target_lanlan"] = target
+            kwargs["coalesce_key"] = f"hearthstone:llm:{self._context_key(target)}"
+            access_reason, _revision = _live_state_access(self)
+            with self._ownership_lock:
+                delivery_invalid = bool(
+                    access_reason
+                    or not self._started
+                    or not self._monitor_dispatch_enabled
+                    or not self.cfg.llm_commentary_enabled
+                    or self._delivery_target() != target
+                )
+            if delivery_invalid:
+                return False
             submitted = _submitted(self.push_message(**kwargs))
             if submitted and terminal:
                 self._restore_context()
@@ -2281,15 +2426,10 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     )
                 normalized = requested.to_dict()
                 submitted = {key: normalized[key] for key in submitted}
-                resolved_target = self._stable_target(requested)
                 revoking_consent = requested_consent_revocation or (
                     previous.llm_data_consent and not requested.llm_data_consent
                 )
-                restore_needed = self._context_target is not None and (
-                    not requested.llm_data_consent
-                    or resolved_target != self._context_target
-                    or requested.log_path != previous.log_path
-                )
+                restore_needed = self._context_restore_required(previous, requested)
                 self._settings_transition = True
                 self._settings_transition_revision = int(
                     getattr(self, "_settings_transition_revision", 0)
@@ -2318,15 +2458,15 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                         self.cfg = CompanionConfig.from_mapping(fail_closed)
                         fail_closed_monitor = getattr(self, "_monitor", None)
                         fail_closed_monitor_config = self.cfg
-                    context_restored = not restore_needed or self._restore_context()
-                    if not context_restored and not revoking_consent:
-                        return Err(
-                            SdkError(
-                                "could not restore the previous Hearthstone character context"
-                            )
+                context_restored = not restore_needed or self._restore_context()
+                if not context_restored and not revoking_consent:
+                    return Err(
+                        SdkError(
+                            "could not restore the previous Hearthstone character context"
                         )
-                    if not context_restored:
-                        runtime_errors.append("context_restore:rejected")
+                    )
+                if not context_restored:
+                    runtime_errors.append("context_restore:rejected")
                 if (
                     fail_closed_monitor is not None
                     and fail_closed_monitor_config is not None
@@ -2566,7 +2706,8 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             "state.turn is only the raw alternating player-turn counter, and state.active_side says whose action it is. "
             "It reads the fresh privacy-filtered player-visible state and never includes raw logs, opponent "
             "hidden cards, secret identities, or deck order. Do not use this tool alone for Battlegrounds/酒馆战棋 strategy or meta questions "
-            "such as 流派、阵容、升本、稳血、买什么; call hearthstone_battlegrounds_advice instead and "
+            "such as 流派、阵容、升本、稳血、买什么; do not call it for any Battlegrounds current-state question. "
+            "Call hearthstone_battlegrounds_advice instead; this tool returns only a redirect when the live mode is Battlegrounds, and "
             "never answer those questions as constructed Hearthstone."
         ),
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
@@ -2637,19 +2778,35 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         if access_reason:
             return blocked_payload(access_reason)
         monitor = self._ensure_monitor()
-        snapshot, runtime, _generation = _capture_monitor(monitor)
+        try:
+            snapshot, runtime, _generation = _capture_monitor(monitor, timeout_seconds=0.05)
+        except TimeoutError:
+            return blocked_payload("state_refresh_in_progress")
         captured_at = time.time()
         freshness = _state_freshness(snapshot, runtime, captured_at=captured_at)
         has_state = snapshot.phase != "idle"
         live = freshness["source"] == "live"
+        battlegrounds_redirect = bool(
+            has_state and live and snapshot.mode == "battlegrounds"
+        )
         result = {
-            "available": bool(has_state and live),
-            "state": snapshot.to_public_dict() if has_state and live else {},
+            "available": bool(has_state and live and not battlegrounds_redirect),
+            "state": (
+                snapshot.to_public_dict()
+                if has_state and live and not battlegrounds_redirect
+                else {}
+            ),
             "freshness": freshness,
-            "reason": "" if has_state and live else "no_live_game_state",
+            "reason": (
+                "battlegrounds_requires_specialized_tool"
+                if battlegrounds_redirect
+                else ("" if has_state and live else "no_live_game_state")
+            ),
             "privacy_scope": "player_visible_game_state",
             "answer_contract": answer_contract,
-            "capabilities": capabilities_for(snapshot if has_state and live else None),
+            "capabilities": capabilities_for(
+                snapshot if has_state and live and not battlegrounds_redirect else None
+            ),
         }
         if snapshot.mode == "battlegrounds":
             result["strategy_routing"] = {
@@ -2674,7 +2831,12 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             "stabilizing, purchases, sales, refreshes, and freezes. Query the fresh privacy-filtered public state, "
             "per-area completeness, observed actual costs and current card attributes, attributed current-pool card "
             "facts, official season rules, and aggregate-only local results. Respect each capability status and "
-            "missing_evidence; never turn partial or unavailable evidence into a specific recommendation. "
+            "missing_evidence. shop_card_priority_advice may support a qualitative ranking when actual card costs "
+            "are unknown; purchase_affordability and specific_purchase_advice must not infer a default minion cost, "
+            "and exact affordability or purchase sequences require observed gold and actual costs. If any shop "
+            "current_cost is null, whole-shop affordability is unknown even with 0 Gold. Never conclude that nothing "
+            "can be bought, the turn must be passed, or no free action exists. Obey decision_guardrails and never turn "
+            "partial or unavailable evidence into a specific recommendation. "
             "This tool is Battlegrounds-only: never answer with constructed decks or constructed archetypes. "
             "It never provides unlicensed global win rates."
         ),
@@ -2715,7 +2877,14 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             "catalog_pool_summary_is_not_lobby_specific_or_win_rate_data": True,
             "catalog_metadata_is_best_effort_and_missing_ids_must_not_be_guessed": True,
             "hero_comparison_requires_observed_choices": True,
+            "shop_card_priority_can_use_complete_catalog_when_actual_costs_missing": True,
+            "shop_card_priority_must_not_claim_affordability_or_exact_sequence": True,
+            "purchase_affordability_requires_observed_gold_and_complete_actual_shop_costs": True,
+            "partial_purchase_affordability_only_covers_cards_with_observed_cost": True,
+            "never_generalize_partial_affordability_to_the_entire_shop": True,
+            "never_claim_no_legal_actions_from_this_snapshot": True,
             "specific_purchase_requires_complete_current_shop_costs_and_catalog": True,
+            "unknown_current_cost_must_remain_null": True,
             "upgrade_and_refresh_require_observed_actual_costs": True,
             "choice_comparison_requires_complete_current_options": True,
             "positioning_requires_complete_current_warband": True,
@@ -2742,7 +2911,10 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         if access_reason:
             return blocked_payload(access_reason)
         monitor = self._ensure_monitor()
-        snapshot, runtime, _generation = _capture_monitor(monitor)
+        try:
+            snapshot, runtime, _generation = _capture_monitor(monitor, timeout_seconds=0.05)
+        except TimeoutError:
+            return blocked_payload("state_refresh_in_progress")
         captured_at = time.time()
         freshness = _state_freshness(snapshot, runtime, captured_at=captured_at)
         battlegrounds = snapshot.battlegrounds.to_public_dict() if snapshot.battlegrounds else None
@@ -2768,7 +2940,12 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             )
             if access_reason:
                 return blocked_payload(access_reason)
-            snapshot, runtime, _generation = _capture_monitor(monitor)
+            try:
+                snapshot, runtime, _generation = _capture_monitor(
+                    monitor, timeout_seconds=0.05
+                )
+            except TimeoutError:
+                return blocked_payload("state_refresh_in_progress")
             captured_at = time.time()
             freshness = _state_freshness(snapshot, runtime, captured_at=captured_at)
         season_key = str(self._season.get("key") or "local-unversioned")
@@ -2790,16 +2967,19 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             and battlegrounds
             and freshness["source"] == "live"
         )
-        battlegrounds_phase = str((battlegrounds or {}).get("phase") or "unknown")
-        hero_choices = list((battlegrounds or {}).get("hero_choices") or [])
-        shop = list((battlegrounds or {}).get("shop") or [])
-        hand = list((battlegrounds or {}).get("hand") or [])
-        warband = list((battlegrounds or {}).get("warband") or [])
-        lobby = list((battlegrounds or {}).get("lobby") or [])
-        current_choice = (battlegrounds or {}).get("current_choice")
+        live_battlegrounds_state = battlegrounds if live_battlegrounds else {}
+        battlegrounds_phase = str(
+            live_battlegrounds_state.get("phase") or "unknown"
+        )
+        hero_choices = list(live_battlegrounds_state.get("hero_choices") or [])
+        shop = list(live_battlegrounds_state.get("shop") or [])
+        hand = list(live_battlegrounds_state.get("hand") or [])
+        warband = list(live_battlegrounds_state.get("warband") or [])
+        lobby = list(live_battlegrounds_state.get("lobby") or [])
+        current_choice = live_battlegrounds_state.get("current_choice")
         choice_options = list((current_choice or {}).get("options") or [])
-        economy_state = dict((battlegrounds or {}).get("economy") or {})
-        current_round = int((battlegrounds or {}).get("round") or 0)
+        economy_state = dict(live_battlegrounds_state.get("economy") or {})
+        current_round = int(live_battlegrounds_state.get("round") or 0)
 
         catalog_facts_needed = bool(
             catalog is not None
@@ -2830,7 +3010,12 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             card_catalog = HearthstoneCompanionPlugin._catalog_status(self)
         catalog_mapping = card_catalog if isinstance(card_catalog, Mapping) else {}
 
+        hero_select_phase = bool(
+            live_battlegrounds and battlegrounds_phase == "hero_select"
+        )
         recruit_phase = bool(live_battlegrounds and battlegrounds_phase == "recruit")
+        hero_select_evidence = ["fresh_hero_select"] if hero_select_phase else []
+        recruit_phase_evidence = ["fresh_recruit_phase"] if recruit_phase else []
         shop_cards = [item for item in shop if isinstance(item, Mapping)]
         hand_cards = [item for item in hand if isinstance(item, Mapping)]
         warband_cards = [item for item in warband if isinstance(item, Mapping)]
@@ -2852,10 +3037,25 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         shop_evidence, shop_missing = area_evidence("shop")
         hand_evidence, hand_missing = area_evidence("hand")
         warband_evidence, warband_missing = area_evidence("warband")
-        economy_evidence, economy_missing = area_evidence(
-            "economy", require_complete=False
-        )
         choice_evidence, choice_missing = area_evidence("choice")
+
+        def economy_value_evidence(name: str) -> tuple[list[str], list[str]]:
+            observation = economy_state.get(f"{name}_observation")
+            if not isinstance(observation, Mapping):
+                return [], [f"{name}_observation_missing"]
+            return _battlegrounds_area_evidence(
+                {
+                    "round": current_round,
+                    "phase": battlegrounds_phase,
+                    "areas": {name: observation},
+                },
+                name,
+                captured_at=captured_at,
+            )
+
+        gold_evidence, gold_missing = economy_value_evidence("gold")
+        upgrade_evidence, upgrade_missing = economy_value_evidence("upgrade")
+        refresh_evidence, refresh_missing = economy_value_evidence("refresh")
 
         hero_catalog_evidence, hero_catalog_missing, hero_unresolved = (
             _catalog_coverage_evidence(
@@ -2865,12 +3065,10 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             else ([], [], [])
         )
         hero_choice_capability = _advice_capability(
-            phase_available=bool(
-                live_battlegrounds and battlegrounds_phase == "hero_select"
-            ),
+            phase_available=hero_select_phase,
             candidates_observed=bool(hero_cards),
             primary_evidence="observed_hero_choices_with_catalog_facts",
-            evidence=["fresh_hero_select", *hero_catalog_evidence],
+            evidence=[*hero_select_evidence, *hero_catalog_evidence],
             missing=hero_catalog_missing,
             unavailable_reason="hero_choices_not_observed",
             unresolved_catalog_ids=hero_unresolved,
@@ -2911,9 +3109,18 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             if recruit_context_cards
             else ([], [], [])
         )
-        gold_observed = (battlegrounds or {}).get("gold") is not None
+        gold_observed = bool(
+            live_battlegrounds_state.get("gold") is not None and not gold_missing
+        )
         shop_costs_observed = bool(shop_cards) and all(
             item.get("current_cost") is not None for item in shop_cards
+        )
+        unknown_shop_cost_ids = list(
+            dict.fromkeys(
+                str(item.get("card_id") or "unknown_shop_card")
+                for item in shop_cards
+                if item.get("current_cost") is None
+            )
         )
         shop_types_observed = bool(shop_cards) and all(
             str(item.get("card_type") or "") for item in shop_cards
@@ -2926,7 +3133,55 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             for item in shop_cards
         ):
             uncertain_shop_state.append("shop_current_keyword_state_incomplete")
-        purchase_field_missing: list[str] = []
+        priority_uncertain_evidence = [*uncertain_shop_state]
+        if not shop_costs_observed:
+            priority_uncertain_evidence.append("shop_actual_cost_incomplete")
+        priority_field_missing = (
+            [] if shop_types_observed else ["shop_card_type_incomplete"]
+        )
+        priority_capability = _advice_capability(
+            phase_available=recruit_phase,
+            candidates_observed=bool(shop_cards),
+            primary_evidence="fresh_complete_recruit_context_with_catalog_facts",
+            evidence=[
+                *recruit_phase_evidence,
+                *shop_evidence,
+                *hand_evidence,
+                *warband_evidence,
+                *recruit_catalog_evidence,
+                *(["shop_card_types_observed"] if shop_types_observed else []),
+            ],
+            missing=[
+                *shop_missing,
+                *hand_missing,
+                *warband_missing,
+                *priority_field_missing,
+                *recruit_catalog_missing,
+            ],
+            unavailable_reason="no_fresh_recruit_shop",
+            unresolved_catalog_ids=recruit_unresolved,
+            uncertain_evidence=priority_uncertain_evidence,
+        )
+        purchase_affordability_missing = [*shop_missing, *gold_missing]
+        if not gold_observed:
+            purchase_affordability_missing.append("current_gold_not_observed")
+        if not shop_costs_observed:
+            purchase_affordability_missing.append("shop_actual_cost_incomplete")
+        purchase_affordability = _advice_capability(
+            phase_available=recruit_phase,
+            candidates_observed=bool(shop_cards),
+            primary_evidence="fresh_observed_gold_and_shop_actual_costs",
+            evidence=[
+                *recruit_phase_evidence,
+                *shop_evidence,
+                *gold_evidence,
+                *(["current_gold_observed"] if gold_observed else []),
+                *(["shop_actual_costs_observed"] if shop_costs_observed else []),
+            ],
+            missing=purchase_affordability_missing,
+            unavailable_reason="no_fresh_recruit_shop",
+        )
+        purchase_field_missing: list[str] = [*gold_missing]
         if not gold_observed:
             purchase_field_missing.append("current_gold_not_observed")
         if not shop_costs_observed:
@@ -2938,11 +3193,12 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             candidates_observed=bool(shop_cards),
             primary_evidence="fresh_complete_recruit_context_with_actual_costs",
             evidence=[
-                "fresh_recruit_phase",
+                *recruit_phase_evidence,
                 *shop_evidence,
                 *hand_evidence,
                 *warband_evidence,
                 *recruit_catalog_evidence,
+                *gold_evidence,
                 *(["current_gold_observed"] if gold_observed else []),
                 *(["shop_actual_costs_observed"] if shop_costs_observed else []),
                 *(["shop_card_types_observed"] if shop_types_observed else []),
@@ -2959,9 +3215,13 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             uncertain_evidence=uncertain_shop_state,
         )
 
-        upgrade_cost_observed = economy_state.get("upgrade_cost") is not None
-        refresh_cost_observed = economy_state.get("refresh_cost") is not None
-        affordability_missing = [*economy_missing]
+        upgrade_cost_observed = bool(
+            economy_state.get("upgrade_cost") is not None and not upgrade_missing
+        )
+        refresh_cost_observed = bool(
+            economy_state.get("refresh_cost") is not None and not refresh_missing
+        )
+        affordability_missing = [*gold_missing, *upgrade_missing]
         if not gold_observed:
             affordability_missing.append("current_gold_not_observed")
         if not upgrade_cost_observed:
@@ -2971,8 +3231,9 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             candidates_observed=bool(gold_observed or upgrade_cost_observed),
             primary_evidence="fresh_observed_gold_and_upgrade_cost",
             evidence=[
-                "fresh_recruit_phase",
-                *economy_evidence,
+                *recruit_phase_evidence,
+                *gold_evidence,
+                *upgrade_evidence,
                 *(["current_gold_observed"] if gold_observed else []),
                 *(
                     ["actual_upgrade_cost_observed"]
@@ -3003,7 +3264,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             unresolved_catalog_ids=recruit_unresolved,
         )
 
-        refresh_field_missing = [*economy_missing]
+        refresh_field_missing = [*gold_missing, *refresh_missing]
         if not gold_observed:
             refresh_field_missing.append("current_gold_not_observed")
         if not refresh_cost_observed:
@@ -3013,8 +3274,9 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             candidates_observed=bool(shop_cards or refresh_cost_observed),
             primary_evidence="fresh_refresh_cost_with_complete_shop",
             evidence=[
-                "fresh_recruit_phase",
-                *economy_evidence,
+                *recruit_phase_evidence,
+                *gold_evidence,
+                *refresh_evidence,
                 *shop_evidence,
                 *recruit_catalog_evidence,
                 *(["current_gold_observed"] if gold_observed else []),
@@ -3057,7 +3319,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             candidates_observed=bool(warband_cards),
             primary_evidence="fresh_complete_positioned_warband",
             evidence=[
-                "fresh_recruit_phase",
+                *recruit_phase_evidence,
                 *warband_evidence,
                 *warband_catalog_evidence,
             ],
@@ -3119,6 +3381,8 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         capabilities = {
             "hero_choice_comparison": hero_choice_capability,
             "current_choice_comparison": choice_capability,
+            "shop_card_priority_advice": priority_capability,
+            "purchase_affordability": purchase_affordability,
             "specific_purchase_advice": purchase_capability,
             "upgrade_affordability": upgrade_affordability,
             "upgrade_advice": upgrade_capability,
@@ -3141,11 +3405,17 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         hand_current = bool(recruit_phase and not hand_missing)
         warband_current_round = bool(recruit_phase and not warband_missing)
         choice_current = bool(live_battlegrounds and current_choice and not choice_missing)
-        economy_current = bool(recruit_phase and not economy_missing)
+        gold_current = bool(recruit_phase and not gold_missing)
+        upgrade_cost_current = bool(recruit_phase and not upgrade_missing)
+        refresh_cost_current = bool(recruit_phase and not refresh_missing)
         local_player = next((item for item in lobby if item.get("is_local")), None)
         current_hero_id = str((local_player or {}).get("hero_card_id") or "")
         current_hero_name = str((local_player or {}).get("hero_name") or "")
-        current_variant = str((battlegrounds or {}).get("variant") or "solo")
+        current_variant = (
+            str(live_battlegrounds_state.get("variant") or "solo")
+            if live_battlegrounds
+            else ""
+        )
         variant_stats = local_stats.get(current_variant, {})
         hero_samples = variant_stats.get("heroes", {}) if isinstance(variant_stats, Mapping) else {}
         current_hero_sample = (
@@ -3169,11 +3439,15 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             if current_hero_id
             else None,
             "stats_key": current_hero_id,
-            "variant": current_variant if battlegrounds else "",
+            "variant": current_variant,
             "season_key": season_key,
             "local_sample": dict(current_hero_sample) if isinstance(current_hero_sample, Mapping) else {},
             "sample_scope": "aggregate_local_history_only",
         }
+        post_game_lobby = list((battlegrounds or {}).get("lobby") or [])
+        post_game_local_player = next(
+            (item for item in post_game_lobby if item.get("is_local")), None
+        )
         post_game_candidate = bool(
             snapshot.mode == "battlegrounds"
             and battlegrounds
@@ -3229,12 +3503,17 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 public_state["warband"] = []
             if battlegrounds_phase in {"hero_select", "recruit"} and not choice_current:
                 public_state["current_choice"] = None
-            if battlegrounds_phase == "recruit" and not economy_current:
-                public_state["refresh_cost"] = None
-                public_state["upgrade_cost"] = None
+            if battlegrounds_phase == "recruit":
                 public_economy = dict(public_state.get("economy") or {})
-                public_economy["refresh_cost"] = None
-                public_economy["upgrade_cost"] = None
+                if not gold_current:
+                    public_state["gold"] = None
+                    public_state["max_gold"] = None
+                if not refresh_cost_current:
+                    public_state["refresh_cost"] = None
+                    public_economy["refresh_cost"] = None
+                if not upgrade_cost_current:
+                    public_state["upgrade_cost"] = None
+                    public_economy["upgrade_cost"] = None
                 public_state["economy"] = public_economy
             if battlegrounds_phase == "combat":
                 public_state["current_choice"] = None
@@ -3255,7 +3534,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 "round": battlegrounds.get("round"),
                 "phase": battlegrounds.get("phase"),
                 "placement": battlegrounds.get("placement"),
-                "local_player": local_player,
+                "local_player": post_game_local_player,
             }
         else:
             public_state = None
@@ -3269,6 +3548,65 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 key: self._season.get(key)
                 for key in ("key", "season", "patch", "verified_at", "status", "is_win_rate_data")
             }
+        if selected_topic != "current_strategy":
+            decision_guardrails: dict[str, Any] = {}
+        elif not recruit_phase:
+            decision_guardrails = {
+                "mandatory_instruction": (
+                    "Do not give current shop, affordability, or purchase-sequence advice outside a fresh "
+                    "Recruit phase."
+                ),
+                "qualitative_shop_priority_allowed": False,
+                "purchase_affordability_allowed": False,
+                "exact_purchase_sequence_allowed": False,
+                "unknown_actual_cost_card_ids": [],
+            }
+        elif unknown_shop_cost_ids:
+            decision_guardrails = {
+                "mandatory_instruction": (
+                    "Some current shop costs are unknown. You may use shop_card_priority_advice for a qualitative "
+                    "ranking when it is available. Whole-shop affordability is UNKNOWN even when current Gold is 0. "
+                    "You MUST NOT give an exact purchase sequence or claim that nothing can be bought, the turn must "
+                    "be passed, or no free action exists. Only state affordability for cards whose current_cost is "
+                    "non-null."
+                ),
+                "qualitative_shop_priority_allowed": priority_capability["available"],
+                "purchase_affordability_allowed": purchase_affordability["available"],
+                "exact_purchase_sequence_allowed": purchase_capability["available"],
+                "whole_shop_affordability": "unknown",
+                "unknown_actual_cost_card_ids": unknown_shop_cost_ids,
+                "required_disclaimer_zh_CN": (
+                    "部分商品的实际费用未知，其中可能有 0 费商品；因此无法判断整家商店是否有可购买商品。"
+                ),
+                "forbidden_conclusions_zh_CN": [
+                    "什么都买不了",
+                    "只能空过",
+                    "啥也干不了",
+                    "没有免费的操作",
+                ],
+            }
+        else:
+            decision_guardrails = {
+                "mandatory_instruction": (
+                    "Use each capability independently; only give affordability or an exact purchase sequence "
+                    "when its corresponding capability is available."
+                ),
+                "qualitative_shop_priority_allowed": priority_capability["available"],
+                "purchase_affordability_allowed": purchase_affordability["available"],
+                "exact_purchase_sequence_allowed": purchase_capability["available"],
+                "unknown_actual_cost_card_ids": [],
+            }
+        current_recruit_decision = (
+            _battlegrounds_purchase_decision(
+                shop_cards,
+                gold=live_battlegrounds_state.get("gold"),
+                qualitative_allowed=priority_capability["available"],
+                affordability_allowed=purchase_affordability["available"],
+                exact_sequence_allowed=purchase_capability["available"],
+            )
+            if selected_topic == "current_strategy" and recruit_phase
+            else {"scope": "not_current_recruit_shop"}
+        )
         result = {
             "available": topic_available[selected_topic],
             "status": topic_status[selected_topic],
@@ -3276,6 +3614,8 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             "game_mode": "battlegrounds",
             "scope": "hearthstone_battlegrounds_only",
             "topic": selected_topic,
+            "current_recruit_decision": current_recruit_decision,
+            "decision_guardrails": decision_guardrails,
             "current_public_state": public_state,
             "capabilities": capabilities,
             "missing_evidence": {

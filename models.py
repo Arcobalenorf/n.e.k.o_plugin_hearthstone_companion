@@ -24,14 +24,27 @@ class Entity:
     hidden: bool = False
     visibility_revoked: bool = False
     realtime_fields: set[str] = field(default_factory=set)
+    battlegrounds_realtime_boolean_baseline_complete: bool = False
+    battlegrounds_game_state_boolean_baseline_complete: bool = False
     last_seen_at: float = 0.0
     last_revision: int = 0
     last_battlegrounds_round: int = 0
     last_battlegrounds_phase: str = ""
+    tag_revisions: dict[str, int] = field(default_factory=dict)
+    tag_observed_at: dict[str, float] = field(default_factory=dict)
+    tag_battlegrounds_rounds: dict[str, int] = field(default_factory=dict)
+    tag_battlegrounds_phases: dict[str, str] = field(default_factory=dict)
 
     def tag_int(self, name: str, default: int = 0) -> int:
         value = _as_int(self.tags.get(name.upper()))
         return default if value is None else value
+
+    @property
+    def battlegrounds_boolean_baseline_complete(self) -> bool:
+        return bool(
+            self.battlegrounds_realtime_boolean_baseline_complete
+            or self.battlegrounds_game_state_boolean_baseline_complete
+        )
 
     @property
     def health(self) -> int | None:
@@ -344,6 +357,15 @@ class BattlegroundsEconomySnapshot:
     refresh_cost: int | None = None
     revision: int = 0
     observed_at: float | None = None
+    gold_observation: BattlegroundsAreaSnapshot = field(
+        default_factory=BattlegroundsAreaSnapshot
+    )
+    upgrade_observation: BattlegroundsAreaSnapshot = field(
+        default_factory=BattlegroundsAreaSnapshot
+    )
+    refresh_observation: BattlegroundsAreaSnapshot = field(
+        default_factory=BattlegroundsAreaSnapshot
+    )
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
@@ -351,6 +373,21 @@ class BattlegroundsEconomySnapshot:
             "refresh_cost": self.refresh_cost,
             "revision": self.revision,
             "observed_at": self.observed_at,
+            "gold_observation": (
+                self.gold_observation.to_public_dict()
+                if self.gold_observation.revision > 0
+                else None
+            ),
+            "upgrade_observation": (
+                self.upgrade_observation.to_public_dict()
+                if self.upgrade_observation.revision > 0
+                else None
+            ),
+            "refresh_observation": (
+                self.refresh_observation.to_public_dict()
+                if self.refresh_observation.revision > 0
+                else None
+            ),
         }
 
 

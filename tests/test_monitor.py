@@ -170,6 +170,49 @@ def test_active_battlegrounds_bootstrap_notifies_state_ready_before_first_turn()
     assert observed[-1][1].turn == 0
     assert llm_events == []
     assert results == []
+
+
+def test_monitor_publishes_live_snapshot_and_refreshes_it_without_new_state(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(monitor_module, "LIVE_STATE_PUBLISH_INTERVAL_SECONDS", 0.0)
+    path = Path("battlegrounds-passive/Power.log")
+    lines = (
+        "D 12:00:00.0000000 GameState.DebugPrintPower() - CREATE_GAME",
+        "D 12:00:00.0000000 GameState.DebugPrintGame() - GameType=GT_BATTLEGROUNDS",
+        _line("CREATE_GAME"),
+        _line("GameEntity EntityID=1"),
+    )
+    published: list[GameSnapshot] = []
+    monitor = CompanionMonitor(
+        CompanionConfig(poll_interval_seconds=0.1),
+        _logger(),
+        on_llm=lambda _prompt, _event, _snapshot: False,
+        on_state=published.append,
+    )
+    monitor._tailer = _BatchSequence(
+        monitor,
+        [
+            TailBatch(
+                lines,
+                path,
+                bootstrap=True,
+                source_reset=True,
+                bootstrap_complete=True,
+            ),
+            TailBatch((), path, bootstrap_complete=True),
+        ],
+    )
+
+    assert monitor.start()
+    deadline = time.monotonic() + 2.0
+    while not monitor._stop.is_set() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert monitor.stop(timeout=2.0)
+
+    assert len(published) >= 2
+    assert all(snapshot.mode == "battlegrounds" for snapshot in published)
+    assert all(snapshot.phase == "hero_select" for snapshot in published)
     assert monitor.status().events_seen == 0
 
 
@@ -381,6 +424,41 @@ def test_spectator_bootstrap_does_not_notify_state_ready() -> None:
     )
 
     assert [kind for kind, _snapshot in observed] == ["source_reset"]
+    assert monitor.snapshot().phase == "spectator"
+    assert llm_events == []
+    assert results == []
+
+
+def test_active_game_entering_spectator_notifies_state_unavailable() -> None:
+    path = Path("spectator-transition/Power.log")
+    active = (
+        _line("CREATE_GAME"),
+        _line("GameEntity EntityID=1"),
+        _line("Player EntityID=2 PlayerID=1 GameAccountId=[hi=0 lo=0]"),
+        _line("Player EntityID=3 PlayerID=2 GameAccountId=[hi=0 lo=0]"),
+        _line("TAG_CHANGE Entity=GameEntity tag=STEP value=MAIN_READY"),
+    )
+    spectator = ("D 12:00:01.0000000 SpectatorMode - Start Spectator Game",)
+
+    monitor, observed, llm_events, results = _run_bootstrap_batches(
+        [
+            TailBatch(
+                active,
+                path,
+                bootstrap=True,
+                source_reset=True,
+                bootstrap_complete=True,
+            ),
+            TailBatch(spectator, path, bootstrap_complete=True),
+        ]
+    )
+
+    assert [kind for kind, _snapshot in observed] == [
+        "source_reset",
+        "state_ready",
+        "state_unavailable",
+    ]
+    assert observed[-1][1].phase == "spectator"
     assert monitor.snapshot().phase == "spectator"
     assert llm_events == []
     assert results == []
@@ -641,6 +719,34 @@ def test_capture_returns_one_generation_and_copies_mutable_status() -> None:
     assert reset_snapshot == GameSnapshot()
     assert reset_status.source_state == "waiting"
     assert reset_status.last_line_at == 0.0
+
+
+def test_try_capture_fails_fast_while_monitor_is_parsing() -> None:
+    monitor = CompanionMonitor(
+        CompanionConfig(),
+        _logger(),
+        on_llm=lambda *_args: False,
+    )
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+
+    def hold_monitor_lock() -> None:
+        with monitor._lock:
+            lock_held.set()
+            assert release_lock.wait(1.0)
+
+    holder = threading.Thread(target=hold_monitor_lock)
+    holder.start()
+    assert lock_held.wait(1.0)
+
+    started = time.monotonic()
+    assert monitor.try_capture(timeout_seconds=0.02) is None
+    elapsed = time.monotonic() - started
+
+    release_lock.set()
+    holder.join(1.0)
+    assert holder.is_alive() is False
+    assert elapsed < 0.25
 
 
 def test_incremental_live_game_emits_stale_without_bootstrap_state_ready() -> None:
@@ -1069,10 +1175,12 @@ def test_interrupted_bootstrap_rebuilds_reader_before_restart(tmp_path: Path) ->
 
 
 def test_parser_exception_rebuilds_the_advanced_reader() -> None:
+    observed: list[str] = []
     monitor = CompanionMonitor(
         CompanionConfig(poll_interval_seconds=0.1),
         _logger(),
         on_llm=lambda *_args: False,
+        on_event=lambda event, _snapshot: observed.append(event.kind),
     )
     old_parser = monitor._parser
     old_tailer = SimpleNamespace(
@@ -1098,6 +1206,7 @@ def test_parser_exception_rebuilds_the_advanced_reader() -> None:
     assert monitor._tailer is not old_tailer
     assert monitor.snapshot() == GameSnapshot()
     assert monitor.status().last_error_code == "monitor:ValueError"
+    assert observed == ["source_reset"]
 
 
 def test_poll_exception_rebuilds_reader_even_before_batch_assignment() -> None:
