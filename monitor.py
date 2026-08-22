@@ -242,6 +242,17 @@ class CompanionMonitor:
                         snapshot = self._snapshot
                     else:
                         snapshot = self._parser.snapshot()
+                        emissions = [
+                            (
+                                event,
+                                self._settled_batch_event_snapshot(
+                                    event,
+                                    event_snapshot,
+                                    snapshot,
+                                ),
+                            )
+                            for event, event_snapshot in emissions
+                        ]
                         state_changed = snapshot != self._snapshot
                         previous_active_snapshot = bool(
                             self._snapshot.game_number > 0
@@ -526,6 +537,26 @@ class CompanionMonitor:
         if event_round <= 0 or event_round == battlegrounds.round:
             return snapshot
         return replace(snapshot, battlegrounds=replace(battlegrounds, round=event_round))
+
+    @staticmethod
+    def _settled_batch_event_snapshot(
+        event: GameEvent,
+        event_snapshot: GameSnapshot,
+        batch_snapshot: GameSnapshot,
+    ) -> GameSnapshot:
+        if event.kind != "turn_started" or batch_snapshot.mode != "constructed":
+            return event_snapshot
+        event_turn = int(event.details.get("turn") or 0)
+        event_side = str(event.details.get("active_side") or "unknown")
+        if (
+            event_turn <= 0
+            or batch_snapshot.game_number != event_snapshot.game_number
+            or batch_snapshot.turn != event_turn
+            or batch_snapshot.active_side != event_side
+            or batch_snapshot.phase != "playing"
+        ):
+            return event_snapshot
+        return batch_snapshot
 
     def _notify_event(
         self,

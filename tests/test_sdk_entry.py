@@ -389,6 +389,314 @@ def test_legacy_none_push_receipt_is_treated_as_accepted(monkeypatch) -> None:
     assert entry._submitted({"submitted": False}) is False
 
 
+def test_agent_query_entries_are_visible_and_admin_entries_remain_hidden(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+
+    constructed_meta = getattr(
+        entry.HearthstoneCompanionPlugin.query_constructed_state,
+        "__neko_test_decorator_kwargs__",
+    )
+    battlegrounds_meta = getattr(
+        entry.HearthstoneCompanionPlugin.query_battlegrounds_state,
+        "__neko_test_decorator_kwargs__",
+    )
+    admin_meta = getattr(
+        entry.HearthstoneCompanionPlugin.get_status,
+        "__neko_test_decorator_kwargs__",
+    )
+
+    assert constructed_meta["kind"] == "service"
+    assert constructed_meta["metadata"] == {
+        "result_kind": "event",
+        "expires_in_s": 8.0,
+    }
+    assert battlegrounds_meta["kind"] == "service"
+    assert battlegrounds_meta["metadata"] == {
+        "result_kind": "event",
+        "expires_in_s": 8.0,
+    }
+    assert constructed_meta["llm_result_fields"] == ["reply"]
+    assert battlegrounds_meta["llm_result_fields"] == ["reply"]
+    assert admin_meta["metadata"]["agent_auto"] is False
+
+
+def test_constructed_agent_query_reuses_native_tool_payload(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    payload = {
+        "available": True,
+        "reason": "",
+        "freshness": {"source": "live", "age_seconds": 0.25},
+        "state": {
+            "mode": "constructed",
+            "phase": "playing",
+            "round": 4,
+            "turn": 7,
+            "active_side": "player",
+            "constructed": {
+                "player": {
+                    "hero": {"health": 24, "armor": 3},
+                    "mana": {"available": 4, "maximum": 4},
+                    "hand": {
+                        "count": 1,
+                        "identities_complete": True,
+                        "known_cards": [
+                            {
+                                "card_id": "CS2_029",
+                                "name": "火球术",
+                                "card_type": "SPELL",
+                                "zone_position": 1,
+                                "cost": 4,
+                            }
+                        ],
+                    },
+                    "board": {"minions": []},
+                },
+                "opponent": {
+                    "hero": {"health": 19, "armor": 0},
+                    "mana": {"available": 2, "maximum": 4},
+                    "hand": {"count": 5, "identities_complete": False},
+                    "board": {"minions": []},
+                },
+            },
+            "choice": None,
+        },
+        "capabilities": {"complete_legal_actions": False},
+    }
+
+    async def current_state(**_kwargs: Any) -> dict[str, Any]:
+        return payload
+
+    plugin = types.SimpleNamespace(hearthstone_current_state=current_state)
+    result = asyncio.run(
+        entry.HearthstoneCompanionPlugin.query_constructed_state(plugin)
+    )
+
+    assert result["payload"] == payload
+    assert "mode=constructed" in result["reply"]
+    assert "round=4" in result["reply"]
+    assert "active=player" in result["reply"]
+    assert "CS2_029" in result["reply"]
+    assert "cost=4" in result["reply"]
+    assert "legal_actions=partial" in result["reply"]
+
+
+def test_battlegrounds_agent_query_prioritizes_live_decision_fields(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    payload = {
+        "available": True,
+        "status": "available",
+        "reason": "",
+        "game_mode": "battlegrounds",
+        "topic": "current_strategy",
+        "freshness": {"source": "live", "age_seconds": 0.4},
+        "current_public_state": {
+            "round": 6,
+            "phase": "recruit",
+            "gold": 7,
+            "max_gold": 10,
+            "tavern_tier": 4,
+            "frozen": False,
+            "refresh_cost": 0,
+            "upgrade_cost": 6,
+            "areas": {
+                "shop": {"complete": True},
+                "hand": {"complete": True},
+                "warband": {"complete": True},
+                "economy": {"complete": True},
+            },
+            "shop": [
+                {
+                    "card_id": "BG_SPELL_001",
+                    "name": "测试酒馆法术",
+                    "card_type": "BATTLEGROUND_SPELL",
+                    "attack": 0,
+                    "health": None,
+                    "tier": 3,
+                    "position": 1,
+                    "premium": False,
+                    "current_cost": 1,
+                    "keywords": {"taunt": False, "divine_shield": False},
+                }
+            ],
+            "hand": [],
+            "warband": [
+                {
+                    "card_id": "BG_MINION_G",
+                    "name": "金色随从",
+                    "card_type": "MINION",
+                    "attack": 12,
+                    "health": 13,
+                    "tier": 4,
+                    "position": 1,
+                    "premium": True,
+                    "current_cost": 2,
+                    "keywords": {
+                        "taunt": True,
+                        "divine_shield": True,
+                        "reborn": False,
+                    },
+                }
+            ],
+            "current_choice": None,
+        },
+        "card_catalog": {
+            "cards": {
+                "BG_SPELL_001": {
+                    "rules_text": "使一个友方随从获得+2/+2。",
+                }
+            }
+        },
+        "capabilities": {
+            "shop_card_priority_advice": {"available": True, "missing_evidence": []},
+            "purchase_affordability": {"available": True, "missing_evidence": []},
+            "upgrade_affordability": {"available": True, "missing_evidence": []},
+            "refresh_advice": {"available": True, "missing_evidence": []},
+            "positioning_advice": {"available": True, "missing_evidence": []},
+        },
+    }
+
+    async def battlegrounds_advice(
+        topic: str = "current_strategy", **_kwargs: Any
+    ) -> dict[str, Any]:
+        assert topic == "current_strategy"
+        return payload
+
+    plugin = types.SimpleNamespace(
+        hearthstone_battlegrounds_advice=battlegrounds_advice
+    )
+    result = asyncio.run(
+        entry.HearthstoneCompanionPlugin.query_battlegrounds_state(
+            plugin,
+            topic="current_strategy",
+            focus="shop",
+        )
+    )
+
+    assert result["payload"] == payload
+    reply = result["reply"]
+    assert "mode=battlegrounds" in reply
+    assert "phase=recruit" in reply
+    assert "gold=7/10" in reply
+    assert "refresh=0" in reply
+    assert "upgrade=6" in reply
+    assert "BG_SPELL_001" in reply
+    assert "type=BS" in reply
+    assert "cost=1" in reply
+    assert "BG_MINION_G" in reply
+    assert "golden=1" in reply
+    assert "kw=taunt,divine_shield" in reply
+    assert "rules=BG_SPELL_001=使一个友方随从获得+2/+2。" in reply
+    assert len(reply) <= entry._AGENT_REPLY_MAX_CHARS
+
+
+def test_agent_query_reply_is_bounded_without_losing_evidence_gate(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    oversized_card = {
+        "card_id": "BG_CARD_" + "X" * 80,
+        "name": "超长卡牌名称" * 20,
+        "card_type": "MINION",
+        "attack": 999,
+        "health": 999,
+        "tier": 6,
+        "position": 1,
+        "premium": True,
+        "current_cost": 3,
+        "keywords": {name: True for name in entry._AGENT_KEYWORD_NAMES},
+    }
+    payload = {
+        "available": True,
+        "topic": "current_strategy",
+        "current_public_state": {
+            "phase": "recruit",
+            "round": 10,
+            "gold": 10,
+            "max_gold": 10,
+            "tavern_tier": 6,
+            "refresh_cost": 1,
+            "upgrade_cost": 0,
+            "areas": {"shop": {"complete": True}},
+            "shop": [dict(oversized_card) for _ in range(7)],
+            "warband": [dict(oversized_card) for _ in range(7)],
+            "hand": [dict(oversized_card) for _ in range(10)],
+        },
+        "card_catalog": {
+            "cards": {
+                oversized_card["card_id"]: {"rules_text": "很长的规则文本" * 40}
+            }
+        },
+        "capabilities": {
+            "purchase_affordability": {
+                "available": False,
+                "missing_evidence": ["shop_current_cost_complete"],
+            }
+        },
+    }
+
+    reply = entry._agent_query_reply(payload, mode="battlegrounds", focus="shop")
+
+    assert len(reply) == entry._AGENT_REPLY_MAX_CHARS
+    assert "caps=buy:0" in reply
+    assert "missing=shop_current_cost_complete" in reply
+    assert reply.endswith(";truncated=1")
+
+
+def test_battlegrounds_agent_query_uses_original_request_for_auto_focus(
+    monkeypatch,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    payload = {
+        "available": True,
+        "topic": "current_strategy",
+        "current_public_state": {
+            "phase": "recruit",
+            "round": 5,
+            "shop": [{"card_id": "SHOP_CARD", "card_type": "MINION"}],
+            "warband": [{"card_id": "BOARD_CARD", "card_type": "MINION"}],
+        },
+        "capabilities": {},
+    }
+
+    async def battlegrounds_advice(
+        topic: str = "current_strategy", **_kwargs: Any
+    ) -> dict[str, Any]:
+        assert topic == "current_strategy"
+        return payload
+
+    plugin = types.SimpleNamespace(
+        hearthstone_battlegrounds_advice=battlegrounds_advice
+    )
+    result = asyncio.run(
+        entry.HearthstoneCompanionPlugin.query_battlegrounds_state(
+            plugin,
+            _ctx={"latest_user_request": "我这回合战团应该怎么站位？"},
+        )
+    )
+
+    assert "warband=BOARD_CARD" in result["reply"]
+    assert "SHOP_CARD" not in result["reply"]
+
+
+def test_agent_query_wrappers_preserve_fail_closed_reason(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    blocked = {
+        "available": False,
+        "reason": "llm_data_sharing_not_authorized",
+        "state": {},
+    }
+
+    async def current_state(**_kwargs: Any) -> dict[str, Any]:
+        return blocked
+
+    plugin = types.SimpleNamespace(hearthstone_current_state=current_state)
+    result = asyncio.run(
+        entry.HearthstoneCompanionPlugin.query_constructed_state(plugin)
+    )
+
+    assert result["payload"] == blocked
+    assert "available=0" in result["reply"]
+    assert "reason=llm_data_sharing_not_authorized" in result["reply"]
+
+
 def test_legacy_none_push_receipt_preserves_targeted_context_lifecycle(monkeypatch) -> None:
     entry = _load_sdk_entry(monkeypatch)
     submitted: list[dict[str, Any]] = []
@@ -1691,29 +1999,40 @@ def test_live_state_is_shared_silently_to_explicit_target(
 
     assert plugin._share_live_state(snapshot) is True
 
-    assert len(submitted) == 1
-    assert submitted[0]["metadata"]["segment"] == "core"
+    assert len(submitted) == 2
+    assert [message["metadata"]["segment"] for message in submitted] == [
+        "core",
+        "board",
+    ]
     assert submitted[0]["coalesce_key"] == plugin._live_state_key("当前角色")
+    assert submitted[1]["coalesce_key"] == plugin._live_state_key(
+        "当前角色", "board"
+    )
     assert all(message["visibility"] == [] for message in submitted)
     assert all(message["ai_behavior"] == "read" for message in submitted)
     assert all(message["target_lanlan"] == "当前角色" for message in submitted)
     assert all(message["metadata"]["kind"] == "game_live_state" for message in submitted)
     assert all(
-        message["metadata"]["privacy_scope"] == "capability_routing_only"
+        message["metadata"]["privacy_scope"]
+        == "filtered_player_visible_live_state"
         for message in submitted
     )
-    assert len(submitted[0]["parts"][0]["text"].encode("utf-8")) <= 900
-    notice = json.loads(submitted[0]["parts"][0]["text"].split(":", 1)[1])
-    assert notice["kind"] == "hearthstone_tool_routing"
-    assert notice["tools"] == [
-        "hearthstone_current_state",
-        "hearthstone_battlegrounds_advice",
+    assert all(
+        len(message["parts"][0]["text"].encode("utf-8")) <= 900
+        for message in submitted
+    )
+    contexts = [
+        json.loads(message["parts"][0]["text"].split(":", 1)[1])
+        for message in submitted
     ]
-    assert set(notice) == {"kind", "tools", "rule"}
-    assert "BG_SPELL_RUNTIME" not in json.dumps(notice, ensure_ascii=False)
+    serialized = json.dumps(contexts, ensure_ascii=False)
+    assert "BG_SPELL_RUNTIME" in serialized
+    assert '"p": "recruit"' in serialized
+    assert '"g": [7, null]' in serialized
+    assert '"c": [0, 6]' in serialized
     assert plugin._live_state_shared is True
     assert plugin._live_state_target == "当前角色"
-    assert plugin._live_state_segment_count == 1
+    assert plugin._live_state_segment_count == 2
 
 
 def test_unresolved_current_role_sends_untargeted_live_state_for_host_routing(
@@ -1764,18 +2083,19 @@ def test_unresolved_current_role_sends_untargeted_live_state_for_host_routing(
         snapshot,
     ) is False
     assert bus_calls == 0
-    assert len(submitted) == 1
+    assert len(submitted) == 2
     assert all(item["visibility"] == [] for item in submitted)
     assert all(item["ai_behavior"] == "read" for item in submitted)
     assert all("target_lanlan" not in item for item in submitted)
     assert all(
-        item["metadata"]["privacy_scope"] == "capability_routing_only"
+        item["metadata"]["privacy_scope"]
+        == "filtered_player_visible_live_state"
         for item in submitted
     )
-    assert all(
-        item["coalesce_key"] == "hearthstone:live-state:active-session"
-        for item in submitted
-    )
+    assert [item["coalesce_key"] for item in submitted] == [
+        "hearthstone:live-state:active-session",
+        "hearthstone:live-state:active-session:board",
+    ]
     assert plugin._live_state_shared is True
     assert plugin._live_state_target == ""
 
@@ -1805,13 +2125,22 @@ def test_live_state_expiration_replaces_pending_snapshot_with_same_key(monkeypat
     assert plugin._share_live_state(snapshot) is True
     assert plugin._expire_live_state() is True
 
-    assert [item["ai_behavior"] for item in submitted] == ["read", "read"]
-    assert submitted[0]["coalesce_key"] == submitted[1]["coalesce_key"]
-    assert [item["metadata"]["segment"] for item in submitted] == ["core", "core"]
-    assert submitted[1]["metadata"]["kind"] == "game_live_state_expired"
-    assert submitted[1]["metadata"]["context_expired"] is True
-    assert "工具能力提示已失效" in submitted[1]["parts"][0]["text"]
-    assert "BG_" not in submitted[1]["parts"][0]["text"]
+    assert [item["ai_behavior"] for item in submitted] == ["read"] * 4
+    assert submitted[0]["coalesce_key"] == submitted[2]["coalesce_key"]
+    assert submitted[1]["coalesce_key"] == submitted[3]["coalesce_key"]
+    assert [item["metadata"]["segment"] for item in submitted] == [
+        "core",
+        "board",
+        "core",
+        "board",
+    ]
+    assert all(
+        item["metadata"]["kind"] == "game_live_state_expired"
+        for item in submitted[2:]
+    )
+    assert all(item["metadata"]["context_expired"] is True for item in submitted[2:])
+    assert "实时公开状态已失效" in submitted[2]["parts"][0]["text"]
+    assert "BG_" not in submitted[2]["parts"][0]["text"]
     assert plugin._live_state_shared is False
     assert plugin._live_state_segment_count == 0
 
@@ -1857,7 +2186,9 @@ def test_live_state_rejection_does_not_mark_notice_as_shared(monkeypatch) -> Non
     assert plugin._live_state_segment_count == 0
 
 
-def test_static_capability_notice_is_not_republished_for_same_target(monkeypatch) -> None:
+def test_live_state_deduplicates_identical_snapshot_and_updates_changed_state(
+    monkeypatch,
+) -> None:
     entry = _load_sdk_entry(monkeypatch)
     submitted: list[dict[str, Any]] = []
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
@@ -1888,12 +2219,72 @@ def test_static_capability_notice_is_not_republished_for_same_target(monkeypatch
 
     assert plugin._share_live_state(battlegrounds) is True
     first_count = len(submitted)
-    assert first_count == 1
+    assert first_count == 2
+    assert plugin._share_live_state(battlegrounds) is True
+    assert len(submitted) == first_count
     assert plugin._share_live_state(constructed) is True
 
-    assert submitted[first_count:] == []
+    replacement = submitted[first_count:]
+    assert [item["metadata"]["kind"] for item in replacement] == [
+        "game_live_state_expired",
+        "game_live_state_expired",
+        "game_live_state",
+    ]
+    assert replacement[-1]["metadata"]["segment"] == "core"
+    assert '"mode":"constructed"' in replacement[-1]["parts"][0]["text"]
     assert plugin._live_state_shared is True
     assert plugin._live_state_segment_count == 1
+
+
+def test_battlegrounds_live_state_republishes_changed_snapshot_in_same_game(
+    monkeypatch,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    submitted: list[dict[str, Any]] = []
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(llm_data_consent=True, target_lanlan="当前角色")
+    plugin._context_target = None
+    plugin._live_state_shared = False
+    plugin._live_state_target = ""
+    plugin._live_state_segment_count = 0
+    plugin._ownership_lock = threading.RLock()
+    plugin._started = True
+    plugin._monitor_dispatch_enabled = True
+    plugin._settings_transition = False
+    plugin.push_message = lambda **kwargs: submitted.append(kwargs) or {"submitted": True}
+    first = GameSnapshot(
+        mode="battlegrounds",
+        phase="recruit",
+        game_number=3,
+        battlegrounds=BattlegroundsSnapshot(round=3, phase="recruit", gold=5),
+    )
+    changed = GameSnapshot(
+        mode="battlegrounds",
+        phase="recruit",
+        game_number=3,
+        battlegrounds=BattlegroundsSnapshot(round=3, phase="recruit", gold=4),
+    )
+
+    assert plugin._share_live_state(first) is True
+    assert plugin._share_live_state(changed) is True
+
+    assert [item["metadata"]["kind"] for item in submitted] == [
+        "game_live_state",
+        "game_live_state",
+        "game_live_state",
+        "game_live_state",
+    ]
+    assert [item["metadata"]["segment"] for item in submitted] == [
+        "core",
+        "board",
+        "core",
+        "board",
+    ]
+    assert submitted[0]["coalesce_key"] == submitted[2]["coalesce_key"]
+    assert submitted[1]["coalesce_key"] == submitted[3]["coalesce_key"]
+    assert '"g":[5,null]' in submitted[0]["parts"][0]["text"]
+    assert '"g":[4,null]' in submitted[2]["parts"][0]["text"]
+    assert plugin._live_state_snapshot == changed
 
 
 def test_restore_context_expires_untargeted_live_state_after_consent_revocation(
@@ -2388,9 +2779,14 @@ def test_restore_then_explicit_target_routes_the_new_notice(monkeypatch) -> None
     plugin.cfg = CompanionConfig(llm_data_consent=True, target_lanlan="当前角色")
 
     assert plugin._publish_live_state(snapshot) is True
-    assert [item.get("target_lanlan") for item in submitted] == ["旧角色", "当前角色"]
+    assert [item.get("target_lanlan") for item in submitted] == [
+        "旧角色",
+        "当前角色",
+        "当前角色",
+    ]
     assert [item["metadata"]["kind"] for item in submitted] == [
         "game_live_state_expired",
+        "game_live_state",
         "game_live_state",
     ]
     assert submitted[1]["coalesce_key"] == plugin._live_state_key("当前角色")
@@ -2512,9 +2908,14 @@ def test_explicit_target_switch_expires_old_notice_before_sharing_to_new_role(
     plugin.cfg = CompanionConfig(llm_data_consent=True, target_lanlan="角色B")
 
     assert plugin._publish_live_state(snapshot) is True
-    assert [item["target_lanlan"] for item in submitted] == ["角色A", "角色B"]
+    assert [item["target_lanlan"] for item in submitted] == [
+        "角色A",
+        "角色B",
+        "角色B",
+    ]
     assert [item["metadata"]["kind"] for item in submitted] == [
         "game_live_state_expired",
+        "game_live_state",
         "game_live_state",
     ]
     assert submitted[0]["coalesce_key"] != submitted[1]["coalesce_key"]
@@ -2555,11 +2956,18 @@ def test_live_state_publish_has_no_private_host_http_dependency(
     )
 
     assert plugin._publish_live_state(snapshot) is True
-    assert len(submitted) == 1
-    assert submitted[0]["metadata"]["kind"] == "game_live_state"
-    assert submitted[0]["metadata"]["privacy_scope"] == "capability_routing_only"
-    assert submitted[0]["target_lanlan"] == "角色A"
+    assert len(submitted) == 2
+    assert all(item["metadata"]["kind"] == "game_live_state" for item in submitted)
+    assert all(
+        item["metadata"]["privacy_scope"]
+        == "filtered_player_visible_live_state"
+        for item in submitted
+    )
+    assert all(item["target_lanlan"] == "角色A" for item in submitted)
     assert submitted[0]["coalesce_key"] == plugin._live_state_key("角色A")
+    assert submitted[1]["coalesce_key"] == plugin._live_state_key(
+        "角色A", "board"
+    )
     assert plugin._live_state_target == "角色A"
 
 

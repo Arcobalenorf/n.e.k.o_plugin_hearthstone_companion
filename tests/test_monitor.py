@@ -151,6 +151,60 @@ def test_constructed_bootstrap_publishes_first_turn_state_in_the_same_poll_batch
     assert results == []
 
 
+def test_constructed_turn_event_uses_resources_settled_later_in_poll_batch() -> None:
+    path = Path("constructed-turn-resource/Power.log")
+    bootstrap = (
+        _line("CREATE_GAME"),
+        _line("GameEntity EntityID=1"),
+        _line("Player EntityID=2 PlayerID=1 GameAccountId=[hi=0 lo=0]"),
+        _line("Player EntityID=3 PlayerID=2 GameAccountId=[hi=0 lo=0]"),
+        _line("TAG_CHANGE Entity=2 tag=MULLIGAN_STATE value=INPUT"),
+        _line("TAG_CHANGE Entity=3 tag=MULLIGAN_STATE value=DONE"),
+        _line("TAG_CHANGE Entity=2 tag=MULLIGAN_STATE value=DONE"),
+        _line("TAG_CHANGE Entity=2 tag=RESOURCES value=1"),
+        _line("TAG_CHANGE Entity=2 tag=CURRENT_PLAYER value=1"),
+        _line("TAG_CHANGE Entity=GameEntity tag=TURN value=1"),
+        _line("TAG_CHANGE Entity=GameEntity tag=STEP value=MAIN_READY"),
+    )
+    opponent_turn = (
+        _line("BLOCK_START BlockType=TRIGGER Entity=GameEntity EffectCardId= EffectIndex=0 Target=0 SubOption=-1"),
+        _line("TAG_CHANGE Entity=2 tag=CURRENT_PLAYER value=0"),
+        _line("TAG_CHANGE Entity=3 tag=CURRENT_PLAYER value=1"),
+        _line("TAG_CHANGE Entity=GameEntity tag=TURN value=2"),
+        _line("BLOCK_END"),
+        _line("TAG_CHANGE Entity=3 tag=RESOURCES value=1"),
+    )
+    local_turn = (
+        _line("BLOCK_START BlockType=TRIGGER Entity=GameEntity EffectCardId= EffectIndex=0 Target=0 SubOption=-1"),
+        _line("TAG_CHANGE Entity=3 tag=CURRENT_PLAYER value=0"),
+        _line("TAG_CHANGE Entity=2 tag=CURRENT_PLAYER value=1"),
+        _line("TAG_CHANGE Entity=GameEntity tag=TURN value=3"),
+        _line("BLOCK_END"),
+        _line("TAG_CHANGE Entity=2 tag=RESOURCES value=2"),
+    )
+
+    _monitor, observed, _llm_events, _results = _run_bootstrap_batches(
+        [
+            TailBatch(
+                bootstrap,
+                path,
+                bootstrap=True,
+                source_reset=True,
+                bootstrap_complete=True,
+            ),
+            TailBatch(opponent_turn, path, bootstrap_complete=True),
+            TailBatch(local_turn, path, bootstrap_complete=True),
+        ]
+    )
+
+    turn_snapshots = [snapshot for kind, snapshot in observed if kind == "turn_started"]
+    assert [snapshot.turn for snapshot in turn_snapshots] == [2, 3]
+    assert turn_snapshots[0].constructed is not None
+    assert turn_snapshots[0].constructed.opponent.mana_available == 1
+    assert turn_snapshots[1].constructed is not None
+    assert turn_snapshots[1].constructed.player.mana_available == 2
+
+
 def test_active_battlegrounds_bootstrap_notifies_state_ready_before_first_turn() -> None:
     path = Path("battlegrounds/Power.log")
     lines = (

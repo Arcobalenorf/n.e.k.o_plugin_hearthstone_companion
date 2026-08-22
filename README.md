@@ -6,14 +6,14 @@
 
 ## 陪伴体验
 
-- 监听到新鲜对局后，以隐藏 `read` 排队一条不超过 900 UTF-8 字节的静态工具能力提示；内容只有两个工具名和“当前事实必须重新调用工具”的规则，不含模式、阶段、回合、经济、卡牌、时间戳或权限状态。
+- 监听到新鲜对局后，以隐藏 `read` 按固定 key 覆盖更新过滤后的实时公开状态；普通对战为一个精简分段，酒馆为二至三个分段，每段不超过 900 UTF-8 字节。酒馆分段保留模式、阶段、回合、金币、刷新/升本费用，以及商店、手牌、战团中实际观测的 CardID、类型、费用、金色状态和当前关键词。
 - 显式配置固定 `target_lanlan` 时，额外建立稳定炉石场景并定向投递；目标为空时，隐藏 `read` 省略目标，由 N.E.K.O 只在恰好一个角色会话已连接时安全接收，多会话歧义时宿主会丢弃而不会广播。插件不会从消息上下文或宿主私有接口猜测角色；需要稳定多会话路由或主动解说时必须填写角色名，工具结果则自动返回实际发起调用的对话。
 - 三连、低血量、升本、逐轮战果与最终名次等公开事实会形成结构化情绪信号；真正的台词始终由当前 N.E.K.O 角色生成。
 - 主动解说只选择稀疏且有情绪价值的事件，并受普通/关键冷却与 30 秒用户聊天静默窗约束；静默窗内只有优先级 `>=9` 的关键事件可以绕过。
-- 用户问“现在酒馆玩什么流派”“这局怎么走”或任何酒馆当前事实时，角色必须先调用 `hearthstone_battlegrounds_advice`；工具返回完整动态局势、规则依据、统计边界和逐项 evidence gate。
-- 用户问普通对战“第几回合”“轮到谁”、具体手牌、Choice 或出牌取舍时，角色必须先调用 `hearthstone_current_state`；每个当前局势问题都重新查询，不能沿用聊天历史里的提示或短评。
+- 用户问“现在酒馆玩什么流派”“这局怎么走”或任何酒馆当前事实时，Agent 路由调用 `query_battlegrounds_state`，其内部读取 `hearthstone_battlegrounds_advice` 的最新动态局势、规则依据、统计边界和逐项 evidence gate。
+- 用户问普通对战“第几回合”“轮到谁”、具体手牌、Choice 或出牌取舍时，Agent 路由调用 `query_constructed_state`，其内部重新读取 `hearthstone_current_state`；不能只沿用聊天历史中的快照或短评。
 - 通用状态工具在酒馆模式只返回专用工具重定向，不重复发送整份酒馆快照；酒馆结果先给出逐卡 `known_affordable`、`known_unaffordable` 或 `unknown_cost_may_be_zero` 的紧凑决策面，再附完整局势与规则依据。
-- 启用插件即默认允许问答工具按需读取过滤后的玩家可见局势，用户仍可随时关闭；主动解说默认关闭，其开关只控制角色是否主动插话。
+- 启用插件即默认允许过滤后的实时公开状态和问答查询入口供当前角色使用，用户仍可随时关闭；主动解说默认关闭，其开关只控制角色是否主动插话。
 
 公开 Plugin SDK 不提供 `respond` 最终文本回调，因此插件不会伪称能把角色实际台词复制到自己的窗口。NEKO 的角色回复、语音和宿主界面是主输出；随包提供的透明浮层只用于用户显式执行诊断测试。
 
@@ -43,7 +43,7 @@ HSReplay Tier7 与 Firestone 的全局表现数据属于各自的私有遥测；
 - 只读 Hearthstone 自己生成的 `Power.log`，不注入、不读内存、不抓包、不模拟协议。
 - 自动连接仅查询进程列表中名称精确为 `Hearthstone.exe` 的可执行文件路径，再检查同目录 `Logs`；不扫描磁盘、不读取进程内存。
 - 不自动点击、出牌或代打，不推断隐藏手牌、未揭示奥秘或未来商店。
-- 不上传原始日志，不保留玩家名、BattleTag、账号 ID 或完整单局历史；默认共享只在工具调用或已启用的主动解说中发送隐私文档列明的有限近期公开事实，并可在面板中关闭。
+- 不上传原始日志，不保留玩家名、BattleTag、账号 ID 或完整单局历史；默认共享仅发送隐私文档列明的有限近期公开事实，包括有界实时上下文、按需查询结果和已启用主动解说的事件上下文，并可在面板中关闭。
 - 首次接入已有日志默认且最多只在本机恢复解析末尾 64 MiB，这些日志字节不会整体发送给模型。
 - 卡牌目录更新只发送固定的公共目录 GET，不发送牌局、卡牌 ID 或玩家信息；可用 `card_catalog_network_enabled=false` 关闭。
 - 本机统计只保存按赛季、模式和英雄聚合的场次与名次计数。
@@ -101,7 +101,7 @@ uv run python -m plugin.neko_plugin_cli.cli verify "<plugin-repo>\dist\hearthsto
 
 ## English summary
 
-Hearthstone Catgirl Companion is a read-only N.E.K.O plugin for constructed Hearthstone and Battlegrounds. Its hidden `read` notice is a static capability hint containing only tool names and invocation rules; current facts and advice are fetched on demand through read-only tools. Users can disable data sharing without disabling local log monitoring, while proactive commentary remains off by default. It supports Power.log-observed local hero choices, solo and Duos Battlegrounds state, per-combat outcomes, aggregate-only local results, and versioned official season rules. N.E.K.O owns the actual character response; the separate transparent overlay is diagnostic-only because the public SDK does not return generated reply text. The plugin never claims access to unlicensed global win-rate telemetry.
+Hearthstone Catgirl Companion is a read-only N.E.K.O plugin for constructed Hearthstone and Battlegrounds. Hidden `read` messages keep a bounded, filtered live public snapshot available to the active role, while Agent-visible query entries fetch fresh, richer facts and evidence gates on demand. Users can disable data sharing without disabling local log monitoring, while proactive commentary remains off by default. It supports Power.log-observed local hero choices, solo and Duos Battlegrounds state, per-combat outcomes, aggregate-only local results, and versioned official season rules. N.E.K.O owns the actual character response; the separate transparent overlay is diagnostic-only because the public SDK does not return generated reply text. The plugin never claims access to unlicensed global win-rate telemetry.
 
 ## 许可证
 

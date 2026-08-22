@@ -742,7 +742,7 @@ def build_live_state_context(
     raise ValueError("live Hearthstone state exceeds max_prompt_chars")
 
 
-_LIVE_DELIVERY_PREFIX = "HS capability routing only:"
+_LIVE_DELIVERY_PREFIX = "HS filtered live state:"
 _LIVE_DELIVERY_AREA_CODES = (
     ("shop", "S"),
     ("hand", "H"),
@@ -1004,34 +1004,30 @@ def _build_minimal_live_state_context(
 
 
 def build_live_state_contexts(
-    _snapshot: GameSnapshot,
+    snapshot: GameSnapshot,
     *,
     observed_at: float | None = None,
     max_prompt_bytes: int = 900,
 ) -> tuple[str, ...]:
-    """Build a static routing cue without serializing any game or permission state."""
-    del observed_at
+    """Build bounded, filtered live-state context for the active N.E.K.O role."""
+    public_state = snapshot.to_public_dict()
+    timestamp = time.time() if observed_at is None else float(observed_at)
     limit = int(max_prompt_bytes)
-    payload = {
-        "kind": "hearthstone_tool_routing",
-        "tools": [
-            "hearthstone_current_state",
-            "hearthstone_battlegrounds_advice",
-        ],
-        "rule": (
-            "Call the relevant tool for current Hearthstone facts or advice. "
-            "This notice contains no game facts or permission state; never infer either from it. "
-            "The current tool result is authoritative and may deny access."
+    if snapshot.mode == "battlegrounds" and isinstance(
+        public_state.get("battlegrounds"), Mapping
+    ):
+        return _build_battlegrounds_live_state_contexts(
+            public_state,
+            observed_at=timestamp,
+            max_prompt_bytes=limit,
+        )
+    return (
+        _build_minimal_live_state_context(
+            public_state,
+            observed_at=timestamp,
+            max_prompt_bytes=limit,
         ),
-    }
-    prompt = _LIVE_DELIVERY_PREFIX + json.dumps(
-        payload,
-        ensure_ascii=False,
-        separators=(",", ":"),
     )
-    if len(prompt.encode("utf-8")) > limit:
-        raise ValueError("Hearthstone capability notice exceeds max_prompt_bytes")
-    return (prompt,)
 
 
 def _prompt_prefix(

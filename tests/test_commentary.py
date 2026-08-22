@@ -544,7 +544,7 @@ def test_live_state_context_is_valid_json_and_respects_host_safe_hard_limit() ->
     assert "current_cost" in payload["schema"]["card"].split("|")
 
 
-def test_capability_notice_survives_packaged_host_byte_fallback_without_game_facts() -> None:
+def test_live_state_contexts_survive_packaged_host_byte_fallback_with_dynamic_state() -> None:
     oversized = "超长不可信卡名" * 200
     cards = tuple(
         BattlegroundsCardSnapshot(
@@ -598,31 +598,23 @@ def test_capability_notice_survives_packaged_host_byte_fallback_without_game_fac
         max_prompt_bytes=900,
     )
 
-    assert len(prompts) == 1
-    prompt = prompts[0]
-    encoded = prompt.encode("utf-8")
-    assert len(encoded) <= 900
-    # Packaged N.E.K.O falls back to one token per UTF-8 byte. The ambient
-    # notice must remain untouched by its 1000-token passive-message limit.
-    assert encoded[:1000] == encoded
-
-    payload = json.loads(prompt.split(":", 1)[1])
-    assert payload["kind"] == "hearthstone_tool_routing"
-    assert payload["tools"] == [
-        "hearthstone_current_state",
-        "hearthstone_battlegrounds_advice",
-    ]
-    assert "no game facts or permission state" in payload["rule"]
-    assert set(payload) == {"kind", "tools", "rule"}
-    serialized = json.dumps(payload, ensure_ascii=False)
-    assert "BG_RUNTIME_CARD" not in serialized
+    assert len(prompts) in {2, 3}
+    assert all(len(prompt.encode("utf-8")) <= 900 for prompt in prompts)
+    payloads = [json.loads(prompt.split(":", 1)[1]) for prompt in prompts]
+    assert {payload["segment"] for payload in payloads} >= {"core", "board"}
+    assert all(payload["of"] == len(prompts) for payload in payloads)
+    serialized = json.dumps(payloads, ensure_ascii=False)
+    assert "BG_RUNTIME_CARD" in serialized
     assert oversized not in serialized
-    assert "recruit" not in serialized
-    assert '"state"' not in serialized
-    assert '"at"' not in serialized
+    assert '"p": "recruit"' in serialized
+    assert '"g": [8, 10]' in serialized
+    assert '"c": [0, 6]' in serialized
+    assert "BS" in serialized
+    assert "golden" in serialized
+    assert "divine_shield" in serialized
 
 
-def test_capability_notice_is_identical_across_modes_and_observation_times() -> None:
+def test_live_state_contexts_change_with_mode_and_observation_time() -> None:
     constructed_prompt = build_live_state_contexts(
         GameSnapshot(mode="constructed", phase="playing", game_number=3, turn=5),
         observed_at=1235.0,
@@ -646,5 +638,8 @@ def test_capability_notice_is_identical_across_modes_and_observation_times() -> 
         max_prompt_bytes=900,
     )[0]
 
-    assert constructed_prompt == battlegrounds_prompt
-    assert "PRIVATE_RUNTIME_CARD" not in battlegrounds_prompt
+    assert constructed_prompt != battlegrounds_prompt
+    assert '"mode":"constructed"' in constructed_prompt
+    assert '"turn":5' in constructed_prompt
+    assert "PRIVATE_RUNTIME_CARD" in battlegrounds_prompt
+    assert '"at":9999.0' in battlegrounds_prompt

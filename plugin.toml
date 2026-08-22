@@ -7,7 +7,7 @@ keywords = ["炉石", "炉石传说", "酒馆战棋", "hearthstone", "battlegrou
 version = "0.3.2"
 type = "plugin"
 entry = "plugin.plugins.hearthstone_companion:HearthstoneCompanionPlugin"
-passive = true
+passive = false
 
 [plugin.author]
 name = "NEKOLU Contributors"

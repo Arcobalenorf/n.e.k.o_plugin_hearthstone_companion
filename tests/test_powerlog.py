@@ -466,6 +466,227 @@ def test_constructed_metadata_and_private_player_refs_drive_live_turn_and_mana()
     assert all(private_local not in entity.name for entity in parser.entities.values())
 
 
+def test_constructed_uniquely_infers_anonymized_opponent_task_reference() -> None:
+    parser = PowerLogParser()
+    private_local = "PRIVATE_LOCAL#1234"
+    private_opponent = "PRIVATE_OPPONENT#5678"
+
+    parser.feed_line(source_line("GameState", "CREATE_GAME"), now=100.0)
+    parser.feed_line(
+        "D 12:00:00.0000000 GameState.DebugPrintGame() - GameType=GT_RANKED",
+        now=100.1,
+    )
+    parser.feed_line(
+        f"D 12:00:00.0000000 GameState.DebugPrintGame() - PlayerID=1, PlayerName={private_local}",
+        now=100.2,
+    )
+    parser.feed_line(
+        "D 12:00:00.0000000 GameState.DebugPrintGame() - "
+        "PlayerID=2, PlayerName=UNKNOWN HUMAN PLAYER",
+        now=100.3,
+    )
+    parser.feed_line(source_line("GameState", "GameEntity EntityID=1"), now=100.4)
+    parser.feed_line(
+        source_line(
+            "GameState",
+            "Player EntityID=2 PlayerID=1 GameAccountId=[hi=0 lo=0]",
+        ),
+        now=100.5,
+    )
+    parser.feed_line(
+        source_line(
+            "GameState",
+            "Player EntityID=3 PlayerID=2 GameAccountId=[hi=0 lo=0]",
+        ),
+        now=100.6,
+    )
+    parser.feed_line(source_line("PowerTaskList", "CREATE_GAME"), now=101.0)
+    feed(parser, f"TAG_CHANGE Entity={private_local} tag=MULLIGAN_STATE value=INPUT")
+    feed(
+        parser,
+        f"TAG_CHANGE Entity={private_opponent} tag=MULLIGAN_STATE value=DONE",
+        f"TAG_CHANGE Entity={private_opponent} tag=RESOURCES value=3",
+        f"TAG_CHANGE Entity={private_opponent} tag=RESOURCES_USED value=1",
+        f"TAG_CHANGE Entity={private_opponent} tag=CURRENT_PLAYER value=1",
+        "TAG_CHANGE Entity=GameEntity tag=TURN value=2",
+        "TAG_CHANGE Entity=GameEntity tag=STEP value=MAIN_READY",
+    )
+
+    snapshot = parser.snapshot()
+    public_json = json.dumps(snapshot.to_public_dict(), ensure_ascii=False)
+
+    assert parser.local_controller == 1
+    assert parser.current_controller == 2
+    assert snapshot.active_side == "opponent"
+    assert snapshot.constructed is not None
+    assert snapshot.constructed.opponent.mana_max == 3
+    assert snapshot.constructed.opponent.mana_available == 2
+    assert private_local not in repr(parser.__dict__)
+    assert private_opponent not in repr(parser.__dict__)
+    assert private_local not in public_json
+    assert private_opponent not in public_json
+
+
+
+
+def test_inactive_constructed_side_does_not_reuse_previous_turn_mana() -> None:
+    parser = PowerLogParser()
+    private_local = "PRIVATE_LOCAL#1234"
+    private_opponent = "PRIVATE_OPPONENT#5678"
+
+    parser.feed_line(source_line("GameState", "CREATE_GAME"), now=100.0)
+    parser.feed_line(
+        "D 12:00:00.0000000 GameState.DebugPrintGame() - GameType=GT_RANKED",
+        now=100.1,
+    )
+    parser.feed_line(
+        f"D 12:00:00.0000000 GameState.DebugPrintGame() - PlayerID=1, PlayerName={private_local}",
+        now=100.2,
+    )
+    parser.feed_line(
+        "D 12:00:00.0000000 GameState.DebugPrintGame() - "
+        "PlayerID=2, PlayerName=UNKNOWN HUMAN PLAYER",
+        now=100.3,
+    )
+    parser.feed_line(source_line("GameState", "GameEntity EntityID=1"), now=100.4)
+    parser.feed_line(
+        source_line(
+            "GameState",
+            "Player EntityID=2 PlayerID=1 GameAccountId=[hi=0 lo=0]",
+        ),
+        now=100.5,
+    )
+    parser.feed_line(
+        source_line(
+            "GameState",
+            "Player EntityID=3 PlayerID=2 GameAccountId=[hi=0 lo=0]",
+        ),
+        now=100.6,
+    )
+    parser.feed_line(source_line("PowerTaskList", "CREATE_GAME"), now=101.0)
+    feed(
+        parser,
+        f"TAG_CHANGE Entity={private_local} tag=MULLIGAN_STATE value=INPUT",
+        f"TAG_CHANGE Entity={private_local} tag=MULLIGAN_STATE value=DONE",
+        f"TAG_CHANGE Entity={private_opponent} tag=MULLIGAN_STATE value=DONE",
+        f"TAG_CHANGE Entity={private_opponent} tag=RESOURCES value=3",
+        f"TAG_CHANGE Entity={private_opponent} tag=RESOURCES_USED value=1",
+        f"TAG_CHANGE Entity={private_local} tag=RESOURCES value=4",
+        f"TAG_CHANGE Entity={private_local} tag=RESOURCES_USED value=2",
+        f"TAG_CHANGE Entity={private_local} tag=CURRENT_PLAYER value=1",
+        "TAG_CHANGE Entity=GameEntity tag=TURN value=7",
+        "TAG_CHANGE Entity=GameEntity tag=STEP value=MAIN_READY",
+    )
+
+    local_turn = parser.snapshot()
+    assert local_turn.active_side == "player"
+    assert local_turn.player.mana_available == 2
+    assert local_turn.opponent.mana_available == 0
+    assert local_turn.constructed is not None
+    assert local_turn.constructed.player.mana_available == 2
+    assert local_turn.constructed.player.mana_max == 4
+    assert local_turn.constructed.opponent.mana_available == 0
+    assert local_turn.constructed.opponent.mana_max == 3
+
+    feed(
+        parser,
+        f'TAG_CHANGE Entity={private_local} tag=CURRENT_PLAYER value=0',
+        f'TAG_CHANGE Entity={private_opponent} tag=CURRENT_PLAYER value=1',
+        'TAG_CHANGE Entity=GameEntity tag=TURN value=8',
+    )
+    opponent_turn = parser.snapshot()
+    assert opponent_turn.active_side == 'opponent'
+    assert opponent_turn.player.mana_available == 0
+    assert opponent_turn.opponent.mana_available == 2
+    assert opponent_turn.constructed is not None
+    assert opponent_turn.constructed.player.mana_available == 0
+    assert opponent_turn.constructed.opponent.mana_available == 2
+
+def test_constructed_does_not_guess_unresolved_player_without_unique_task_candidate() -> None:
+    parser = PowerLogParser()
+    feed(
+        parser,
+        "CREATE_GAME",
+        "Player EntityID=2 PlayerID=1 GameAccountId=[hi=0 lo=0]",
+        "Player EntityID=3 PlayerID=2 GameAccountId=[hi=0 lo=0]",
+        "TAG_CHANGE Entity=2 tag=MULLIGAN_STATE value=INPUT",
+        "TAG_CHANGE Entity=UNMAPPED_PLAYER#9999 tag=RESOURCES value=4",
+    )
+
+    assert parser.local_controller == 1
+    assert parser.entities[3].tags.get("RESOURCES") is None
+    assert "UNMAPPED_PLAYER#9999" not in repr(parser.__dict__)
+
+
+def test_constructed_weak_playstate_aliases_do_not_block_or_misbind_later_inference() -> None:
+    parser = PowerLogParser()
+    private_local = "PRIVATE_LOCAL#1234"
+    private_opponent = "PRIVATE_OPPONENT#5678"
+    one_shot_local = "ONESHOT_LOCAL#1"
+    one_shot_opponent = "ONESHOT_OPPONENT#1"
+    late_local = "LATE_LOCAL#1"
+
+    parser.feed_line(source_line("GameState", "CREATE_GAME"), now=100.0)
+    parser.feed_line(
+        "D 12:00:00.0000000 GameState.DebugPrintGame() - GameType=GT_RANKED",
+        now=100.1,
+    )
+    parser.feed_line(
+        f"D 12:00:00.0000000 GameState.DebugPrintGame() - "
+        f"PlayerID=1, PlayerName={private_local}",
+        now=100.2,
+    )
+    parser.feed_line(
+        "D 12:00:00.0000000 GameState.DebugPrintGame() - "
+        "PlayerID=2, PlayerName=UNKNOWN HUMAN PLAYER",
+        now=100.3,
+    )
+    parser.feed_line(source_line("GameState", "GameEntity EntityID=1"), now=100.4)
+    parser.feed_line(
+        source_line(
+            "GameState",
+            "Player EntityID=2 PlayerID=1 GameAccountId=[hi=0 lo=0]",
+        ),
+        now=100.5,
+    )
+    parser.feed_line(
+        source_line(
+            "GameState",
+            "Player EntityID=3 PlayerID=2 GameAccountId=[hi=0 lo=0]",
+        ),
+        now=100.6,
+    )
+    parser.feed_line(source_line("PowerTaskList", "CREATE_GAME"), now=101.0)
+    feed(parser, f"TAG_CHANGE Entity={one_shot_local} tag=PLAYSTATE value=PLAYING")
+    feed(parser, f"TAG_CHANGE Entity={one_shot_opponent} tag=PLAYSTATE value=PLAYING")
+    feed(
+        parser,
+        f"TAG_CHANGE Entity={private_local} tag=MULLIGAN_STATE value=INPUT",
+        f"TAG_CHANGE Entity={private_local} tag=CURRENT_PLAYER value=1",
+        f"TAG_CHANGE Entity={private_opponent} tag=MULLIGAN_STATE value=DONE",
+        f"TAG_CHANGE Entity={private_opponent} tag=RESOURCES value=3",
+        f"TAG_CHANGE Entity={private_opponent} tag=RESOURCES_USED value=1",
+        f"TAG_CHANGE Entity={private_opponent} tag=CURRENT_PLAYER value=1",
+        "TAG_CHANGE Entity=GameEntity tag=TURN value=2",
+        "TAG_CHANGE Entity=GameEntity tag=STEP value=MAIN_READY",
+    )
+    feed(parser, f"TAG_CHANGE Entity={late_local} tag=PLAYSTATE value=PLAYING")
+
+    snapshot = parser.snapshot()
+
+    assert parser.local_controller == 1
+    assert snapshot.active_side == "opponent"
+    assert snapshot.constructed is not None
+    assert snapshot.constructed.opponent.mana_max == 3
+    assert snapshot.constructed.opponent.mana_available == 2
+    assert parser.entities[3].tags.get("PLAYSTATE") is None
+    assert private_local not in repr(parser.__dict__)
+    assert private_opponent not in repr(parser.__dict__)
+    assert one_shot_local not in repr(parser.__dict__)
+    assert one_shot_opponent not in repr(parser.__dict__)
+    assert late_local not in repr(parser.__dict__)
+
+
 def test_constructed_snapshot_exposes_visible_local_cards_and_public_board_details() -> None:
     parser = PowerLogParser()
     feed(
@@ -807,6 +1028,51 @@ def test_constructed_opponent_ignores_controller_zero_system_entities() -> None:
     assert [card.card_id for card in snapshot.constructed.opponent.board] == [
         "OPPONENT_BOARD"
     ]
+
+
+def test_constructed_change_entity_clears_all_old_identity_state() -> None:
+    parser = PowerLogParser()
+    feed(
+        parser,
+        "CREATE_GAME",
+        "Player EntityID=2 PlayerID=1 GameAccountId=[hi=0 lo=0]",
+        "Player EntityID=3 PlayerID=2 GameAccountId=[hi=0 lo=0]",
+        "TAG_CHANGE Entity=2 tag=MULLIGAN_STATE value=INPUT",
+    )
+    add_entity(
+        parser,
+        20,
+        "OLD_CARD",
+        controller=1,
+        zone="PLAY",
+        card_type="MINION",
+    )
+    identity_tags = {
+        "COST": "4",
+        "ATK": "5",
+        "HEALTH": "6",
+        "DAMAGE": "2",
+        "DURABILITY": "3",
+        "LIFESTEAL": "1",
+        "RUSH": "1",
+        "CHARGE": "1",
+        "EXHAUSTED": "1",
+        "FROZEN": "1",
+        "IMMUNE": "1",
+        "SILENCED": "1",
+        "DORMANT": "1",
+    }
+    feed(parser, *(f"    tag={tag} value={value}" for tag, value in identity_tags.items()))
+
+    feed(
+        parser,
+        "CHANGE_ENTITY - Updating Entity=[entityName=New Card id=20 "
+        "zone=PLAY zonePos=1 cardId=OLD_CARD player=1] CardID=NEW_CARD",
+    )
+
+    entity = parser.entities[20]
+    assert entity.card_id == "NEW_CARD"
+    assert not (identity_tags.keys() & entity.tags.keys())
 
 
 def test_spectator_state_survives_create_game_until_explicit_end() -> None:
@@ -3038,6 +3304,42 @@ def test_first_in_progress_battlegrounds_phase_zero_recovers_combat(
 
     assert parser.snapshot().phase == "combat"
     assert [event.kind for event in events] == ["battlegrounds_combat_started"]
+
+
+
+def test_unchanged_recruit_board_rejoins_current_phase_after_combat() -> None:
+    parser = PowerLogParser()
+    feed(
+        parser,
+        "CREATE_GAME",
+        "GameEntity EntityID=1",
+        "Player EntityID=8 PlayerID=3 GameAccountId=[hi=0 lo=0]",
+        "Player EntityID=9 PlayerID=11 GameAccountId=[hi=0 lo=0]",
+        "    tag=BACON_DUMMY_PLAYER value=1",
+        "TAG_CHANGE Entity=8 tag=MULLIGAN_STATE value=DONE",
+        "TAG_CHANGE Entity=8 tag=TURN value=1",
+    )
+    add_entity(parser, 200, "BG_REAL_MINION", controller=3, zone="PLAY", card_type="MINION")
+    feed(
+        parser,
+        "    tag=ATK value=7",
+        "    tag=HEALTH value=8",
+        "    tag=ZONE_POSITION value=1",
+    )
+
+    assert parser.snapshot().phase == "recruit"
+    feed(parser, "TAG_CHANGE Entity=8 tag=2022 value=0")
+    assert parser.snapshot().phase == "combat"
+    feed(parser, "TAG_CHANGE Entity=200 tag=ATTACKING value=1")
+    feed(parser, "TAG_CHANGE Entity=8 tag=2022 value=1")
+
+    battlegrounds = parser.snapshot().battlegrounds
+    assert battlegrounds is not None
+    assert parser.snapshot().phase == "recruit"
+    assert [card.card_id for card in battlegrounds.warband] == ["BG_REAL_MINION"]
+    assert battlegrounds.areas["warband"].complete is True
+    assert battlegrounds.areas["warband"].round == battlegrounds.round
+    assert battlegrounds.areas["warband"].phase == "recruit"
 
 
 def test_battlegrounds_caches_authoritative_recruit_board_and_filters_ui_helpers() -> None:

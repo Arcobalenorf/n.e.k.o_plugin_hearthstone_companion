@@ -33,7 +33,7 @@ def test_smoke_default_config_enables_questions_not_proactive_commentary() -> No
     assert config.llm_data_consent is True
 
 
-def test_manifest_is_passive_so_admin_entries_do_not_enter_agent_routing() -> None:
+def test_manifest_exposes_read_only_queries_to_agent_routing() -> None:
     manifest = tomllib.loads((Path(__file__).parents[1] / "plugin.toml").read_text(encoding="utf-8"))
 
-    assert manifest["plugin"]["passive"] is True
+    assert manifest["plugin"]["passive"] is False

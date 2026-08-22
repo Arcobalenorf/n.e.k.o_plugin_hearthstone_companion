@@ -167,6 +167,54 @@ _CONSTRUCTED_STATE_TAGS = (
     ("SILENCED", "silenced"),
     ("DORMANT", "dormant"),
 )
+_CONSTRUCTED_PLAYER_TAGS = frozenset(
+    {
+        "COMBO_ACTIVE",
+        "CURRENT_PLAYER",
+        "FATIGUE",
+        "MULLIGAN_STATE",
+        "NUM_CARDS_DRAWN_THIS_TURN",
+        "NUM_CARDS_PLAYED_THIS_TURN",
+        "NUM_FRIENDLY_MINIONS_THAT_ATTACKED_THIS_TURN",
+        "NUM_MINIONS_PLAYED_THIS_TURN",
+        "NUM_OPTIONS_PLAYED_THIS_TURN",
+        "NUM_RESOURCES_SPENT_THIS_GAME",
+        "NUM_SPELLS_PLAYED_THIS_GAME",
+        "NUM_TURNS_IN_PLAY",
+        "NUM_TURNS_LEFT",
+        "OVERLOAD_LOCKED",
+        "OVERLOAD_OWED",
+        "PLAYSTATE",
+        "RESOURCES",
+        "RESOURCES_USED",
+        "TEMP_RESOURCES",
+        "TIMEOUT",
+        "TURN",
+    }
+)
+_CONSTRUCTED_PLAYER_ALIAS_TAGS = frozenset(
+    {
+        "CURRENT_PLAYER",
+        "FATIGUE",
+        "MULLIGAN_STATE",
+        "OVERLOAD_LOCKED",
+        "OVERLOAD_OWED",
+        "PLAYSTATE",
+        "RESOURCES",
+        "RESOURCES_USED",
+        "TEMP_RESOURCES",
+        "TIMEOUT",
+        "TURN",
+    }
+)
+_CONSTRUCTED_PLAYER_WEAK_TAGS = frozenset(
+    {
+        "NUM_TURNS_LEFT",
+        "PLAYSTATE",
+        "TIMEOUT",
+    }
+)
+_CONSTRUCTED_PLAYER_STRONG_TAGS = _CONSTRUCTED_PLAYER_TAGS - _CONSTRUCTED_PLAYER_WEAK_TAGS
 _BATTLEGROUNDS_KEYWORD_TAGS = (
     ("TAUNT", "taunt"),
     ("DIVINE_SHIELD", "divine_shield"),
@@ -193,8 +241,11 @@ _CARD_IDENTITY_TAGS = frozenset(
         "ATK",
         "HEALTH",
         "DAMAGE",
+        "DURABILITY",
         "TECH_LEVEL",
         "BACON_CARD_TIER",
+        *(tag for tag, _public_name in _CONSTRUCTED_KEYWORD_TAGS),
+        *(tag for tag, _public_name in _CONSTRUCTED_STATE_TAGS),
         *_BATTLEGROUNDS_BOOLEAN_BASELINE_TAGS,
     }
 )
@@ -338,6 +389,7 @@ class PowerLogParser:
         self._pending_game_state_game_entity_id: int | None = None
         self._player_name_controllers: dict[bytes, int] = {}
         self._pending_player_name_controllers: dict[bytes, int] = {}
+        self._task_player_name_controllers: dict[bytes, int] = {}
         self._choices: dict[int, _ChoiceFrame] = {}
         self._current_choice_id: int | None = None
         self._public_revision = 0
@@ -398,6 +450,7 @@ class PowerLogParser:
         self._pending_game_state_game_entity_id = None
         self._player_name_controllers.clear()
         self._pending_player_name_controllers.clear()
+        self._task_player_name_controllers.clear()
         self._choices.clear()
         self._current_choice_id = None
         self._public_revision = 0
@@ -808,6 +861,7 @@ class PowerLogParser:
                 entity = self._unresolved_tag_entity(match.group(1), match.group(2), match.group(3))
             if entity is None:
                 return []
+            self._remember_task_player_reference(match.group(1), match.group(2), entity)
             return self._apply_tag(
                 entity,
                 match.group(2),
@@ -1388,10 +1442,92 @@ class PowerLogParser:
         key = self._player_name_key(value)
         if key is None:
             return None, None
-        controller = self._player_name_controllers.get(key)
+        controller = self._task_player_name_controllers.get(key)
+        if controller is None:
+            controller = self._player_name_controllers.get(key)
         if controller is None:
             controller = self._pending_player_name_controllers.get(key)
         return key, controller
+
+    def _bare_player_reference_key(self, value: str) -> bytes | None:
+        raw = str(value or "").strip()
+        if raw.isdigit() or raw.casefold() == "gameentity":
+            return None
+        if any(
+            pattern.search(raw)
+            for pattern in (
+                _ENTITY_ID_RE,
+                _CARD_ID_RE,
+                _CONTROLLER_RE,
+                _ZONE_RE,
+                _NAME_RE,
+            )
+        ):
+            return None
+        return self._player_name_key(raw)
+
+    def _remember_task_player_reference(
+        self,
+        raw_ref: str,
+        raw_tag: str,
+        entity: Entity,
+    ) -> None:
+        tag = _clean(raw_tag, limit=60).upper()
+        if (
+            self.mode != "constructed"
+            or tag not in _CONSTRUCTED_PLAYER_STRONG_TAGS
+            or entity.card_type != "PLAYER"
+        ):
+            return
+        controller = self._controller(entity)
+        if (
+            controller is None
+            or self.player_entities.get(controller) != entity.entity_id
+        ):
+            return
+        key = self._bare_player_reference_key(raw_ref)
+        if key is not None and (len(self._task_player_name_controllers) < 8 or key in self._task_player_name_controllers):
+            self._task_player_name_controllers[key] = controller
+
+    def _infer_constructed_player_entity(
+        self,
+        raw_ref: str,
+        raw_tag: str,
+    ) -> Entity | None:
+        tag = _clean(raw_tag, limit=60).upper()
+        if (
+            self.mode != "constructed"
+            or self.local_controller is None
+            or tag in _CONSTRUCTED_PLAYER_WEAK_TAGS
+            or tag not in _CONSTRUCTED_PLAYER_ALIAS_TAGS
+        ):
+            return None
+        key = self._bare_player_reference_key(raw_ref)
+        if key is None:
+            return None
+        registered = {
+            controller
+            for controller, entity_id in self.player_entities.items()
+            if controller > 0
+            and controller != self.bob_controller
+            and (entity := self.entities.get(entity_id)) is not None
+            and entity.card_type == "PLAYER"
+        }
+        if len(registered) != 2:
+            return None
+        task_controllers = set(self._task_player_name_controllers.values())
+        if self.local_controller not in task_controllers:
+            return None
+        candidates = registered - {self.local_controller}
+        if len(candidates) != 1:
+            return None
+        controller = candidates.pop()
+        entity = self.entities.get(self.player_entities.get(controller, -1))
+        if entity is None:
+            return None
+        if len(self._task_player_name_controllers) < 8:
+            self._task_player_name_controllers[key] = controller
+        return entity
 
     def _consume_choice_line(self, line: str, timestamp: float) -> bool:
         match = _CHOICE_HEADER_RE.search(line)
@@ -2087,7 +2223,18 @@ class PowerLogParser:
         resources = _int(player_entity.tags.get("RESOURCES")) if player_entity else None
         used = player_entity.tag_int("RESOURCES_USED") if player_entity else 0
         temporary = player_entity.tag_int("TEMP_RESOURCES") if player_entity else 0
-        mana_available = None if resources is None else max(0, resources - used + temporary)
+        if (
+            resources is None
+            or (
+                self.mode == "constructed"
+                and self.current_controller is not None
+                and controller is not None
+                and self.current_controller != controller
+            )
+        ):
+            mana_available = 0 if resources is not None else None
+        else:
+            mana_available = max(0, resources - used + temporary)
         return SideSnapshot(
             health=hero.health if hero else None,
             armor=hero.armor if hero else 0,
@@ -2128,7 +2275,17 @@ class PowerLogParser:
         resources = _int(player_entity.tags.get("RESOURCES")) if player_entity else None
         used = player_entity.tag_int("RESOURCES_USED") if player_entity else 0
         temporary = player_entity.tag_int("TEMP_RESOURCES") if player_entity else 0
-        mana_available = None if resources is None else max(0, resources - used + temporary)
+        if (
+            resources is None
+            or (
+                self.current_controller is not None
+                and controller is not None
+                and self.current_controller != controller
+            )
+        ):
+            mana_available = 0 if resources is not None else None
+        else:
+            mana_available = max(0, resources - used + temporary)
 
         hand_entities = [entity for entity in entities if entity.zone == "HAND"]
         known_hand = tuple(
@@ -2899,20 +3056,8 @@ class PowerLogParser:
                 default=0.0,
             )
             or None,
-            round=max(
-                (entity.last_battlegrounds_round for entity in observed_entities),
-                default=self.battlegrounds_round,
-            ),
-            phase=(
-                max(
-                    (
-                        (entity.last_seen_at, entity.last_battlegrounds_phase)
-                        for entity in observed_entities
-                    ),
-                    default=(0.0, self.phase),
-                )[1]
-                or self.phase
-            ),
+            round=self.battlegrounds_round,
+            phase=self.phase,
         )
 
     def _battlegrounds_hero_choices(self) -> tuple[BattlegroundsHeroChoiceSnapshot, ...]:
@@ -3350,6 +3495,9 @@ class PowerLogParser:
         return True
 
     def _unresolved_tag_entity(self, raw_ref: str, raw_tag: str, raw_value: str) -> Entity | None:
+        constructed_player = self._infer_constructed_player_entity(raw_ref, raw_tag)
+        if constructed_player is not None:
+            return constructed_player
         if self.mode != "battlegrounds":
             return None
         tag = _clean(raw_tag, limit=60).upper()

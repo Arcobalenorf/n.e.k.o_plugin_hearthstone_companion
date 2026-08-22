@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import threading
 import time
 from dataclasses import replace
@@ -40,7 +41,8 @@ _BATTLEGROUNDS_STATS_KEY = "battlegrounds_stats_v1"
 _CHAT_QUIET_BYPASS_PRIORITY = 9
 _LLM_DELIVERY_MAX_CHARS = 1800
 _LIVE_STATE_DELIVERY_MAX_BYTES = 900
-_LIVE_STATE_SEGMENTS = ("core",)
+_LIVE_STATE_SEGMENTS = ("core", "board", "hand")
+_AGENT_REPLY_MAX_CHARS = 1800
 _STATS_CLEAR_WRITE_TIMEOUT_SECONDS = 3.0
 _SHUTDOWN_THREAD_BUDGET_SECONDS = 0.4
 _SHUTDOWN_WRITER_BUDGET_SECONDS = 0.3
@@ -440,6 +442,358 @@ def _live_state_access(
         return inspect()
 
 
+_AGENT_KEYWORD_NAMES = (
+    "taunt",
+    "divine_shield",
+    "reborn",
+    "poisonous",
+    "venomous",
+    "stealth",
+    "windfury",
+    "mega_windfury",
+    "deathrattle",
+    "battlecry",
+    "magnetic",
+    "elusive",
+)
+
+
+def _agent_text(value: Any, *, limit: int = 48) -> str:
+    text = ("" if value is None else str(value)).replace("\r", " ").replace("\n", " ")
+    text = text.replace(";", ",").replace("[", "(").replace("]", ")").strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(1, limit - 1)] + "…"
+
+
+def _agent_scalar(value: Any) -> str:
+    if value is None:
+        return "?"
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    return _agent_text(value, limit=24) or "?"
+
+
+def _agent_card(card: Any) -> str:
+    if not isinstance(card, Mapping):
+        return "?"
+    card_id = _agent_text(card.get("card_id"), limit=28) or "?"
+    name = _agent_text(card.get("name"), limit=24)
+    identity = card_id if not name or name == card_id else f"{card_id}/{name}"
+    raw_type = str(card.get("card_type") or "").upper()
+    card_type = {
+        "MINION": "M",
+        "SPELL": "S",
+        "BATTLEGROUND_SPELL": "BS",
+        "TAVERN_SPELL": "BS",
+    }.get(raw_type, raw_type or "?")
+    keywords = card.get("keywords")
+    active_keywords: list[str] = []
+    keyword_unknown = False
+    if isinstance(keywords, Mapping):
+        for name in _AGENT_KEYWORD_NAMES:
+            value = keywords.get(name)
+            if value is True:
+                active_keywords.append(name)
+            elif value is None and name in keywords:
+                keyword_unknown = True
+    keyword_text = ",".join(active_keywords) or ("?" if keyword_unknown else "-")
+    fields = [
+        f"type={card_type}",
+        f"cost={_agent_scalar(card.get('current_cost', card.get('cost')))}",
+    ]
+    if card.get("attack") is not None or card.get("health") is not None:
+        fields.extend(
+            (
+                f"atk={_agent_scalar(card.get('attack'))}",
+                f"hp={_agent_scalar(card.get('health'))}",
+            )
+        )
+    if "tier" in card:
+        fields.append(f"tier={_agent_scalar(card.get('tier'))}")
+    position = card.get("position", card.get("zone_position"))
+    if position:
+        fields.append(f"pos={_agent_scalar(position)}")
+    if "premium" in card:
+        fields.append(f"golden={_agent_scalar(card.get('premium'))}")
+    if isinstance(keywords, Mapping):
+        fields.append(f"kw={keyword_text}")
+    return f"{identity}[{','.join(fields)}]"
+
+
+def _agent_cards(value: Any, *, limit: int) -> str:
+    if not isinstance(value, list):
+        return "?"
+    cards = [_agent_card(item) for item in value[:limit]]
+    if len(value) > limit:
+        cards.append(f"+{len(value) - limit}")
+    return "|".join(cards) if cards else "-"
+
+
+def _agent_side(side: Any, *, include_hand: bool) -> str:
+    if not isinstance(side, Mapping):
+        return "?"
+    hero = side.get("hero") if isinstance(side.get("hero"), Mapping) else {}
+    mana = side.get("mana") if isinstance(side.get("mana"), Mapping) else {}
+    hand = side.get("hand") if isinstance(side.get("hand"), Mapping) else {}
+    board = side.get("board") if isinstance(side.get("board"), Mapping) else {}
+    parts = [
+        f"hp={_agent_scalar(hero.get('health'))}+{_agent_scalar(hero.get('armor', 0))}",
+        f"mana={_agent_scalar(mana.get('available'))}/{_agent_scalar(mana.get('maximum'))}",
+        f"hand={_agent_scalar(hand.get('count'))}",
+        f"board={_agent_cards(board.get('minions'), limit=7)}",
+    ]
+    if include_hand:
+        parts.insert(
+            3,
+            f"hand_complete={_agent_scalar(hand.get('identities_complete'))}",
+        )
+        parts.insert(4, f"cards={_agent_cards(hand.get('known_cards'), limit=10)}")
+    return ",".join(parts)
+
+
+def _agent_constructed_reply(payload: Mapping[str, Any]) -> str:
+    if not payload.get("available"):
+        return (
+            "HS_QUERY mode=constructed;available=0;"
+            f"reason={_agent_text(payload.get('reason') or 'no_live_game_state')}"
+        )
+    state = payload.get("state") if isinstance(payload.get("state"), Mapping) else {}
+    constructed = (
+        state.get("constructed")
+        if isinstance(state.get("constructed"), Mapping)
+        else {}
+    )
+    freshness = (
+        payload.get("freshness")
+        if isinstance(payload.get("freshness"), Mapping)
+        else {}
+    )
+    choice = state.get("choice") if isinstance(state.get("choice"), Mapping) else None
+    parts = [
+        "HS_QUERY mode=constructed",
+        "available=1",
+        f"source={_agent_scalar(freshness.get('source'))}",
+        f"age={_agent_scalar(freshness.get('age_seconds'))}",
+        f"phase={_agent_scalar(state.get('phase'))}",
+        f"round={_agent_scalar(state.get('round'))}",
+        f"turn={_agent_scalar(state.get('turn'))}",
+        f"active={_agent_scalar(state.get('active_side'))}",
+        "legal_actions=partial",
+        f"player={_agent_side(constructed.get('player'), include_hand=True)}",
+        f"opponent={_agent_side(constructed.get('opponent'), include_hand=False)}",
+    ]
+    if choice is not None:
+        parts.append(
+            "choice="
+            f"{_agent_scalar(choice.get('choice_type'))}:"
+            f"{_agent_cards(choice.get('options'), limit=8)}"
+        )
+    return ";".join(parts)
+
+
+def _agent_catalog_rules(payload: Mapping[str, Any], cards: Any) -> str:
+    catalog = (
+        payload.get("card_catalog")
+        if isinstance(payload.get("card_catalog"), Mapping)
+        else {}
+    )
+    facts = catalog.get("cards") if isinstance(catalog.get("cards"), Mapping) else {}
+    if not isinstance(cards, list):
+        return ""
+    rules: list[str] = []
+    for card in cards[:7]:
+        if not isinstance(card, Mapping):
+            continue
+        card_id = str(card.get("card_id") or "")
+        fact = facts.get(card_id) if isinstance(facts, Mapping) else None
+        if not isinstance(fact, Mapping):
+            continue
+        rules_text = _agent_text(fact.get("rules_text"), limit=72)
+        if rules_text:
+            rules.append(f"{_agent_text(card_id, limit=28)}={rules_text}")
+    return "|".join(rules)
+
+
+def _agent_capabilities(payload: Mapping[str, Any]) -> str:
+    capabilities = (
+        payload.get("capabilities")
+        if isinstance(payload.get("capabilities"), Mapping)
+        else {}
+    )
+    names = (
+        ("shop_card_priority_advice", "shop"),
+        ("purchase_affordability", "buy"),
+        ("specific_purchase_advice", "sequence"),
+        ("upgrade_affordability", "level"),
+        ("refresh_advice", "refresh"),
+        ("positioning_advice", "position"),
+        ("choice_advice", "choice"),
+        ("combat_commentary", "combat"),
+    )
+    statuses: list[str] = []
+    missing: list[str] = []
+    for source_name, label in names:
+        value = capabilities.get(source_name)
+        if not isinstance(value, Mapping):
+            continue
+        statuses.append(f"{label}:{1 if value.get('available') else 0}")
+        for item in list(value.get("missing_evidence") or [])[:3]:
+            text = _agent_text(item, limit=40)
+            if text and text not in missing:
+                missing.append(text)
+    result = ",".join(statuses) or "?"
+    if missing:
+        result += ";missing=" + ",".join(missing[:8])
+    return result
+
+
+def _agent_battlegrounds_reply(
+    payload: Mapping[str, Any], *, focus: str = "auto"
+) -> str:
+    if not payload.get("available"):
+        return (
+            "HS_QUERY mode=battlegrounds;available=0;"
+            f"reason={_agent_text(payload.get('reason') or 'no_live_battlegrounds_state')}"
+        )
+    topic = str(payload.get("topic") or "current_strategy")
+    if topic != "current_strategy":
+        selected = {
+            "season_meta": payload.get("season_rules"),
+            "hero_performance": payload.get("hero_performance"),
+            "post_game": payload.get("current_public_state"),
+        }.get(topic)
+        return (
+            "HS_QUERY mode=battlegrounds;available=1;"
+            f"topic={_agent_text(topic)};data="
+            + _agent_text(
+                json.dumps(selected, ensure_ascii=False, separators=(",", ":")),
+                limit=900,
+            )
+        )
+
+    state = (
+        payload.get("current_public_state")
+        if isinstance(payload.get("current_public_state"), Mapping)
+        else {}
+    )
+    phase = str(state.get("phase") or "unknown")
+    selected_focus = str(focus or "auto")
+    if selected_focus == "auto":
+        selected_focus = {
+            "hero_select": "choice",
+            "recruit": "shop",
+            "combat": "board",
+        }.get(phase, "board")
+    areas = state.get("areas") if isinstance(state.get("areas"), Mapping) else {}
+    complete_areas = [
+        name
+        for name in ("shop", "hand", "warband", "economy", "choice")
+        if isinstance(areas.get(name), Mapping) and areas[name].get("complete") is True
+    ]
+    parts = [
+        "HS_QUERY mode=battlegrounds",
+        "available=1",
+        "source=live",
+        f"phase={_agent_scalar(phase)}",
+        f"round={_agent_scalar(state.get('round'))}",
+        f"gold={_agent_scalar(state.get('gold'))}/{_agent_scalar(state.get('max_gold'))}",
+        f"tier={_agent_scalar(state.get('tavern_tier'))}",
+        f"frozen={_agent_scalar(state.get('frozen'))}",
+        f"refresh={_agent_scalar(state.get('refresh_cost'))}",
+        f"upgrade={_agent_scalar(state.get('upgrade_cost'))}",
+        f"complete={','.join(complete_areas) or '-'}",
+        f"caps={_agent_capabilities(payload)}",
+    ]
+    if selected_focus == "choice":
+        heroes = state.get("hero_choices")
+        if isinstance(heroes, list) and heroes:
+            parts.append(
+                "heroes="
+                + "|".join(
+                    f"{_agent_text(item.get('card_id'), limit=28)}/{_agent_text(item.get('name'), limit=24)}"
+                    for item in heroes[:8]
+                    if isinstance(item, Mapping)
+                )
+            )
+        choice = state.get("current_choice")
+        if isinstance(choice, Mapping):
+            parts.append(
+                f"choice={_agent_scalar(choice.get('choice_type'))}:"
+                f"{_agent_cards(choice.get('options'), limit=8)}"
+            )
+            rules = _agent_catalog_rules(payload, choice.get("options"))
+            if rules:
+                parts.append(f"rules={rules}")
+    elif selected_focus == "opponent":
+        opponents = state.get("opponents")
+        parts.append(
+            "opponents="
+            + _agent_text(
+                json.dumps(opponents, ensure_ascii=False, separators=(",", ":")),
+                limit=1100,
+            )
+        )
+    elif selected_focus == "board":
+        parts.append(f"warband={_agent_cards(state.get('warband'), limit=7)}")
+        opponents = state.get("opponents")
+        if isinstance(opponents, Mapping):
+            current = opponents.get("current")
+            if isinstance(current, Mapping):
+                board = current.get("board") if isinstance(current.get("board"), Mapping) else {}
+                parts.append(
+                    "current_opponent="
+                    f"hero:{_agent_text((current.get('hero') or {}).get('name') if isinstance(current.get('hero'), Mapping) else '', limit=24)},"
+                    f"hp:{_agent_scalar(current.get('effective_health'))},"
+                    f"board:{_agent_cards(board.get('minions'), limit=7)}"
+                )
+    else:
+        shop = state.get("shop")
+        parts.append(f"shop={_agent_cards(shop, limit=7)}")
+        rules = _agent_catalog_rules(payload, shop)
+        if rules:
+            parts.append(f"rules={rules}")
+        parts.append(f"warband={_agent_cards(state.get('warband'), limit=7)}")
+        parts.append(f"hand={_agent_cards(state.get('hand'), limit=10)}")
+    return ";".join(parts)
+
+
+def _bound_agent_reply(value: str) -> str:
+    text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+    if len(text) <= _AGENT_REPLY_MAX_CHARS:
+        return text
+    suffix = ";truncated=1"
+    return text[: _AGENT_REPLY_MAX_CHARS - len(suffix)].rstrip(";|, ") + suffix
+
+
+def _agent_focus_from_request(value: Any) -> str:
+    text = str(value or "").casefold()
+    focus_terms = (
+        ("opponent", ("对手", "对面", "下一家", "opponent")),
+        ("choice", ("英雄选择", "候选英雄", "发现", "选哪个", "choice")),
+        (
+            "board",
+            ("站位", "阵容", "战团", "战斗", "稳血", "position", "board", "combat"),
+        ),
+        (
+            "shop",
+            ("商店", "买", "升本", "刷新", "冻结", "酒馆法术", "shop", "buy", "refresh"),
+        ),
+    )
+    for focus, terms in focus_terms:
+        if any(term in text for term in terms):
+            return focus
+    return "auto"
+
+
+def _agent_query_reply(
+    payload: Mapping[str, Any], *, mode: str, focus: str = "auto"
+) -> str:
+    if mode == "battlegrounds":
+        return _bound_agent_reply(_agent_battlegrounds_reply(payload, focus=focus))
+    return _bound_agent_reply(_agent_constructed_reply(payload))
+
+
 @neko_plugin
 class HearthstoneCompanionPlugin(NekoPluginBase):
     """Read-only Hearthstone companion built on the public N.E.K.O Plugin SDK."""
@@ -474,6 +828,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         self._live_state_target = ""
         self._live_state_segment_count = 0
         self._live_state_game_number = 0
+        self._live_state_snapshot: GameSnapshot | None = None
         self._ownership_lock = threading.RLock()
         self._delivery_lock = threading.RLock()
         self._settings_lock = asyncio.Lock()
@@ -1699,7 +2054,11 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 "context_type": "hearthstone_companion_live_state",
                 "delivery_intent": "passive_context",
                 "context_expired": expired,
-                "privacy_scope": "capability_routing_only",
+                "privacy_scope": (
+                    "no_game_state_tombstone"
+                    if expired
+                    else "filtered_player_visible_live_state"
+                ),
                 "segment": segment,
             },
             "priority": 0,
@@ -1739,6 +2098,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     and getattr(self, "_live_state_target", "") == target
                     and int(getattr(self, "_live_state_game_number", 0) or 0)
                     == snapshot.game_number
+                    and getattr(self, "_live_state_snapshot", None) == snapshot
                 )
                 target_changed = bool(
                     getattr(self, "_live_state_shared", False)
@@ -1753,12 +2113,6 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 return True
             if (target_changed or game_changed) and not self._expire_live_state():
                 return False
-            with self._ownership_lock:
-                if (
-                    getattr(self, "_live_state_shared", False)
-                    and getattr(self, "_live_state_target", "") == target
-                ):
-                    return True
             try:
                 texts = build_live_state_contexts(
                     snapshot,
@@ -1817,14 +2171,16 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 if access_reason or self._delivery_target() != target:
                     self._expire_live_state()
                     return False
+            with self._ownership_lock:
+                self._live_state_snapshot = snapshot
             return True
 
     @staticmethod
     def _live_state_expired_text() -> str:
         return (
-            "# 炉石工具能力提示已失效\n"
-            "不得从之前的静态提示推断当前权限或局势。"
-            "如果主人继续询问当前对局，请调用炉石工具；工具拒绝或不可用时如实说明。"
+            "# 炉石实时公开状态已失效\n"
+            "不得继续使用之前的局势快照。"
+            "如果主人继续询问当前对局，请调用炉石查询入口；拒绝或不可用时如实说明。"
         )
 
     def _expire_live_state(self) -> bool:
@@ -1861,6 +2217,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     self._live_state_target = ""
                     self._live_state_segment_count = 0
                     self._live_state_game_number = 0
+                    self._live_state_snapshot = None
             return True
 
     def _restore_context(self) -> bool:
@@ -2696,6 +3053,103 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         state["runtime"] = runtime
         state["summary"] = "已读取炉石陪玩状态。"
         return Ok(state)
+
+    @plugin_entry(
+        id="query_constructed_state",
+        name=tr(
+            "entries.query_constructed_state.name",
+            default="查询当前炉石对战",
+        ),
+        description=tr(
+            "entries.query_constructed_state.description",
+            default=(
+                "用户询问当前普通、标准、狂野或竞技场炉石对战的回合、行动方、法力、"
+                "手牌、场面、Choice 或出牌建议时调用。每次都读取最新玩家可见状态；"
+                "酒馆战棋问题必须改用 query_battlegrounds_state。"
+            ),
+        ),
+        input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+        kind="service",
+        timeout=5.0,
+        llm_result_fields=["reply"],
+        metadata={"result_kind": "event", "expires_in_s": 8.0},
+    )
+    async def query_constructed_state(self, **_: Any):
+        payload = await self.hearthstone_current_state()
+        return Ok(
+            {
+                "reply": _agent_query_reply(payload, mode="constructed"),
+                "payload": payload,
+            }
+        )
+
+    @plugin_entry(
+        id="query_battlegrounds_state",
+        name=tr(
+            "entries.query_battlegrounds_state.name",
+            default="查询当前酒馆战棋局势",
+        ),
+        description=tr(
+            "entries.query_battlegrounds_state.description",
+            default=(
+                "用户询问酒馆战棋、酒馆、商店买什么、酒馆法术、英雄选择、流派、阵容、"
+                "站位、升本、刷新、冻结、稳血、对手或复盘时调用。返回最新玩家可见局势，"
+                "包括实际费用、卡牌类型、金色、当前关键词和证据完整度；绝不回退到构筑套牌。"
+            ),
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "topic": {
+                    "type": "string",
+                    "enum": [
+                        "current_strategy",
+                        "season_meta",
+                        "hero_performance",
+                        "post_game",
+                    ],
+                    "default": "current_strategy",
+                },
+                "focus": {
+                    "type": "string",
+                    "enum": ["auto", "shop", "board", "choice", "opponent"],
+                    "default": "auto",
+                    "description": tr(
+                        "entries.query_battlegrounds_state.focus",
+                        default=(
+                            "买什么/升本/刷新用 shop；阵容/站位/战斗用 board；"
+                            "英雄或发现选项用 choice；对手信息用 opponent。"
+                        ),
+                    ),
+                },
+            },
+            "additionalProperties": False,
+        },
+        kind="service",
+        timeout=5.0,
+        llm_result_fields=["reply"],
+        metadata={"result_kind": "event", "expires_in_s": 8.0},
+    )
+    async def query_battlegrounds_state(
+        self,
+        topic: str = "current_strategy",
+        focus: str = "auto",
+        _ctx: Mapping[str, Any] | None = None,
+        **_: Any,
+    ):
+        if focus == "auto" and isinstance(_ctx, Mapping):
+            focus = _agent_focus_from_request(_ctx.get("latest_user_request"))
+        payload = await self.hearthstone_battlegrounds_advice(topic=topic)
+        return Ok(
+            {
+                "reply": _agent_query_reply(
+                    payload,
+                    mode="battlegrounds",
+                    focus=focus,
+                ),
+                "payload": payload,
+            }
+        )
 
     @llm_tool(
         name="hearthstone_current_state",
