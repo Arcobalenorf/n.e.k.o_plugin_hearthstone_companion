@@ -17,7 +17,6 @@ ResultCallback = Callable[[GameEvent, GameSnapshot], None]
 EventCallback = Callable[[GameEvent, GameSnapshot], None]
 StateCallback = Callable[[GameSnapshot], None]
 LIVE_STATE_MAX_AGE_SECONDS = 300.0
-LIVE_STATE_PUBLISH_INTERVAL_SECONDS = 2.0
 
 
 class CompanionMonitor:
@@ -64,7 +63,6 @@ class CompanionMonitor:
         self._bootstrap_complete = False
         self._state_ready_notified = False
         self._state_stale_notified = False
-        self._next_state_publish_at = 0.0
 
     def _begin_source_generation_locked(self) -> None:
         self._source_generation += 1
@@ -72,7 +70,6 @@ class CompanionMonitor:
         self._bootstrap_complete = False
         self._state_ready_notified = False
         self._state_stale_notified = False
-        self._next_state_publish_at = 0.0
         self._status.source_state = (
             "waiting_for_log" if self._status.monitor_running else "waiting"
         )
@@ -275,17 +272,7 @@ class CompanionMonitor:
                             and activity_at > 0
                             and now - activity_at <= LIVE_STATE_MAX_AGE_SECONDS
                         )
-                        publish_state = bool(
-                            live_active_snapshot
-                            and (
-                                state_changed
-                                or now >= self._next_state_publish_at
-                            )
-                        )
-                        if publish_state:
-                            self._next_state_publish_at = (
-                                now + LIVE_STATE_PUBLISH_INTERVAL_SECONDS
-                            )
+                        publish_state = bool(live_active_snapshot and state_changed)
                         state_ready = bool(
                             batch.bootstrap
                             and self._bootstrap_complete
@@ -643,5 +630,4 @@ class CompanionMonitor:
 __all__ = [
     "CompanionMonitor",
     "LIVE_STATE_MAX_AGE_SECONDS",
-    "LIVE_STATE_PUBLISH_INTERVAL_SECONDS",
 ]

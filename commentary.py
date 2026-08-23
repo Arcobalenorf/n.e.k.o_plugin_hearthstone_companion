@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import time
 from collections import deque
 from collections.abc import Mapping
@@ -407,6 +408,38 @@ _LIVE_KEYWORD_CODES = (
     ("m", "magnetic"),
     ("e", "elusive"),
 )
+_CONSTRUCTED_LIVE_KEYWORD_CODES = (
+    ("t", "taunt"),
+    ("d", "divine_shield"),
+    ("r", "reborn"),
+    ("s", "stealth"),
+    ("w", "windfury"),
+    ("W", "mega_windfury"),
+    ("p", "poisonous"),
+    ("l", "lifesteal"),
+    ("u", "rush"),
+    ("c", "charge"),
+    ("x", "deathrattle"),
+    ("b", "battlecry"),
+    ("e", "elusive"),
+)
+_CONSTRUCTED_LIVE_STATE_CODES = (
+    ("f", "frozen"),
+    ("s", "silenced"),
+    ("i", "immune"),
+    ("d", "dormant"),
+)
+_CONSTRUCTED_LIVE_STATE_NAMES = frozenset(
+    state for _code, state in _CONSTRUCTED_LIVE_STATE_CODES
+)
+_CONSTRUCTED_LIVE_CARD_TYPE_CODES = {
+    "MINION": "m",
+    "SPELL": "s",
+    "WEAPON": "w",
+    "LOCATION": "l",
+    "HERO": "h",
+    "HERO_POWER": "p",
+}
 
 
 def _live_text(value: Any, *, limit: int) -> str:
@@ -421,6 +454,115 @@ def _live_scalar(value: Any) -> str:
     if value is False:
         return "0"
     return str(value)
+
+
+def _live_constructed(
+    value: Any,
+    *,
+    include_names: bool,
+    name_limit: int,
+) -> tuple[dict[str, Any], dict[str, str]] | None:
+    if not isinstance(value, Mapping):
+        return None
+    keyword_codes = {
+        keyword: code for code, keyword in _CONSTRUCTED_LIVE_KEYWORD_CODES
+    }
+    used_keyword_codes: set[str] = set()
+    card_fields = ["id"]
+    if include_names:
+        card_fields.append("name")
+    card_fields.extend(("attack", "health", "position", "keywords"))
+
+    def compact_card(card_value: Any) -> str:
+        card = card_value if isinstance(card_value, Mapping) else {}
+        raw_keywords = card.get("keywords")
+        keywords = (
+            list(raw_keywords)
+            if isinstance(raw_keywords, (list, tuple))
+            else []
+        )
+        active_codes: list[str] = []
+        unknown_keywords: list[str] = []
+        for raw_keyword in keywords[:16]:
+            keyword = _live_text(raw_keyword, limit=24)
+            code = keyword_codes.get(keyword)
+            if code is None:
+                if keyword:
+                    unknown_keywords.append(keyword)
+                continue
+            if code not in active_codes:
+                active_codes.append(code)
+                used_keyword_codes.add(code)
+        keyword_value = "".join(active_codes)
+        if unknown_keywords:
+            literal_keywords = ",".join(unknown_keywords[:4])
+            keyword_value = (
+                f"{keyword_value}+{literal_keywords}"
+                if keyword_value
+                else literal_keywords
+            )
+        fields: list[Any] = [_live_text(card.get("card_id"), limit=40)]
+        if include_names:
+            fields.append(
+                _live_text(card.get("name"), limit=max(1, int(name_limit)))
+            )
+        fields.extend(
+            (
+                card.get("attack"),
+                card.get("health"),
+                card.get("zone_position"),
+                keyword_value or "-",
+            )
+        )
+        return "|".join(_live_scalar(field) for field in fields)
+
+    def compact_side(raw: Any) -> tuple[str, list[str]]:
+        side = raw if isinstance(raw, Mapping) else {}
+        hero = side.get("hero") if isinstance(side.get("hero"), Mapping) else {}
+        mana = side.get("mana") if isinstance(side.get("mana"), Mapping) else {}
+        hand = side.get("hand") if isinstance(side.get("hand"), Mapping) else {}
+        deck = side.get("deck") if isinstance(side.get("deck"), Mapping) else {}
+        secrets = side.get("secrets") if isinstance(side.get("secrets"), Mapping) else {}
+        board = side.get("board") if isinstance(side.get("board"), Mapping) else {}
+        summary = "|".join(
+            _live_scalar(item)
+            for item in (
+                hero.get("effective_health"),
+                mana.get("available"),
+                mana.get("maximum"),
+                hand.get("count"),
+                deck.get("count"),
+                secrets.get("count"),
+                board.get("count"),
+            )
+        )
+        cards = [
+            compact_card(card)
+            for card in list(board.get("minions") or [])[:7]
+            if isinstance(card, Mapping)
+        ]
+        return summary, cards
+
+    player_summary, player_board = compact_side(value.get("player"))
+    opponent_summary, opponent_board = compact_side(value.get("opponent"))
+    keyword_schema = ",".join(
+        f"{code} {keyword}"
+        for code, keyword in _CONSTRUCTED_LIVE_KEYWORD_CODES
+        if code in used_keyword_codes
+    )
+    return (
+        {
+            "variant": _live_text(value.get("variant"), limit=24),
+            "player_summary": player_summary,
+            "opponent_summary": opponent_summary,
+            "player_board": player_board,
+            "opponent_board": opponent_board,
+        },
+        {
+            "card": "|".join(card_fields),
+            "keywords": keyword_schema or "- none observed",
+        },
+    )
 
 
 def _live_battlegrounds(
@@ -742,7 +884,23 @@ def build_live_state_context(
     raise ValueError("live Hearthstone state exceeds max_prompt_chars")
 
 
-_LIVE_DELIVERY_PREFIX = "HS filtered live state:"
+_LIVE_DELIVERY_PREFIX = "HS live:"
+_LIVE_DELIVERY_TARGET_TOKENS = 175
+_LIVE_DELIVERY_CARD_MAX_BYTES = 350
+_LIVE_DELIVERY_CARDS_PER_SEGMENT = 2
+_LIVE_BATTLEGROUNDS_KEYWORD_CODES = (
+    ("taunt", "T"),
+    ("divine_shield", "D"),
+    ("reborn", "R"),
+    ("venomous", "V"),
+    ("poisonous", "P"),
+    ("windfury", "W"),
+    ("mega_windfury", "M"),
+    ("deathrattle", "X"),
+    ("battlecry", "B"),
+    ("magnetic", "G"),
+    ("elusive", "E"),
+)
 _LIVE_DELIVERY_AREA_CODES = (
     ("shop", "S"),
     ("hand", "H"),
@@ -849,123 +1007,562 @@ def _live_delivery_area_set(compact_battlegrounds: Mapping[str, Any]) -> str:
     )
 
 
+def _live_delivery_token_estimate(text: str) -> int:
+    """Conservatively approximate the host's o200k token count.
+
+    Plugins cannot import host internals. The estimate deliberately leaves room below
+    the host's 200-token parser boundary; integration tests also exercise the pinned
+    host tokenizer.
+    """
+    ascii_count = sum(ord(char) < 128 for char in text)
+    non_ascii_count = len(text) - ascii_count
+    return math.ceil(ascii_count * 0.32 + non_ascii_count * 1.2)
+
+
+def _encode_live_delivery(
+    payload: Mapping[str, Any],
+    *,
+    max_prompt_bytes: int,
+) -> str | None:
+    prompt = _LIVE_DELIVERY_PREFIX + json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    if len(prompt.encode("utf-8")) > max_prompt_bytes:
+        return None
+    if _live_delivery_token_estimate(prompt) > _LIVE_DELIVERY_TARGET_TOKENS:
+        return None
+    return prompt
+
+
+def _live_revision(public_state: Mapping[str, Any], observed_at: float) -> str:
+    return f"g{int(public_state.get('game_number') or 0)}:{observed_at:.3f}"
+
+
+def _live_active_keywords(value: Any, *, limit: int = 16) -> list[str]:
+    if isinstance(value, Mapping):
+        raw_values = [key for key, enabled in value.items() if enabled is True]
+    elif isinstance(value, (list, tuple)):
+        raw_values = list(value)
+    else:
+        raw_values = []
+    return [
+        keyword
+        for keyword in (
+            _live_text(raw_keyword, limit=24) for raw_keyword in raw_values[:limit]
+        )
+        if keyword
+    ]
+
+
+def _live_battlegrounds_card(value: Any, *, name_limit: int) -> list[Any]:
+    card = value if isinstance(value, Mapping) else {}
+    raw_type = str(card.get("card_type") or "").upper()
+    card_type = {
+        "MINION": "m",
+        "SPELL": "s",
+        "BATTLEGROUND_SPELL": "s",
+        "TAVERN_SPELL": "s",
+    }.get(raw_type, _live_text(raw_type, limit=24) or None)
+    premium = card.get("premium")
+    card_id = _live_text(card.get("card_id"), limit=40)
+    raw_name = _live_text(card.get("name"), limit=96)
+    raw_keywords = card.get("keywords")
+    keyword_codes = (
+        "".join(
+            code
+            for keyword, code in _LIVE_BATTLEGROUNDS_KEYWORD_CODES
+            if raw_keywords.get(keyword) is True
+        )
+        if isinstance(raw_keywords, Mapping)
+        else ""
+    )
+    golden_code = "?" if premium is None else "g" if premium else "-"
+    return [
+        card_id or None,
+        raw_name[:name_limit] or None,
+        card.get("position"),
+        card.get("attack"),
+        card.get("health"),
+        card.get("tier"),
+        card.get("current_cost"),
+        f"{card_type or '?'}{golden_code}{keyword_codes}",
+    ]
+
+
+def _live_constructed_keyword_codes(value: Any) -> str:
+    raw_values = list(value) if isinstance(value, (list, tuple)) else []
+    active = {
+        _live_text(raw_keyword, limit=24)
+        for raw_keyword in raw_values[:16]
+    }
+    return "".join(
+        code
+        for code, keyword in _CONSTRUCTED_LIVE_KEYWORD_CODES
+        if keyword in active
+    )
+
+
+def _live_constructed_state_codes(value: Any) -> str:
+    raw_values = list(value) if isinstance(value, (list, tuple)) else []
+    active = {
+        _live_text(raw_state, limit=24).casefold()
+        for raw_state in raw_values[:8]
+    }
+    encoded = "".join(
+        code for code, state in _CONSTRUCTED_LIVE_STATE_CODES if state in active
+    )
+    if any(
+        state and state not in _CONSTRUCTED_LIVE_STATE_NAMES
+        for state in active
+    ):
+        encoded += "?"
+    return encoded
+
+
+def _live_constructed_board_card(value: Any, *, name_limit: int) -> list[Any]:
+    card = value if isinstance(value, Mapping) else {}
+    card_id = _live_text(card.get("card_id"), limit=40)
+    raw_name = _live_text(card.get("name"), limit=96)
+    return [
+        card_id or None,
+        raw_name[:name_limit] or None,
+        card.get("zone_position"),
+        card.get("attack"),
+        card.get("health"),
+        _live_constructed_keyword_codes(card.get("keywords")),
+        _live_constructed_state_codes(card.get("states")),
+    ]
+
+
+def _live_constructed_hand_card(value: Any, *, name_limit: int) -> list[Any]:
+    card = value if isinstance(value, Mapping) else {}
+    card_id = _live_text(card.get("card_id"), limit=40)
+    raw_name = _live_text(card.get("name"), limit=96)
+    raw_type = str(card.get("card_type") or "").upper()
+    return [
+        card_id or None,
+        raw_name[:name_limit] or None,
+        card.get("zone_position"),
+        _CONSTRUCTED_LIVE_CARD_TYPE_CODES.get(
+            raw_type,
+            _live_text(raw_type, limit=16) or None,
+        ),
+        card.get("cost"),
+        _live_constructed_keyword_codes(card.get("keywords")),
+        _live_constructed_state_codes(card.get("states")),
+    ]
+
+
+def _build_live_card_segments(
+    cards: Any,
+    *,
+    area: str,
+    common: Mapping[str, Any],
+    complete: bool | None,
+    max_prompt_bytes: int,
+    card_builder: Any,
+    cards_per_segment: int = _LIVE_DELIVERY_CARDS_PER_SEGMENT,
+    include_complete: bool = True,
+    include_bounds: bool = True,
+    include_area: bool = True,
+) -> list[tuple[str, str]]:
+    raw_cards = [card for card in list(cards or []) if isinstance(card, Mapping)]
+    if not raw_cards:
+        return []
+    segments: list[tuple[str, str]] = []
+    start = 0
+    while start < len(raw_cards):
+        selected: tuple[int, str] | None = None
+        for name_limit in (24, 16, 12, 8):
+            for chunk_size in range(
+                min(max(1, cards_per_segment), len(raw_cards) - start),
+                0,
+                -1,
+            ):
+                segment_name = f"{area}_{len(segments) + 1}"
+                payload = {
+                    **common,
+                    "segment": segment_name,
+                    "cards": [
+                        card_builder(card, name_limit=name_limit)
+                        for card in raw_cards[start : start + chunk_size]
+                    ],
+                }
+                if include_complete:
+                    payload["complete"] = complete
+                if include_bounds:
+                    payload["start"] = start + 1
+                    payload["total"] = len(raw_cards)
+                if include_area:
+                    payload["area"] = area
+                prompt = _encode_live_delivery(
+                    payload,
+                    max_prompt_bytes=min(
+                        max_prompt_bytes,
+                        _LIVE_DELIVERY_CARD_MAX_BYTES,
+                    ),
+                )
+                if prompt is not None:
+                    selected = chunk_size, prompt
+                    break
+            if selected is not None:
+                break
+        if selected is None:
+            raise ValueError(f"live {area} card exceeds delivery boundary")
+        chunk_size, prompt = selected
+        segments.append((f"{area}_{len(segments) + 1}", prompt))
+        start += chunk_size
+    return segments
+
+
 def _build_battlegrounds_live_state_contexts(
     public_state: Mapping[str, Any],
     *,
     observed_at: float,
     max_prompt_bytes: int,
-) -> tuple[str, ...]:
+) -> tuple[tuple[str, str], ...]:
     battlegrounds = public_state.get("battlegrounds")
     if not isinstance(battlegrounds, Mapping):
         raise ValueError("battlegrounds state is not available")
-
-    variants = (
-        (True, 24, True),
-        (True, 12, True),
-        (False, 1, True),
-        (False, 1, False),
+    revision = _live_revision(public_state, observed_at)
+    areas = (
+        battlegrounds.get("areas")
+        if isinstance(battlegrounds.get("areas"), Mapping)
+        else {}
     )
-    three_segment_fallback: tuple[str, ...] | None = None
-    for include_names, name_limit, include_choice_cards in variants:
-        compact = _live_battlegrounds(
-            battlegrounds,
-            include_names=include_names,
-            name_limit=name_limit,
-            include_choice_cards=include_choice_cards,
-            include_players=False,
-            include_mechanics=False,
-            include_observation_details=False,
-        )
-        if compact is None:
-            continue
-        compact_battlegrounds, schema, keyword_sets = compact
-        common = {
-            "m": public_state.get("mode"),
-            "r": compact_battlegrounds.get("round"),
-            "p": compact_battlegrounds.get("phase"),
+    complete_areas = [
+        area
+        for area in ("shop", "hand", "warband", "economy", "choice")
+        if isinstance(areas.get(area), Mapping)
+        and areas[area].get("complete") is True
+    ]
+    current_choice = battlegrounds.get("current_choice")
+    choice = None
+    if isinstance(current_choice, Mapping):
+        choice = {
+            "type": current_choice.get("choice_type"),
+            "min": current_choice.get("count_min"),
+            "max": current_choice.get("count_max"),
+            "option_count": len(list(current_choice.get("options") or [])),
         }
-        core_state = {
-            **common,
-            "g": compact_battlegrounds.get("gold"),
-            "t": compact_battlegrounds.get("tier"),
-            "f": compact_battlegrounds.get("frozen"),
-            "l": compact_battlegrounds.get("placement"),
-            "c": list(compact_battlegrounds.get("costs") or [])[:2],
-            "a": _live_delivery_area_set(compact_battlegrounds),
-            "S": list(compact_battlegrounds.get("shop") or [])[:7],
-            "q": _live_delivery_choice(compact_battlegrounds.get("current_choice")),
-        }
-        hand_state = {
-            **common,
-            "H": list(compact_battlegrounds.get("hand") or [])[:10],
-        }
-        board_state = {
-            **common,
-            "W": list(compact_battlegrounds.get("warband") or [])[:7],
-        }
-        combined_board_state = {
-            **common,
-            "H": hand_state["H"],
-            "W": board_state["W"],
-        }
-        two_prompts = (
-            _live_delivery_prompt(
-                segment="core",
-                observed_at=observed_at,
-                state=core_state,
-                keyword_sets=keyword_sets,
-                card_schema=schema["card"],
-                segment_count=2,
-            ),
-            _live_delivery_prompt(
-                segment="board",
-                observed_at=observed_at,
-                state=combined_board_state,
-                keyword_sets=keyword_sets,
-                card_schema=schema["card"],
-                segment_count=2,
-            ),
-        )
-        two_sizes = [len(prompt.encode("utf-8")) for prompt in two_prompts]
-        if (
-            all(size <= max_prompt_bytes for size in two_sizes)
-            and sum(2 * size + 48 for size in two_sizes) <= 3000
-        ):
-            return two_prompts
+    core_payload = {
+        "revision": revision,
+        "segment": "core",
+        "mode": "battlegrounds",
+        "round": battlegrounds.get("round"),
+        "phase": battlegrounds.get("phase"),
+        "gold": battlegrounds.get("gold"),
+        "max_gold": battlegrounds.get("max_gold"),
+        "tavern_tier": battlegrounds.get("tavern_tier"),
+        "frozen": battlegrounds.get("frozen"),
+        "placement": battlegrounds.get("placement"),
+        "refresh_actual_cost": battlegrounds.get("refresh_cost"),
+        "upgrade_actual_cost": battlegrounds.get("upgrade_cost"),
+        "counts": {
+            area: len(list(battlegrounds.get(area) or []))
+            for area in ("shop", "hand", "warband")
+        },
+        "complete_areas": complete_areas,
+        "card_fields": (
+            "cards=[id,name,pos,atk,hp,tier,cost,flags];"
+            "flags=<type><gold><kw>;type=m随s法;gold=g金-普?未;"
+            "kw=T嘲D盾R复V烈P毒W风M超X亡B吼G磁E免"
+        ),
+    }
+    core_prompt = _encode_live_delivery(
+        core_payload,
+        max_prompt_bytes=max_prompt_bytes,
+    )
+    if core_prompt is None:
+        raise ValueError("live Battlegrounds core exceeds delivery boundary")
 
-        three_prompts = (
-            _live_delivery_prompt(
-                segment="core",
-                observed_at=observed_at,
-                state=core_state,
-                keyword_sets=keyword_sets,
-                card_schema=schema["card"],
-                segment_count=3,
-            ),
-            _live_delivery_prompt(
-                segment="board",
-                observed_at=observed_at,
-                state=board_state,
-                keyword_sets=keyword_sets,
-                card_schema=schema["card"],
-                segment_count=3,
-            ),
-            _live_delivery_prompt(
-                segment="hand",
-                observed_at=observed_at,
-                state=hand_state,
-                keyword_sets=keyword_sets,
-                card_schema=schema["card"],
-                segment_count=3,
-            ),
+    # The core segment is always queued first and carries mode/round/phase. Repeating
+    # those fields in every card segment wastes the host's callback budget twice
+    # because its bridge mirrors each body into both summary and detail.
+    common = {"revision": revision}
+    segments: list[tuple[str, str]] = [("core", core_prompt)]
+    if choice is not None:
+        choice_prompt = _encode_live_delivery(
+            {
+                **common,
+                "segment": "choice",
+                "choice": choice,
+            },
+            max_prompt_bytes=max_prompt_bytes,
         )
-        if three_segment_fallback is None and all(
-            len(prompt.encode("utf-8")) <= max_prompt_bytes for prompt in three_prompts
-        ):
-            three_segment_fallback = three_prompts
-    if three_segment_fallback is not None:
-        return three_segment_fallback
-    raise ValueError("live Battlegrounds state exceeds max_prompt_bytes")
+        if choice_prompt is None:
+            raise ValueError("live Battlegrounds choice exceeds delivery boundary")
+        segments.append(("choice", choice_prompt))
+
+    def append_area(area: str, limit: int, cards_per_segment: int) -> None:
+        area_state = areas.get(area) if isinstance(areas.get(area), Mapping) else {}
+        complete = area_state.get("complete") if area_state else None
+        segments.extend(
+            _build_live_card_segments(
+                list(battlegrounds.get(area) or [])[:limit],
+                area=area,
+                common=common,
+                complete=complete,
+                max_prompt_bytes=max_prompt_bytes,
+                card_builder=_live_battlegrounds_card,
+                cards_per_segment=cards_per_segment,
+                include_complete=False,
+                include_bounds=False,
+                include_area=False,
+            )
+        )
+
+    opponents = (
+        battlegrounds.get("opponents")
+        if isinstance(battlegrounds.get("opponents"), Mapping)
+        else {}
+    )
+
+    def append_opponent(relationship: str) -> None:
+        opponent = opponents.get(relationship)
+        if not isinstance(opponent, Mapping):
+            return
+        hero = opponent.get("hero") if isinstance(opponent.get("hero"), Mapping) else {}
+        board = opponent.get("board") if isinstance(opponent.get("board"), Mapping) else {}
+        board_cards = list(board.get("minions") or [])[:7]
+        observed_round = board.get("observed_round")
+        observed_in_combat = board.get("observed_in_combat")
+        segments.extend(
+            _build_live_card_segments(
+                board_cards,
+                area=f"opponent_{relationship}_board",
+                common={
+                    **common,
+                    "relationship": relationship,
+                    "observed_round": observed_round,
+                    "observed_in_combat": observed_in_combat,
+                },
+                complete=observed_in_combat,
+                max_prompt_bytes=max_prompt_bytes,
+                card_builder=_live_battlegrounds_card,
+                cards_per_segment=7,
+            )
+        )
+        status_segment = f"opponent_{relationship}_status"
+        status_prompt = _encode_live_delivery(
+            {
+                **common,
+                "segment": status_segment,
+                "relationship": relationship,
+                "player_id": opponent.get("player_id"),
+                "hero": {
+                    "id": _live_text(hero.get("card_id"), limit=40),
+                    "name": _live_text(hero.get("name"), limit=24),
+                },
+                "health": opponent.get("health"),
+                "armor": opponent.get("armor"),
+                "tavern_tier": opponent.get("tavern_tier"),
+                "placement": opponent.get("placement"),
+                "eliminated": opponent.get("eliminated"),
+                "observed_round": observed_round,
+                "board_count": len(board_cards),
+            },
+            max_prompt_bytes=max_prompt_bytes,
+        )
+        if status_prompt is None:
+            raise ValueError(f"live Battlegrounds {relationship} opponent status exceeds delivery boundary")
+        segments.append((status_segment, status_prompt))
+
+    # The host selects one oldest callback prefix under a shared budget. Keep the
+    # complete phase-critical areas together before optional opponent history.
+    if battlegrounds.get("phase") == "combat":
+        append_opponent("current")
+        append_area("warband", 7, 7)
+        append_opponent("last")
+        append_area("hand", 10, 10)
+        append_opponent("next")
+        append_area("shop", 7, 7)
+    else:
+        append_area("shop", 7, 7)
+        append_area("warband", 7, 7)
+        append_area("hand", 10, 10)
+        append_opponent("last")
+        append_opponent("current")
+        append_opponent("next")
+    return tuple(segments)
+
+
+def _constructed_live_delivery_prompt(
+    *,
+    segment: str,
+    observed_at: float,
+    state: Mapping[str, Any],
+    schema: str,
+) -> str:
+    return _LIVE_DELIVERY_PREFIX + json.dumps(
+        {
+            "segment": segment,
+            "of": 2,
+            "at": round(observed_at, 3),
+            "state": state,
+            "schema": schema,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _build_constructed_live_state_contexts(
+    public_state: Mapping[str, Any],
+    *,
+    observed_at: float,
+    max_prompt_bytes: int,
+) -> tuple[tuple[str, str], ...]:
+    constructed = public_state.get("constructed")
+    if not isinstance(constructed, Mapping):
+        raise ValueError("constructed state is not available")
+    player = constructed.get("player") if isinstance(constructed.get("player"), Mapping) else {}
+    opponent = (
+        constructed.get("opponent")
+        if isinstance(constructed.get("opponent"), Mapping)
+        else {}
+    )
+    player_board = player.get("board") if isinstance(player.get("board"), Mapping) else {}
+    opponent_board = (
+        opponent.get("board") if isinstance(opponent.get("board"), Mapping) else {}
+    )
+    revision = _live_revision(public_state, observed_at)
+    choice = _compact_choice(public_state.get("choice"))
+    core_payload = {
+        "revision": revision,
+        "segment": "core",
+        "mode": "constructed",
+        "phase": public_state.get("phase"),
+        "action_turn": public_state.get("turn"),
+        "round": public_state.get("round"),
+        "active_side": public_state.get("active_side"),
+        "variant": constructed.get("variant"),
+        "counts": {
+            "player_board": len(list(player_board.get("minions") or [])),
+            "opponent_board": len(list(opponent_board.get("minions") or [])),
+            "player_hand": int(
+                (player.get("hand") or {}).get("count")
+                if isinstance(player.get("hand"), Mapping)
+                else 0
+            ),
+        },
+        "complete_areas": [
+            "player_board",
+            "opponent_board",
+            *(
+                ["player_hand"]
+                if isinstance(player.get("hand"), Mapping)
+                and player["hand"].get("identities_complete") is True
+                else []
+            ),
+        ],
+        "card_fields": (
+            "board=[id,name,pos,atk,hp,kw,state];"
+            "hand=[id,name,pos,type,cost,kw,state];"
+            "type=m随s法w武l地h雄p技;"
+            "kw=t嘲d盾r生s潜w风W超p毒l吸u突c冲x亡b吼e免;"
+            "state=f冻s沉i免d休?其"
+        ),
+    }
+    core_prompt = _encode_live_delivery(
+        core_payload,
+        max_prompt_bytes=max_prompt_bytes,
+    )
+    if core_prompt is None:
+        raise ValueError("live constructed core exceeds delivery boundary")
+
+    common = {"revision": revision}
+    segments: list[tuple[str, str]] = [("core", core_prompt)]
+
+    def side_status(side: Mapping[str, Any]) -> dict[str, Any]:
+        hero = side.get("hero") if isinstance(side.get("hero"), Mapping) else {}
+        mana = side.get("mana") if isinstance(side.get("mana"), Mapping) else {}
+        hand = side.get("hand") if isinstance(side.get("hand"), Mapping) else {}
+        deck = side.get("deck") if isinstance(side.get("deck"), Mapping) else {}
+        secrets = side.get("secrets") if isinstance(side.get("secrets"), Mapping) else {}
+        payload = {
+            "hero": {
+                "id": hero.get("card_id"),
+                "name": _live_text(hero.get("name"), limit=24),
+                "health": hero.get("health"),
+                "armor": hero.get("armor"),
+                "effective_health": hero.get("effective_health"),
+            },
+            "mana": {
+                "available": mana.get("available"),
+                "maximum": mana.get("maximum"),
+            },
+            "hand_count": hand.get("count"),
+            "deck_count": deck.get("count"),
+            "secret_count": secrets.get("count"),
+        }
+        return payload
+
+    status_payload = {
+        **common,
+        "segment": "status",
+        "player": side_status(player),
+        "opponent": side_status(opponent),
+    }
+    if choice is not None:
+        status_payload["choice"] = {
+            "type": choice.get("choice_type"),
+            "min": choice.get("count_min"),
+            "max": choice.get("count_max"),
+            "option_count": choice.get("option_count"),
+        }
+    status_prompt = _encode_live_delivery(
+        status_payload,
+        max_prompt_bytes=max_prompt_bytes,
+    )
+    if status_prompt is None:
+        raise ValueError("live constructed status exceeds delivery boundary")
+    segments.append(("status", status_prompt))
+    areas: tuple[tuple[str, Any, bool | None, Any, int], ...] = (
+        (
+            "opponent_board",
+            opponent_board.get("minions"),
+            True,
+            _live_constructed_board_card,
+            7,
+        ),
+        (
+            "player_board",
+            player_board.get("minions"),
+            True,
+            _live_constructed_board_card,
+            7,
+        ),
+        (
+            "player_hand",
+            (player.get("hand") or {}).get("known_cards")
+            if isinstance(player.get("hand"), Mapping)
+            else [],
+            (player.get("hand") or {}).get("identities_complete")
+            if isinstance(player.get("hand"), Mapping)
+            else None,
+            _live_constructed_hand_card,
+            10,
+        ),
+    )
+    for area, cards, complete, card_builder, cards_per_segment in areas:
+        segments.extend(
+            _build_live_card_segments(
+                cards,
+                area=area,
+                common=common,
+                complete=complete,
+                max_prompt_bytes=max_prompt_bytes,
+                card_builder=card_builder,
+                cards_per_segment=cards_per_segment,
+                include_complete=False,
+                include_bounds=False,
+                include_area=False,
+            )
+        )
+    return tuple(segments)
 
 
 def _build_minimal_live_state_context(
@@ -1003,13 +1600,13 @@ def _build_minimal_live_state_context(
     raise ValueError("minimal live Hearthstone state exceeds max_prompt_bytes")
 
 
-def build_live_state_contexts(
+def build_live_state_segments(
     snapshot: GameSnapshot,
     *,
     observed_at: float | None = None,
     max_prompt_bytes: int = 900,
-) -> tuple[str, ...]:
-    """Build bounded, filtered live-state context for the active N.E.K.O role."""
+) -> tuple[tuple[str, str], ...]:
+    """Build named live-state segments that remain intact at the host boundary."""
     public_state = snapshot.to_public_dict()
     timestamp = time.time() if observed_at is None else float(observed_at)
     limit = int(max_prompt_bytes)
@@ -1021,12 +1618,38 @@ def build_live_state_contexts(
             observed_at=timestamp,
             max_prompt_bytes=limit,
         )
-    return (
+    if snapshot.mode == "constructed" and isinstance(
+        public_state.get("constructed"), Mapping
+    ):
+        return _build_constructed_live_state_contexts(
+            public_state,
+            observed_at=timestamp,
+            max_prompt_bytes=limit,
+        )
+    return ((
+        "core",
         _build_minimal_live_state_context(
             public_state,
             observed_at=timestamp,
             max_prompt_bytes=limit,
         ),
+    ),)
+
+
+def build_live_state_contexts(
+    snapshot: GameSnapshot,
+    *,
+    observed_at: float | None = None,
+    max_prompt_bytes: int = 900,
+) -> tuple[str, ...]:
+    """Compatibility wrapper returning only the segment text."""
+    return tuple(
+        text
+        for _segment, text in build_live_state_segments(
+            snapshot,
+            observed_at=observed_at,
+            max_prompt_bytes=max_prompt_bytes,
+        )
     )
 
 
@@ -1186,5 +1809,6 @@ __all__ = [
     "build_emotion_cue",
     "build_live_state_context",
     "build_live_state_contexts",
+    "build_live_state_segments",
     "build_llm_prompt",
 ]

@@ -3,8 +3,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import threading
 import time
+import urllib.parse
+import urllib.request
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping
@@ -19,13 +22,14 @@ from plugin.sdk.plugin import (
     message,
     neko_plugin,
     plugin_entry,
+    timer_interval,
     tr,
     ui,
     unwrap_or,
 )
 
 from .card_catalog import BattlegroundsCardCatalog
-from .commentary import build_live_state_contexts, build_llm_prompt
+from .commentary import build_llm_prompt
 from .config import CompanionConfig
 from .instructions import HEARTHSTONE_CONTEXT_INSTRUCTIONS, HEARTHSTONE_RESTORE_INSTRUCTIONS
 from .log_config import ensure_power_log_config
@@ -40,13 +44,45 @@ _CONFIG_SECTION = "hearthstone_companion"
 _BATTLEGROUNDS_STATS_KEY = "battlegrounds_stats_v1"
 _CHAT_QUIET_BYPASS_PRIORITY = 9
 _LLM_DELIVERY_MAX_CHARS = 1800
-_LIVE_STATE_DELIVERY_MAX_BYTES = 900
-_LIVE_STATE_SEGMENTS = ("core", "board", "hand")
-_AGENT_REPLY_MAX_CHARS = 1800
+# The host feeds Agent entry results back through a 200-token summary budget.
+# Keep replies materially below that limit without depending on host internals.
+_AGENT_REPLY_MAX_CHARS = 360
+_AGENT_REPLY_TARGET_TOKENS = 180
+_AGENT_REPLY_ESTIMATED_MAX_TOKENS = 170
+_LLM_TOOL_FOCUSED_MAX_BYTES = 4096
+_LLM_TOOL_STATE_MAX_BYTES = 2048
+_CONSTRUCTED_TOOL_FOCUSES = (
+    "overview",
+    "board",
+    "hand",
+    "opponent",
+    "choice",
+    "strategy",
+)
+_BATTLEGROUNDS_TOOL_FOCUSES = (
+    "overview",
+    "shop",
+    "economy",
+    "board",
+    "hand",
+    "choice",
+    "opponent",
+    "strategy",
+)
 _STATS_CLEAR_WRITE_TIMEOUT_SECONDS = 3.0
 _SHUTDOWN_THREAD_BUDGET_SECONDS = 0.4
 _SHUTDOWN_WRITER_BUDGET_SECONDS = 0.3
 _SHUTDOWN_CONFIG_RECONCILE_BUDGET_SECONDS = 0.25
+_LLM_TOOL_HEALTH_HTTP_TIMEOUT_SECONDS = 2.0
+_LLM_TOOL_REGISTRY_MAX_BYTES = 1024 * 1024
+_LLM_TOOL_HEALTH_RETRY_BASE_SECONDS = 5.0
+_LLM_TOOL_HEALTH_RETRY_MAX_SECONDS = 15.0
+_LLM_TOOL_CONFIRM_DELAYS_SECONDS = (0.2, 0.4)
+_DEFAULT_USER_PLUGIN_SERVER_PORT = 48916
+_LLM_TOOL_HANDLER_NAMES = {
+    "hearthstone_current_state": "hearthstone_current_state",
+    "hearthstone_battlegrounds_advice": "hearthstone_battlegrounds_advice",
+}
 _OVERLAY_RUNTIME_FIELDS = (
     "overlay_enabled",
     "overlay_window_titles",
@@ -383,6 +419,110 @@ def _battlegrounds_purchase_decision(
     return result
 
 
+def _main_server_tools_url() -> str:
+    raw_port = (
+        os.getenv("NEKO_MAIN_SERVER_PORT")
+        or os.getenv("MAIN_SERVER_PORT")
+        or "48911"
+    )
+    try:
+        port = int(raw_port)
+    except (TypeError, ValueError):
+        port = 48911
+    if not 1 <= port <= 65535:
+        port = 48911
+    return f"http://127.0.0.1:{port}/api/tools"
+
+
+def _fetch_main_tool_registry() -> dict[str, Any]:
+    request = urllib.request.Request(
+        _main_server_tools_url(),
+        headers={"Accept": "application/json"},
+        method="GET",
+    )
+    with urllib.request.urlopen(  # noqa: S310 - URL is fixed to loopback.
+        request,
+        timeout=_LLM_TOOL_HEALTH_HTTP_TIMEOUT_SECONDS,
+    ) as response:
+        payload = response.read(_LLM_TOOL_REGISTRY_MAX_BYTES + 1)
+    if len(payload) > _LLM_TOOL_REGISTRY_MAX_BYTES:
+        raise ValueError("main server tool registry response is too large")
+    decoded = json.loads(payload)
+    if not isinstance(decoded, dict):
+        raise TypeError("main server tool registry response must be an object")
+    return decoded
+
+
+def _user_plugin_server_port() -> int:
+    raw_port = os.getenv("NEKO_USER_PLUGIN_SERVER_PORT") or str(
+        _DEFAULT_USER_PLUGIN_SERVER_PORT
+    )
+    try:
+        port = int(raw_port)
+    except (TypeError, ValueError):
+        port = _DEFAULT_USER_PLUGIN_SERVER_PORT
+    if not 1 <= port <= 65535:
+        port = _DEFAULT_USER_PLUGIN_SERVER_PORT
+    return port
+
+
+def _is_loopback_tool_callback(value: Any, *, plugin_id: str, tool_name: str) -> bool:
+    try:
+        parsed = urllib.parse.urlsplit(str(value or ""))
+        hostname = str(parsed.hostname or "").casefold()
+        port = parsed.port
+    except (TypeError, ValueError):
+        return False
+    expected_path = f"/api/llm-tools/callback/{plugin_id}/{tool_name}"
+    return (
+        parsed.scheme == "http"
+        and hostname == "127.0.0.1"
+        and port == _user_plugin_server_port()
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.path == expected_path
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+def _missing_remote_llm_tools(
+    registry: Mapping[str, Any],
+    *,
+    expected_names: set[str],
+    expected_source: str,
+    plugin_id: str,
+) -> set[str]:
+    tools_by_role = registry.get("tools_by_role")
+    if registry.get("ok") is not True or not isinstance(tools_by_role, Mapping):
+        raise ValueError("main server tool registry response has an invalid shape")
+    if not tools_by_role:
+        return set(expected_names)
+
+    missing: set[str] = set()
+    for tools in tools_by_role.values():
+        if not isinstance(tools, list):
+            raise ValueError("main server role tool registry must be a list")
+        healthy_names = {
+            name
+            for name in expected_names
+            if any(
+                isinstance(item, Mapping)
+                and str(item.get("name") or "") == name
+                and str(item.get("source") or "") == expected_source
+                and item.get("is_remote") is True
+                and _is_loopback_tool_callback(
+                    item.get("callback_url"),
+                    plugin_id=plugin_id,
+                    tool_name=name,
+                )
+                for item in tools
+            )
+        }
+        missing.update(expected_names - healthy_names)
+    return missing
+
+
 def _capture_monitor(
     monitor: Any, *, timeout_seconds: float | None = None
 ) -> tuple[GameSnapshot, Any, int | None]:
@@ -455,6 +595,32 @@ _AGENT_KEYWORD_NAMES = (
     "battlecry",
     "magnetic",
     "elusive",
+    "lifesteal",
+    "rush",
+    "charge",
+)
+_AGENT_CONSTRUCTED_KEYWORD_CODES = (
+    ("t", "taunt"),
+    ("d", "divine_shield"),
+    ("r", "reborn"),
+    ("s", "stealth"),
+    ("w", "windfury"),
+    ("W", "mega_windfury"),
+    ("p", "poisonous"),
+    ("v", "venomous"),
+    ("l", "lifesteal"),
+    ("u", "rush"),
+    ("c", "charge"),
+    ("x", "deathrattle"),
+    ("b", "battlecry"),
+    ("m", "magnetic"),
+    ("e", "elusive"),
+)
+_AGENT_STATE_CODES = (
+    ("f", "frozen"),
+    ("s", "silenced"),
+    ("i", "immune"),
+    ("d", "dormant"),
 )
 
 
@@ -474,11 +640,34 @@ def _agent_scalar(value: Any) -> str:
     return _agent_text(value, limit=24) or "?"
 
 
-def _agent_card(card: Any) -> str:
+def _agent_atom(value: Any, *, limit: int = 28) -> str:
+    text = _agent_text(value, limit=limit)
+    for delimiter in ("|", ",", ";", "=", "/", "[", "]"):
+        text = text.replace(delimiter, " ")
+    return " ".join(text.split())
+
+
+def _agent_keyword_state(value: Any) -> tuple[list[str], bool]:
+    active: list[str] = []
+    unknown = False
+    if isinstance(value, Mapping):
+        for name in _AGENT_KEYWORD_NAMES:
+            current = value.get(name)
+            if current is True:
+                active.append(name)
+            elif current is None and name in value:
+                unknown = True
+    elif isinstance(value, (list, tuple)):
+        normalized = {str(item).strip().casefold() for item in value}
+        active.extend(name for name in _AGENT_KEYWORD_NAMES if name in normalized)
+    return active, unknown
+
+
+def _agent_card(card: Any, *, name_limit: int = 24) -> str:
     if not isinstance(card, Mapping):
         return "?"
     card_id = _agent_text(card.get("card_id"), limit=28) or "?"
-    name = _agent_text(card.get("name"), limit=24)
+    name = _agent_text(card.get("name"), limit=name_limit) if name_limit > 0 else ""
     identity = card_id if not name or name == card_id else f"{card_id}/{name}"
     raw_type = str(card.get("card_type") or "").upper()
     card_type = {
@@ -488,15 +677,7 @@ def _agent_card(card: Any) -> str:
         "TAVERN_SPELL": "BS",
     }.get(raw_type, raw_type or "?")
     keywords = card.get("keywords")
-    active_keywords: list[str] = []
-    keyword_unknown = False
-    if isinstance(keywords, Mapping):
-        for name in _AGENT_KEYWORD_NAMES:
-            value = keywords.get(name)
-            if value is True:
-                active_keywords.append(name)
-            elif value is None and name in keywords:
-                keyword_unknown = True
+    active_keywords, keyword_unknown = _agent_keyword_state(keywords)
     keyword_text = ",".join(active_keywords) or ("?" if keyword_unknown else "-")
     fields = [
         f"type={card_type}",
@@ -516,80 +697,455 @@ def _agent_card(card: Any) -> str:
         fields.append(f"pos={_agent_scalar(position)}")
     if "premium" in card:
         fields.append(f"golden={_agent_scalar(card.get('premium'))}")
-    if isinstance(keywords, Mapping):
+    if isinstance(keywords, (Mapping, list, tuple)):
         fields.append(f"kw={keyword_text}")
+    states = card.get("states")
+    if isinstance(states, (list, tuple)):
+        state_text = ",".join(
+            item
+            for item in (_agent_text(state, limit=24) for state in states)
+            if item
+        )
+        fields.append(f"state={state_text or '-'}")
     return f"{identity}[{','.join(fields)}]"
 
 
-def _agent_cards(value: Any, *, limit: int) -> str:
+def _agent_cards(value: Any, *, limit: int, name_limit: int = 24) -> str:
     if not isinstance(value, list):
         return "?"
-    cards = [_agent_card(item) for item in value[:limit]]
+    cards = [_agent_card(item, name_limit=name_limit) for item in value[:limit]]
     if len(value) > limit:
         cards.append(f"+{len(value) - limit}")
     return "|".join(cards) if cards else "-"
 
 
-def _agent_side(side: Any, *, include_hand: bool) -> str:
+def _agent_identity_list(value: Any, *, limit: int, name_limit: int) -> str:
+    if not isinstance(value, list):
+        return "?"
+    identities: list[str] = []
+    for raw_card in value[:limit]:
+        card = raw_card if isinstance(raw_card, Mapping) else {}
+        card_id = _agent_atom(card.get("card_id"), limit=28) or "?"
+        name = _agent_atom(card.get("name"), limit=name_limit) if name_limit else ""
+        identities.append(
+            card_id if not name or name == card_id else f"{card_id}~{name}"
+        )
+    if len(value) > limit:
+        identities.append(f"+{len(value) - limit}")
+    return ",".join(identities) if identities else "-"
+
+
+def _agent_reply_fits(value: str) -> bool:
+    if len(value) > _AGENT_REPLY_MAX_CHARS:
+        return False
+    ascii_count = sum(ord(char) < 128 for char in value)
+    non_ascii_count = len(value) - ascii_count
+    estimated_tokens = int(ascii_count * 0.82 + non_ascii_count * 1.1 + 0.999)
+    return estimated_tokens <= _AGENT_REPLY_ESTIMATED_MAX_TOKENS
+
+
+def _agent_identity_reply_fits(value: str) -> bool:
+    if len(value) > _AGENT_REPLY_MAX_CHARS:
+        return False
+    ascii_count = sum(ord(char) < 128 for char in value)
+    non_ascii_count = len(value) - ascii_count
+    estimated_tokens = int(ascii_count * 0.60 + non_ascii_count + 0.999)
+    return estimated_tokens <= _AGENT_REPLY_ESTIMATED_MAX_TOKENS
+
+
+def _focused_tool_state_fits(value: str) -> bool:
+    return len(value.encode("utf-8")) <= _LLM_TOOL_STATE_MAX_BYTES
+
+
+def _agent_compact_battlegrounds_cards(
+    value: Any,
+    *,
+    limit: int,
+    name_limit: int,
+    include_position: bool = True,
+) -> tuple[str, set[str]]:
+    if not isinstance(value, list):
+        return "?", set()
+    keyword_codes = {
+        name: code for code, name in _AGENT_CONSTRUCTED_KEYWORD_CODES
+    }
+    encoded: list[str] = []
+    used_keywords: set[str] = set()
+    for raw_card in value[:limit]:
+        card = raw_card if isinstance(raw_card, Mapping) else {}
+        card_id = _agent_atom(card.get("card_id"), limit=28) or "?"
+        name = _agent_atom(card.get("name"), limit=name_limit) if name_limit else ""
+        identity = card_id if not name or name == card_id else f"{card_id}~{name}"
+        raw_type = str(card.get("card_type") or "").upper()
+        card_type = {
+            "MINION": "M",
+            "SPELL": "S",
+            "BATTLEGROUND_SPELL": "BS",
+            "TAVERN_SPELL": "BS",
+        }.get(raw_type, raw_type or "?")
+        active_keywords, keyword_unknown = _agent_keyword_state(card.get("keywords"))
+        codes = "".join(
+            keyword_codes[name]
+            for name in active_keywords
+            if name in keyword_codes
+        )
+        used_keywords.update(active_keywords)
+        if keyword_unknown:
+            codes = f"{codes}?" if codes else "?"
+        fields = [
+            identity,
+            card_type,
+            _agent_scalar(card.get("current_cost", card.get("cost"))),
+            _agent_scalar(card.get("attack")),
+            _agent_scalar(card.get("health")),
+            _agent_scalar(card.get("tier")),
+        ]
+        if include_position:
+            fields.append(
+                _agent_scalar(card.get("position", card.get("zone_position")))
+            )
+        fields.extend(
+            (
+                _agent_scalar(card.get("premium")),
+                codes or "-",
+            )
+        )
+        encoded.append("/".join(fields))
+    if len(value) > limit:
+        encoded.append(f"+{len(value) - limit}")
+    return ",".join(encoded) if encoded else "-", used_keywords
+
+
+def _agent_sparse_battlegrounds_cards(
+    value: Any,
+    *,
+    limit: int,
+    name_limit: int,
+) -> tuple[str, str, str, set[str]]:
+    if not isinstance(value, list):
+        return "?", "?/?/?", "", set()
+    keyword_codes = {
+        name: code for code, name in _AGENT_CONSTRUCTED_KEYWORD_CODES
+    }
+    encoded: list[str] = []
+    types: list[str] = []
+    costs: list[str] = []
+    goldens: list[str] = []
+    keyword_sets: list[str] = []
+    used_keywords: set[str] = set()
+    for raw_card in value[:limit]:
+        card = raw_card if isinstance(raw_card, Mapping) else {}
+        card_id = _agent_atom(card.get("card_id"), limit=28) or "?"
+        name = _agent_atom(card.get("name"), limit=name_limit) if name_limit else ""
+        identity = card_id if not name or name == card_id else f"{card_id}~{name}"
+        raw_type = str(card.get("card_type") or "").upper()
+        card_type = {
+            "MINION": "M",
+            "SPELL": "S",
+            "BATTLEGROUND_SPELL": "BS",
+            "TAVERN_SPELL": "BS",
+        }.get(raw_type, raw_type or "?")
+        active_keywords, keyword_unknown = _agent_keyword_state(card.get("keywords"))
+        keyword_text = "".join(
+            keyword_codes[name]
+            for name in active_keywords
+            if name in keyword_codes
+        )
+        used_keywords.update(active_keywords)
+        if keyword_unknown:
+            keyword_text = f"{keyword_text}?" if keyword_text else "?"
+        encoded.append(
+            "/".join(
+                (
+                    identity,
+                    _agent_scalar(card.get("attack")),
+                    _agent_scalar(card.get("health")),
+                    _agent_scalar(card.get("tier")),
+                )
+            )
+        )
+        types.append(card_type)
+        costs.append(_agent_scalar(card.get("current_cost", card.get("cost"))))
+        goldens.append(_agent_scalar(card.get("premium")))
+        keyword_sets.append(keyword_text or "-")
+
+    def most_common(items: list[str]) -> str:
+        if not items:
+            return "?"
+        counts = {item: items.count(item) for item in items}
+        return max(counts, key=lambda item: (counts[item], -items.index(item)))
+
+    defaults = (
+        most_common(types),
+        most_common(costs),
+        most_common(goldens),
+        most_common(keyword_sets),
+    )
+    overrides: list[str] = []
+    for position, values in enumerate(
+        zip(types, costs, goldens, keyword_sets),
+        start=1,
+    ):
+        for field, value, default in zip(("T", "C", "G", "K"), values, defaults):
+            if value != default:
+                overrides.append(f"{position}{field}:{value}")
+    if len(value) > limit:
+        overrides.append(f"more:{len(value) - limit}")
+    return (
+        ",".join(encoded) if encoded else "-",
+        "/".join(defaults),
+        ",".join(overrides),
+        used_keywords,
+    )
+
+
+def _agent_side_summary(side: Any) -> str:
     if not isinstance(side, Mapping):
         return "?"
     hero = side.get("hero") if isinstance(side.get("hero"), Mapping) else {}
     mana = side.get("mana") if isinstance(side.get("mana"), Mapping) else {}
     hand = side.get("hand") if isinstance(side.get("hand"), Mapping) else {}
-    board = side.get("board") if isinstance(side.get("board"), Mapping) else {}
     parts = [
         f"hp={_agent_scalar(hero.get('health'))}+{_agent_scalar(hero.get('armor', 0))}",
         f"mana={_agent_scalar(mana.get('available'))}/{_agent_scalar(mana.get('maximum'))}",
         f"hand={_agent_scalar(hand.get('count'))}",
-        f"board={_agent_cards(board.get('minions'), limit=7)}",
     ]
-    if include_hand:
-        parts.insert(
-            3,
-            f"hand_complete={_agent_scalar(hand.get('identities_complete'))}",
-        )
-        parts.insert(4, f"cards={_agent_cards(hand.get('known_cards'), limit=10)}")
     return ",".join(parts)
 
 
-def _agent_constructed_reply(payload: Mapping[str, Any]) -> str:
+def _agent_constructed_reply(
+    payload: Mapping[str, Any],
+    *,
+    focus: str = "auto",
+    focused_tool: bool = False,
+) -> str:
     if not payload.get("available"):
         return (
             "HS_QUERY mode=constructed;available=0;"
             f"reason={_agent_text(payload.get('reason') or 'no_live_game_state')}"
         )
     state = payload.get("state") if isinstance(payload.get("state"), Mapping) else {}
-    constructed = (
-        state.get("constructed")
-        if isinstance(state.get("constructed"), Mapping)
-        else {}
-    )
-    freshness = (
-        payload.get("freshness")
-        if isinstance(payload.get("freshness"), Mapping)
-        else {}
-    )
-    choice = state.get("choice") if isinstance(state.get("choice"), Mapping) else None
-    parts = [
-        "HS_QUERY mode=constructed",
-        "available=1",
-        f"source={_agent_scalar(freshness.get('source'))}",
-        f"age={_agent_scalar(freshness.get('age_seconds'))}",
-        f"phase={_agent_scalar(state.get('phase'))}",
+    constructed = state.get("constructed")
+    constructed = constructed if isinstance(constructed, Mapping) else {}
+    player = constructed.get("player")
+    player = player if isinstance(player, Mapping) else {}
+    opponent = constructed.get("opponent")
+    opponent = opponent if isinstance(opponent, Mapping) else {}
+    player_board = player.get("board")
+    player_board = player_board if isinstance(player_board, Mapping) else {}
+    opponent_board = opponent.get("board")
+    opponent_board = opponent_board if isinstance(opponent_board, Mapping) else {}
+    player_hand = player.get("hand")
+    player_hand = player_hand if isinstance(player_hand, Mapping) else {}
+    choice = state.get("choice")
+    choice = choice if isinstance(choice, Mapping) else None
+    selected_focus = str(focus or "auto")
+    if selected_focus == "overview":
+        selected_focus = "auto"
+    elif selected_focus == "auto" and choice is not None:
+        selected_focus = "choice"
+
+    core = [
+        "HS_C",
         f"round={_agent_scalar(state.get('round'))}",
         f"turn={_agent_scalar(state.get('turn'))}",
         f"active={_agent_scalar(state.get('active_side'))}",
-        "legal_actions=partial",
-        f"player={_agent_side(constructed.get('player'), include_hand=True)}",
-        f"opponent={_agent_side(constructed.get('opponent'), include_hand=False)}",
     ]
-    if choice is not None:
-        parts.append(
-            "choice="
-            f"{_agent_scalar(choice.get('choice_type'))}:"
-            f"{_agent_cards(choice.get('options'), limit=8)}"
+    keyword_codes = {
+        name: code for code, name in _AGENT_CONSTRUCTED_KEYWORD_CODES
+    }
+    state_codes = {name: code for code, name in _AGENT_STATE_CODES}
+    reply_fits = _focused_tool_state_fits if focused_tool else _agent_reply_fits
+
+    def compact_cards(
+        value: Any,
+        *,
+        limit: int,
+        name_limit: int,
+        hand_shape: bool,
+    ) -> tuple[str, set[str], set[str]]:
+        if not isinstance(value, list):
+            return "?", set(), set()
+        encoded: list[str] = []
+        used_keywords: set[str] = set()
+        used_states: set[str] = set()
+        for raw_card in value[:limit]:
+            card = raw_card if isinstance(raw_card, Mapping) else {}
+            card_id = _agent_atom(card.get("card_id"), limit=28) or "?"
+            name = _agent_atom(card.get("name"), limit=name_limit) if name_limit else ""
+            identity = card_id if not name or name == card_id else f"{card_id}~{name}"
+            active_keywords, keyword_unknown = _agent_keyword_state(card.get("keywords"))
+            keyword_text = "".join(
+                keyword_codes[name]
+                for name in active_keywords
+                if name in keyword_codes
+            )
+            used_keywords.update(active_keywords)
+            if keyword_unknown:
+                keyword_text = f"{keyword_text}?" if keyword_text else "?"
+            raw_states = card.get("states")
+            normalized_states = (
+                [str(item).strip().casefold() for item in raw_states]
+                if isinstance(raw_states, (list, tuple))
+                else []
+            )
+            used_states.update(normalized_states)
+            state_text = "".join(
+                state_codes[name] for name in normalized_states if name in state_codes
+            )
+            if any(name not in state_codes for name in normalized_states):
+                state_text = f"{state_text}?" if state_text else "?"
+            if hand_shape:
+                raw_type = str(card.get("card_type") or "").upper()
+                fields = [
+                    identity,
+                    {
+                        "MINION": "M",
+                        "SPELL": "S",
+                        "WEAPON": "W",
+                        "LOCATION": "L",
+                    }.get(raw_type, raw_type or "?"),
+                    _agent_scalar(card.get("current_cost", card.get("cost"))),
+                    _agent_scalar(card.get("zone_position")),
+                    keyword_text or "-",
+                    state_text or "-",
+                ]
+            else:
+                fields = [
+                    identity,
+                    _agent_scalar(card.get("attack")),
+                    _agent_scalar(card.get("health")),
+                    _agent_scalar(card.get("zone_position")),
+                    keyword_text or "-",
+                    state_text or "-",
+                ]
+            encoded.append("/".join(fields))
+        if len(value) > limit:
+            encoded.append(f"+{len(value) - limit}")
+        return ",".join(encoded) if encoded else "-", used_keywords, used_states
+
+    def legends(keywords: set[str], states: set[str]) -> list[str]:
+        result: list[str] = []
+        keyword_labels = {
+            "divine_shield": "shield",
+            "mega_windfury": "mega_wind",
+            "poisonous": "poison",
+        }
+        if keywords:
+            result.append(
+                "K="
+                + ",".join(
+                    f"{code}:{keyword_labels.get(name, name)}"
+                    for code, name in _AGENT_CONSTRUCTED_KEYWORD_CODES
+                    if name in keywords
+                )
+            )
+        if states:
+            result.append(
+                "S="
+                + ",".join(
+                    f"{code}:{name}"
+                    for code, name in _AGENT_STATE_CODES
+                    if name in states
+                )
+            )
+        return result
+
+    if selected_focus in {"auto", "overview"}:
+        player_hero = player.get("hero") if isinstance(player.get("hero"), Mapping) else {}
+        opponent_hero = (
+            opponent.get("hero") if isinstance(opponent.get("hero"), Mapping) else {}
         )
-    return ";".join(parts)
+        mana = player.get("mana") if isinstance(player.get("mana"), Mapping) else {}
+        return ";".join(
+            [
+                *core,
+                f"phase={_agent_scalar(state.get('phase'))}",
+                f"player_hp={_agent_scalar(player_hero.get('health'))}+{_agent_scalar(player_hero.get('armor', 0))}",
+                f"mana={_agent_scalar(mana.get('available'))}/{_agent_scalar(mana.get('maximum'))}",
+                f"hand={_agent_scalar(player_hand.get('count'))}",
+                f"player_board={len(list(player_board.get('minions') or []))}",
+                f"opponent_hp={_agent_scalar(opponent_hero.get('health'))}+{_agent_scalar(opponent_hero.get('armor', 0))}",
+                f"opponent_board={len(list(opponent_board.get('minions') or []))}",
+                "legal_actions=partial",
+            ]
+        )
+
+    if selected_focus == "hand":
+        cards = player_hand.get("known_cards")
+        target_label = "player_hand"
+        schema = "id~name/type/actual_cost/pos/kw/state"
+        limit = 10
+        hand_shape = True
+        extra = [
+            f"q={_agent_scalar(player_hand.get('identities_complete'))}"
+        ]
+    elif selected_focus == "choice":
+        cards = choice.get("options") if choice is not None else []
+        target_label = "choice"
+        schema = "id~name/type/actual_cost/pos/kw/state"
+        limit = 8
+        hand_shape = True
+        extra = [
+            f"choice_type={_agent_scalar(choice.get('choice_type') if choice else None)}"
+        ]
+    else:
+        target_side = opponent if selected_focus == "opponent" else player
+        target_board = opponent_board if selected_focus == "opponent" else player_board
+        target_hero = (
+            target_side.get("hero")
+            if isinstance(target_side.get("hero"), Mapping)
+            else {}
+        )
+        cards = target_board.get("minions")
+        target_label = "opponent_board" if selected_focus == "opponent" else "player_board"
+        schema = "id~name/atk/hp/pos/kw/state"
+        limit = 7
+        hand_shape = False
+        extra = [
+            f"hp={_agent_scalar(target_hero.get('health'))}+{_agent_scalar(target_hero.get('armor', 0))}"
+        ]
+
+    variants = (
+        ((12, True), (8, False), (4, False), (0, False))
+        if focused_tool
+        else ((12, True), (8, False), (4, False))
+    )
+    for name_limit, include_legends in variants:
+        rendered, used_keywords, used_states = compact_cards(
+            cards,
+            limit=limit,
+            name_limit=name_limit,
+            hand_shape=hand_shape,
+        )
+        rendered_schema = schema if name_limit else schema.replace("~name", "")
+        parts = [*core, *extra]
+        if include_legends:
+            parts.extend(legends(used_keywords, used_states))
+        parts.append(f"{target_label}[{rendered_schema}]={rendered}")
+        candidate = ";".join(parts)
+        if reply_fits(candidate):
+            return candidate
+
+    for name_limit in (12, 8, 4, 0):
+        identity = "id~name" if name_limit else "id"
+        compact_label = {
+            "opponent_board": "O",
+            "player_board": "P",
+            "player_hand": "H",
+            "choice": "C",
+        }.get(target_label, target_label)
+        candidate = ";".join(
+            [
+                "HS_C",
+                f"{compact_label}[{identity}]="
+                + _agent_identity_list(cards, limit=limit, name_limit=name_limit),
+                "omitted=details",
+            ]
+        )
+        if reply_fits(candidate):
+            return candidate
+    return "HS_QUERY;available=1;omitted=oversize_identities"
 
 
 def _agent_catalog_rules(payload: Mapping[str, Any], cards: Any) -> str:
@@ -598,20 +1154,32 @@ def _agent_catalog_rules(payload: Mapping[str, Any], cards: Any) -> str:
         if isinstance(payload.get("card_catalog"), Mapping)
         else {}
     )
-    facts = catalog.get("cards") if isinstance(catalog.get("cards"), Mapping) else {}
+    facts = catalog.get("cards") if isinstance(catalog.get("cards"), Mapping) else None
+    if not isinstance(facts, Mapping):
+        facts = (
+            catalog.get("observed_card_facts")
+            if isinstance(catalog.get("observed_card_facts"), Mapping)
+            else {}
+        )
     if not isinstance(cards, list):
         return ""
     rules: list[str] = []
-    for card in cards[:7]:
+    seen_card_ids: set[str] = set()
+    for card in cards:
         if not isinstance(card, Mapping):
             continue
         card_id = str(card.get("card_id") or "")
+        if not card_id or card_id in seen_card_ids:
+            continue
+        seen_card_ids.add(card_id)
         fact = facts.get(card_id) if isinstance(facts, Mapping) else None
         if not isinstance(fact, Mapping):
             continue
         rules_text = _agent_text(fact.get("rules_text"), limit=72)
         if rules_text:
             rules.append(f"{_agent_text(card_id, limit=28)}={rules_text}")
+        if len(rules) >= 7:
+            break
     return "|".join(rules)
 
 
@@ -627,8 +1195,8 @@ def _agent_capabilities(payload: Mapping[str, Any]) -> str:
         ("specific_purchase_advice", "sequence"),
         ("upgrade_affordability", "level"),
         ("refresh_advice", "refresh"),
-        ("positioning_advice", "position"),
-        ("choice_advice", "choice"),
+        ("specific_positioning_advice", "position"),
+        ("current_choice_comparison", "choice"),
         ("combat_commentary", "combat"),
     )
     statuses: list[str] = []
@@ -649,13 +1217,21 @@ def _agent_capabilities(payload: Mapping[str, Any]) -> str:
 
 
 def _agent_battlegrounds_reply(
-    payload: Mapping[str, Any], *, focus: str = "auto"
+    payload: Mapping[str, Any],
+    *,
+    focus: str = "auto",
+    opponent_relation: str = "auto",
+    focused_tool: bool = False,
 ) -> str:
     if not payload.get("available"):
         return (
             "HS_QUERY mode=battlegrounds;available=0;"
             f"reason={_agent_text(payload.get('reason') or 'no_live_battlegrounds_state')}"
         )
+    reply_fits = _focused_tool_state_fits if focused_tool else _agent_reply_fits
+    identity_reply_fits = (
+        _focused_tool_state_fits if focused_tool else _agent_identity_reply_fits
+    )
     topic = str(payload.get("topic") or "current_strategy")
     if topic != "current_strategy":
         selected = {
@@ -663,14 +1239,15 @@ def _agent_battlegrounds_reply(
             "hero_performance": payload.get("hero_performance"),
             "post_game": payload.get("current_public_state"),
         }.get(topic)
-        return (
+        prefix = (
             "HS_QUERY mode=battlegrounds;available=1;"
-            f"topic={_agent_text(topic)};data="
-            + _agent_text(
-                json.dumps(selected, ensure_ascii=False, separators=(",", ":")),
-                limit=900,
-            )
+            f"topic={_agent_text(topic)}"
         )
+        encoded = json.dumps(selected, ensure_ascii=False, separators=(",", ":"))
+        candidate = f"{prefix};data={encoded}"
+        if reply_fits(candidate):
+            return candidate
+        return f"{prefix};data_chars={len(encoded)};omitted=oversize_topic_payload"
 
     state = (
         payload.get("current_public_state")
@@ -686,84 +1263,340 @@ def _agent_battlegrounds_reply(
             "combat": "board",
         }.get(phase, "board")
     areas = state.get("areas") if isinstance(state.get("areas"), Mapping) else {}
-    complete_areas = [
-        name
-        for name in ("shop", "hand", "warband", "economy", "choice")
-        if isinstance(areas.get(name), Mapping) and areas[name].get("complete") is True
+    core = [
+        "HS_BG",
+        f"r={_agent_scalar(state.get('round'))}",
     ]
-    parts = [
-        "HS_QUERY mode=battlegrounds",
-        "available=1",
-        "source=live",
-        f"phase={_agent_scalar(phase)}",
-        f"round={_agent_scalar(state.get('round'))}",
-        f"gold={_agent_scalar(state.get('gold'))}/{_agent_scalar(state.get('max_gold'))}",
-        f"tier={_agent_scalar(state.get('tavern_tier'))}",
-        f"frozen={_agent_scalar(state.get('frozen'))}",
-        f"refresh={_agent_scalar(state.get('refresh_cost'))}",
-        f"upgrade={_agent_scalar(state.get('upgrade_cost'))}",
-        f"complete={','.join(complete_areas) or '-'}",
-        f"caps={_agent_capabilities(payload)}",
-    ]
-    if selected_focus == "choice":
-        heroes = state.get("hero_choices")
-        if isinstance(heroes, list) and heroes:
-            parts.append(
-                "heroes="
-                + "|".join(
-                    f"{_agent_text(item.get('card_id'), limit=28)}/{_agent_text(item.get('name'), limit=24)}"
-                    for item in heroes[:8]
+
+    capability_groups = {
+        "shop": (
+            ("shop_card_priority_advice", "shop"),
+            ("purchase_affordability", "buy"),
+            ("specific_purchase_advice", "sequence"),
+            ("upgrade_affordability", "level"),
+            ("refresh_advice", "refresh"),
+        ),
+        "economy": (
+            ("purchase_affordability", "buy"),
+            ("upgrade_affordability", "level"),
+            ("refresh_advice", "refresh"),
+        ),
+        "board": (("specific_positioning_advice", "position"),),
+        "opponent": (("combat_commentary", "combat"),),
+        "choice": (("current_choice_comparison", "choice"),),
+        "hand": (("specific_purchase_advice", "sequence"),),
+    }
+
+    def evidence_gate() -> list[str]:
+        capabilities = payload.get("capabilities")
+        capabilities = capabilities if isinstance(capabilities, Mapping) else {}
+        blocked: list[str] = []
+        missing: list[str] = []
+        for key, label in capability_groups.get(selected_focus, ()):
+            value = capabilities.get(key)
+            if not isinstance(value, Mapping):
+                continue
+            if not value.get("available"):
+                blocked.append(label)
+            for item in list(value.get("missing_evidence") or []):
+                atom = _agent_atom(item, limit=32)
+                if atom and atom not in missing:
+                    missing.append(atom)
+        result = [f"blocked={','.join(blocked)}"] if blocked else []
+        if missing:
+            result.append(f"missing={','.join(missing[:3])}")
+        return result
+
+    target_cards: Any = []
+    target_label = selected_focus
+    limit = 7
+    extra: list[str] = []
+    area_name = selected_focus
+
+    if selected_focus == "overview":
+        return ";".join(
+            [
+                *core,
+                f"phase={_agent_scalar(phase)}",
+                f"g={_agent_scalar(state.get('gold'))}/{_agent_scalar(state.get('max_gold'))}",
+                f"t={_agent_scalar(state.get('tavern_tier'))}",
+                f"shop={len(list(state.get('shop') or []))}",
+                f"warband={len(list(state.get('warband') or []))}",
+                f"hand={len(list(state.get('hand') or []))}",
+            ]
+        )
+    if selected_focus == "economy":
+        return ";".join(
+            [
+                *core,
+                f"phase={_agent_scalar(phase)}",
+                f"g={_agent_scalar(state.get('gold'))}/{_agent_scalar(state.get('max_gold'))}",
+                f"t={_agent_scalar(state.get('tavern_tier'))}",
+                f"f={_agent_scalar(state.get('frozen'))}",
+                f"rf={_agent_scalar(state.get('refresh_cost'))}",
+                f"up={_agent_scalar(state.get('upgrade_cost'))}",
+                *evidence_gate(),
+            ]
+        )
+
+    if selected_focus == "shop":
+        target_cards = state.get("shop")
+        target_label = "shop"
+        area_name = "shop"
+        extra = [
+            f"g={_agent_scalar(state.get('gold'))}/{_agent_scalar(state.get('max_gold'))}",
+            f"t={_agent_scalar(state.get('tavern_tier'))}",
+            f"f={_agent_scalar(state.get('frozen'))}",
+            f"rf={_agent_scalar(state.get('refresh_cost'))}",
+            f"up={_agent_scalar(state.get('upgrade_cost'))}",
+        ]
+    elif selected_focus == "hand":
+        target_cards = state.get("hand")
+        target_label = "hand"
+        area_name = "hand"
+        limit = 10
+        extra = [
+            f"g={_agent_scalar(state.get('gold'))}/{_agent_scalar(state.get('max_gold'))}"
+        ]
+    elif selected_focus == "choice":
+        current_choice = state.get("current_choice")
+        current_choice = current_choice if isinstance(current_choice, Mapping) else {}
+        target_cards = current_choice.get("options")
+        target_label = "choice"
+        area_name = "choice"
+        limit = 8
+        extra = [f"choice={_agent_scalar(current_choice.get('choice_type'))}"]
+        if not isinstance(target_cards, list) or not target_cards:
+            heroes = state.get("hero_choices")
+            hero_ids = (
+                ",".join(
+                    "~".join(
+                        part
+                        for part in (
+                            _agent_atom(item.get("card_id"), limit=28),
+                            _agent_atom(item.get("name"), limit=12),
+                        )
+                        if part
+                    )
+                    for item in list(heroes or [])[:8]
                     if isinstance(item, Mapping)
                 )
+                if isinstance(heroes, list)
+                else "?"
             )
-        choice = state.get("current_choice")
-        if isinstance(choice, Mapping):
-            parts.append(
-                f"choice={_agent_scalar(choice.get('choice_type'))}:"
-                f"{_agent_cards(choice.get('options'), limit=8)}"
+            return ";".join(
+                [
+                    *core,
+                    *extra,
+                    "cards=id~name",
+                    f"heroes={hero_ids or '-'}",
+                ]
             )
-            rules = _agent_catalog_rules(payload, choice.get("options"))
-            if rules:
-                parts.append(f"rules={rules}")
     elif selected_focus == "opponent":
         opponents = state.get("opponents")
-        parts.append(
-            "opponents="
-            + _agent_text(
-                json.dumps(opponents, ensure_ascii=False, separators=(",", ":")),
-                limit=1100,
-            )
+        opponents = opponents if isinstance(opponents, Mapping) else {}
+        requested_relation = str(opponent_relation or "auto")
+        if requested_relation not in {"current", "next", "last"} or not isinstance(
+            opponents.get(requested_relation), Mapping
+        ):
+            requested_relation = "auto"
+        observed_last = opponents.get("last")
+        observed_last = observed_last if isinstance(observed_last, Mapping) else {}
+        observed_last_board = observed_last.get("board")
+        observed_last_board = (
+            observed_last_board if isinstance(observed_last_board, Mapping) else {}
         )
-    elif selected_focus == "board":
-        parts.append(f"warband={_agent_cards(state.get('warband'), limit=7)}")
-        opponents = state.get("opponents")
-        if isinstance(opponents, Mapping):
-            current = opponents.get("current")
-            if isinstance(current, Mapping):
-                board = current.get("board") if isinstance(current.get("board"), Mapping) else {}
-                parts.append(
-                    "current_opponent="
-                    f"hero:{_agent_text((current.get('hero') or {}).get('name') if isinstance(current.get('hero'), Mapping) else '', limit=24)},"
-                    f"hp:{_agent_scalar(current.get('effective_health'))},"
-                    f"board:{_agent_cards(board.get('minions'), limit=7)}"
+        relation = requested_relation if requested_relation != "auto" else next(
+            (
+                name
+                for name in (
+                    "current",
+                    "last" if list(observed_last_board.get("minions") or []) else "next",
+                    "next",
+                    "last",
                 )
+                if isinstance(opponents.get(name), Mapping)
+            ),
+            "current",
+        )
+        observed = opponents.get(relation)
+        observed = observed if isinstance(observed, Mapping) else {}
+        hero = observed.get("hero")
+        hero = hero if isinstance(hero, Mapping) else {}
+        board = observed.get("board")
+        board = board if isinstance(board, Mapping) else {}
+        target_cards = board.get("minions")
+        target_label = f"{relation}_opponent_board"
+        area_name = "opponent"
+        extra = [
+            f"rel={relation}",
+            f"hero={_agent_atom(hero.get('card_id'), limit=28) or '?'}",
+            f"hp={_agent_scalar(observed.get('effective_health'))}",
+            f"t={_agent_scalar(observed.get('tavern_tier'))}",
+            f"seen_r={_agent_scalar(board.get('observed_round'))}",
+        ]
     else:
-        shop = state.get("shop")
-        parts.append(f"shop={_agent_cards(shop, limit=7)}")
-        rules = _agent_catalog_rules(payload, shop)
-        if rules:
-            parts.append(f"rules={rules}")
-        parts.append(f"warband={_agent_cards(state.get('warband'), limit=7)}")
-        parts.append(f"hand={_agent_cards(state.get('hand'), limit=10)}")
-    return ";".join(parts)
+        selected_focus = "board"
+        target_cards = state.get("warband")
+        target_label = "warband"
+        area_name = "warband"
+        extra = [
+            f"g={_agent_scalar(state.get('gold'))}/{_agent_scalar(state.get('max_gold'))}",
+            f"t={_agent_scalar(state.get('tavern_tier'))}",
+        ]
+
+    area = areas.get(area_name)
+    area = area if isinstance(area, Mapping) else {}
+    completeness = f"q={_agent_scalar(area.get('complete'))}"
+    gate = evidence_gate()
+
+    target_count = len(target_cards) if isinstance(target_cards, list) else 0
+    if target_count > 3 and not focused_tool:
+        compact_label = {
+            "shop": "S",
+            "hand": "H",
+            "warband": "W",
+            "current_opponent_board": "O",
+            "next_opponent_board": "O",
+            "last_opponent_board": "O",
+            "choice": "C",
+        }.get(target_label, target_label)
+        for name_limit in (12, 8, 4):
+            rendered, defaults, overrides, _used_keywords = (
+                _agent_sparse_battlegrounds_cards(
+                    target_cards,
+                    limit=limit,
+                    name_limit=name_limit,
+                )
+            )
+            parts = [
+                *core,
+                *extra,
+                completeness,
+                *gate,
+                f"{compact_label}={rendered}",
+                f"D={defaults}",
+            ]
+            if overrides:
+                parts.append(f"X={overrides}")
+            candidate = ";".join(parts)
+            if reply_fits(candidate):
+                return candidate
+
+    variants = (
+        ((12, True), (8, False), (4, False), (0, False))
+        if focused_tool
+        else (((12, True), (8, False), (4, False)) if target_count <= 3 else ())
+    )
+    for name_limit, include_legend in variants:
+        ordered_shop = selected_focus == "shop"
+        rendered, used_keywords = _agent_compact_battlegrounds_cards(
+            target_cards,
+            limit=limit,
+            name_limit=name_limit,
+            include_position=not ordered_shop,
+        )
+        identity = "id~name" if name_limit else "id"
+        card_schema = f"{identity}/type/cost/atk/hp/tier"
+        if not ordered_shop:
+            card_schema += "/pos"
+        card_schema += "/golden/kw"
+        schema_label = target_label
+        parts = [
+            *core,
+            *extra,
+            completeness,
+            *gate,
+        ]
+        if include_legend and used_keywords:
+            parts.append(
+                "K="
+                + ",".join(
+                    f"{code}:{'shield' if name == 'divine_shield' else name}"
+                    for code, name in _AGENT_CONSTRUCTED_KEYWORD_CODES
+                    if name in used_keywords
+                )
+            )
+        parts.append(f"{schema_label}[{card_schema}]={rendered}")
+        candidate = ";".join(parts)
+        if reply_fits(candidate):
+            return candidate
+
+    for name_limit in (12, 8, 4, 0):
+        identity = "id~name" if name_limit else "id"
+        compact_label = {
+            "shop": "S",
+            "hand": "H",
+            "warband": "W",
+            "current_opponent_board": "O",
+            "next_opponent_board": "O",
+            "last_opponent_board": "O",
+            "choice": "C",
+        }.get(target_label, target_label)
+        decision_fields: list[str] = []
+        if selected_focus == "shop" and isinstance(target_cards, list):
+            decision_fields.append(
+                "cost="
+                + "/".join(
+                    _agent_scalar(card.get("current_cost", card.get("cost")))
+                    for card in target_cards[:limit]
+                    if isinstance(card, Mapping)
+                )
+            )
+        candidate = ";".join(
+            [
+                "HS_BG",
+                f"r={_agent_scalar(state.get('round'))}",
+                *extra,
+                completeness,
+                *gate,
+                f"{compact_label}[{identity}]="
+                + _agent_identity_list(
+                    target_cards,
+                    limit=limit,
+                    name_limit=name_limit,
+                ),
+                *decision_fields,
+                "omitted=card_details",
+            ]
+        )
+        if reply_fits(candidate):
+            return candidate
+        minimal_candidate = ";".join(
+            [
+                "HS_BG",
+                *gate,
+                f"{compact_label}[{identity}]="
+                + _agent_identity_list(
+                    target_cards,
+                    limit=limit,
+                    name_limit=name_limit,
+                ),
+                "omitted=details",
+            ]
+        )
+        if identity_reply_fits(minimal_candidate):
+            return minimal_candidate
+    return "HS_BG;available=1;omitted=oversize_identities"
 
 
 def _bound_agent_reply(value: str) -> str:
     text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
-    if len(text) <= _AGENT_REPLY_MAX_CHARS:
+    if _agent_reply_fits(text) or (
+        "[id~name]=" in text and _agent_identity_reply_fits(text)
+    ):
         return text
-    suffix = ";truncated=1"
-    return text[: _AGENT_REPLY_MAX_CHARS - len(suffix)].rstrip(";|, ") + suffix
+    suffix = ";omitted=tail"
+    prefix = text[: _AGENT_REPLY_MAX_CHARS - len(suffix)]
+    while prefix:
+        boundary = prefix.rfind(";")
+        if boundary <= 0:
+            break
+        candidate = prefix[:boundary].rstrip(";|, ") + suffix
+        if _agent_reply_fits(candidate):
+            return candidate
+        prefix = prefix[:boundary]
+    return "HS_QUERY;available=?;omitted=oversize_reply"
 
 
 def _agent_focus_from_request(value: Any) -> str:
@@ -771,6 +1604,7 @@ def _agent_focus_from_request(value: Any) -> str:
     focus_terms = (
         ("opponent", ("对手", "对面", "下一家", "opponent")),
         ("choice", ("英雄选择", "候选英雄", "发现", "选哪个", "choice")),
+        ("hand", ("手牌", "hand")),
         (
             "board",
             ("站位", "阵容", "战团", "战斗", "稳血", "position", "board", "combat"),
@@ -786,12 +1620,335 @@ def _agent_focus_from_request(value: Any) -> str:
     return "auto"
 
 
+def _agent_opponent_relation_from_request(value: Any) -> str:
+    text = str(value or "").casefold()
+    relation_terms = (
+        ("last", ("上一轮", "上轮", "上一位", "上一家", "刚才的对手", "last opponent", "previous opponent")),
+        ("next", ("下一轮", "下轮", "下一位", "下一家", "next opponent")),
+        ("current", ("当前对手", "战斗对手", "正在打", "current opponent")),
+    )
+    for relation, terms in relation_terms:
+        if any(term in text for term in terms):
+            return relation
+    return "auto"
+
+
 def _agent_query_reply(
-    payload: Mapping[str, Any], *, mode: str, focus: str = "auto"
+    payload: Mapping[str, Any],
+    *,
+    mode: str,
+    focus: str = "auto",
+    opponent_relation: str = "auto",
 ) -> str:
     if mode == "battlegrounds":
-        return _bound_agent_reply(_agent_battlegrounds_reply(payload, focus=focus))
-    return _bound_agent_reply(_agent_constructed_reply(payload))
+        return _bound_agent_reply(
+            _agent_battlegrounds_reply(
+                payload,
+                focus=focus,
+                opponent_relation=opponent_relation,
+            )
+        )
+    return _bound_agent_reply(_agent_constructed_reply(payload, focus=focus))
+
+
+def _focused_tool_query_reply(
+    payload: Mapping[str, Any],
+    *,
+    mode: str,
+    focus: str,
+    opponent_relation: str = "auto",
+) -> str:
+    if mode == "battlegrounds":
+        return _agent_battlegrounds_reply(
+            payload,
+            focus=focus,
+            opponent_relation=opponent_relation,
+            focused_tool=True,
+        )
+    return _agent_constructed_reply(
+        payload,
+        focus=focus,
+        focused_tool=True,
+    )
+
+
+def _focused_tool_json_bytes(value: Mapping[str, Any]) -> int:
+    return len(
+        json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    )
+
+
+def _focused_tool_cards(
+    payload: Mapping[str, Any],
+    *,
+    mode: str,
+    focus: str,
+    opponent_relation: str = "auto",
+) -> list[Any]:
+    if mode == "constructed":
+        state = payload.get("state") if isinstance(payload.get("state"), Mapping) else {}
+        constructed = (
+            state.get("constructed")
+            if isinstance(state.get("constructed"), Mapping)
+            else {}
+        )
+        player = (
+            constructed.get("player")
+            if isinstance(constructed.get("player"), Mapping)
+            else {}
+        )
+        opponent = (
+            constructed.get("opponent")
+            if isinstance(constructed.get("opponent"), Mapping)
+            else {}
+        )
+        if focus == "hand":
+            hand = player.get("hand") if isinstance(player.get("hand"), Mapping) else {}
+            cards = hand.get("known_cards")
+        elif focus == "opponent":
+            board = (
+                opponent.get("board")
+                if isinstance(opponent.get("board"), Mapping)
+                else {}
+            )
+            cards = board.get("minions")
+        elif focus == "choice":
+            choice = state.get("choice") if isinstance(state.get("choice"), Mapping) else {}
+            cards = choice.get("options")
+        elif focus == "board":
+            board = (
+                player.get("board")
+                if isinstance(player.get("board"), Mapping)
+                else {}
+            )
+            cards = board.get("minions")
+        else:
+            cards = []
+        return list(cards) if isinstance(cards, list) else []
+
+    state = (
+        payload.get("current_public_state")
+        if isinstance(payload.get("current_public_state"), Mapping)
+        else {}
+    )
+    if focus == "shop":
+        cards = state.get("shop")
+    elif focus == "hand":
+        cards = state.get("hand")
+    elif focus == "board":
+        cards = state.get("warband")
+    elif focus == "choice":
+        current_choice = (
+            state.get("current_choice")
+            if isinstance(state.get("current_choice"), Mapping)
+            else {}
+        )
+        cards = current_choice.get("options")
+        if not isinstance(cards, list) or not cards:
+            cards = state.get("hero_choices")
+    elif focus == "opponent":
+        opponents = (
+            state.get("opponents")
+            if isinstance(state.get("opponents"), Mapping)
+            else {}
+        )
+        selected_relation = str(opponent_relation or "auto")
+        if selected_relation not in {"current", "next", "last"} or not isinstance(
+            opponents.get(selected_relation), Mapping
+        ):
+            last = opponents.get("last")
+            last = last if isinstance(last, Mapping) else {}
+            last_board = last.get("board")
+            last_board = last_board if isinstance(last_board, Mapping) else {}
+            selected_relation = next(
+                (
+                    relation
+                    for relation in (
+                        "current",
+                        "last" if list(last_board.get("minions") or []) else "next",
+                        "next",
+                        "last",
+                    )
+                    if isinstance(opponents.get(relation), Mapping)
+                ),
+                "current",
+            )
+        observed = opponents.get(selected_relation)
+        observed = observed if isinstance(observed, Mapping) else {}
+        board = observed.get("board")
+        board = board if isinstance(board, Mapping) else {}
+        cards = board.get("minions")
+    else:
+        cards = []
+    return list(cards) if isinstance(cards, list) else []
+
+
+def _focused_tool_evidence(
+    payload: Mapping[str, Any],
+    *,
+    mode: str,
+    view_focuses: tuple[str, ...],
+) -> dict[str, Any]:
+    if mode == "constructed":
+        keys_by_focus = {
+            "overview": ("round_tracking", "turn_tracking", "active_side_tracking"),
+            "hand": (
+                "own_visible_hand_cards",
+                "own_hand_identities_complete",
+                "specific_card_play_analysis",
+            ),
+            "choice": ("current_choice_options",),
+        }
+    else:
+        keys_by_focus = {
+            "shop": (
+                "shop_card_priority_advice",
+                "purchase_affordability",
+                "specific_purchase_advice",
+                "upgrade_affordability",
+                "refresh_advice",
+            ),
+            "economy": (
+                "purchase_affordability",
+                "upgrade_affordability",
+                "refresh_advice",
+            ),
+            "board": ("specific_positioning_advice",),
+            "choice": ("current_choice_comparison",),
+            "opponent": ("combat_commentary",),
+        }
+    capabilities = (
+        payload.get("capabilities")
+        if isinstance(payload.get("capabilities"), Mapping)
+        else {}
+    )
+    selected_keys = tuple(
+        dict.fromkeys(
+            key
+            for view_focus in view_focuses
+            for key in keys_by_focus.get(view_focus, ())
+        )
+    )
+    result: dict[str, Any] = {}
+    for key in selected_keys:
+        value = capabilities.get(key)
+        if isinstance(value, Mapping):
+            compact: dict[str, Any] = {"available": bool(value.get("available"))}
+            missing = [
+                _agent_text(item, limit=48)
+                for item in list(value.get("missing_evidence") or [])[:4]
+            ]
+            missing = [item for item in missing if item]
+            if missing:
+                compact["missing_evidence"] = missing
+            result[key] = compact
+        elif value is not None:
+            result[key] = bool(value)
+    return result
+
+
+def _focused_llm_tool_result(
+    payload: Mapping[str, Any],
+    *,
+    mode: str,
+    focus: str,
+    opponent_relation: str = "auto",
+) -> dict[str, Any]:
+    allowed_focuses = (
+        _CONSTRUCTED_TOOL_FOCUSES
+        if mode == "constructed"
+        else _BATTLEGROUNDS_TOOL_FOCUSES
+    )
+    selected_focus = focus if focus in allowed_focuses else "overview"
+    if selected_focus != "strategy":
+        view_focuses = (selected_focus,)
+    elif mode == "constructed":
+        state = payload.get("state") if isinstance(payload.get("state"), Mapping) else {}
+        choice = state.get("choice") if isinstance(state.get("choice"), Mapping) else {}
+        view_focuses = (
+            ("overview", "choice")
+            if list(choice.get("options") or [])
+            else ("overview", "board", "hand", "opponent")
+        )
+    else:
+        state = (
+            payload.get("current_public_state")
+            if isinstance(payload.get("current_public_state"), Mapping)
+            else {}
+        )
+        view_focuses = {
+            "hero_select": ("overview", "choice"),
+            "recruit": ("overview", "economy", "shop", "board", "hand"),
+            "combat": ("overview", "board", "opponent"),
+        }.get(str(state.get("phase") or ""), ("overview", "board"))
+
+    views = [
+        {
+            "focus": view_focus,
+            "state": _focused_tool_query_reply(
+                payload,
+                mode=mode,
+                focus=view_focus,
+                opponent_relation=opponent_relation,
+            ),
+        }
+        for view_focus in view_focuses
+    ]
+    involved_cards = [
+        card
+        for view_focus in view_focuses
+        for card in _focused_tool_cards(
+            payload,
+            mode=mode,
+            focus=view_focus,
+            opponent_relation=opponent_relation,
+        )
+    ]
+    result: dict[str, Any] = {
+        "format": "hearthstone_compact_v1",
+        "mode": mode,
+        "focus": selected_focus,
+        "available": bool(payload.get("available")),
+        "views": views,
+        "evidence": _focused_tool_evidence(
+            payload,
+            mode=mode,
+            view_focuses=view_focuses,
+        ),
+        "catalog_rules": _agent_catalog_rules(payload, involved_cards),
+        "truncated": False,
+        "byte_limit": _LLM_TOOL_FOCUSED_MAX_BYTES,
+    }
+    if mode == "battlegrounds":
+        result["topic"] = _agent_text(payload.get("topic") or "current_strategy", limit=32)
+    reason = _agent_text(payload.get("reason"), limit=72)
+    if reason:
+        result["reason"] = reason
+    if _focused_tool_json_bytes(result) <= _LLM_TOOL_FOCUSED_MAX_BYTES:
+        return result
+
+    fallback = {
+        "format": "hearthstone_compact_v1",
+        "mode": mode,
+        "focus": selected_focus,
+        "available": bool(payload.get("available")),
+        "views": views[:1],
+        "evidence": {},
+        "catalog_rules": "",
+        "truncated": True,
+        "truncation_reason": "focused_result_exceeded_byte_budget",
+        "byte_limit": _LLM_TOOL_FOCUSED_MAX_BYTES,
+    }
+    if reason:
+        fallback["reason"] = reason
+    if _focused_tool_json_bytes(fallback) > _LLM_TOOL_FOCUSED_MAX_BYTES:
+        fallback["views"] = [
+            {
+                "focus": view_focuses[0],
+                "state": "HS_QUERY;available=?;omitted=oversize_focused_result",
+            }
+        ]
+    return fallback
 
 
 @neko_plugin
@@ -826,9 +1983,8 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         self._context_target: str | None = None
         self._live_state_shared = False
         self._live_state_target = ""
-        self._live_state_segment_count = 0
         self._live_state_game_number = 0
-        self._live_state_snapshot: GameSnapshot | None = None
+        self._live_state_notice_fingerprint: tuple[Any, ...] | None = None
         self._ownership_lock = threading.RLock()
         self._delivery_lock = threading.RLock()
         self._settings_lock = asyncio.Lock()
@@ -857,6 +2013,343 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         self._config_runtime_error_codes: tuple[str, ...] = ()
         self._config_restart_required = False
         self._overlay_applied_config = self.cfg
+        self._llm_tool_health_lock = threading.Lock()
+        self._llm_tool_health_in_flight = False
+        self._llm_tool_health_failures = 0
+        self._llm_tool_health_next_attempt_at = 0.0
+        self._llm_tool_recovery_specs: dict[str, dict[str, Any]] = {}
+        self._register_agent_query_entries()
+
+    def _register_agent_query_entries(self) -> None:
+        # ENTRY_UPDATE makes these query routes visible after an in-place
+        # upgrade even when the host still has an older static preview cached.
+        self.register_dynamic_entry(
+            entry_id="query_constructed_state",
+            handler=self.query_constructed_state,
+            name=tr(
+                "entries.query_constructed_state.name",
+                default="查询当前炉石对战",
+            ),
+            description=tr(
+                "entries.query_constructed_state.description",
+                default=(
+                    "用户询问当前普通、标准、狂野或竞技场炉石对战的回合、行动方、法力、"
+                    "手牌、场面、Choice 或出牌建议时调用。每次都读取最新玩家可见状态；"
+                    "酒馆战棋问题必须改用 query_battlegrounds_state；紧凑手牌结果的 q 表示"
+                    "手牌身份是否完整。"
+                ),
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "focus": {
+                        "type": "string",
+                        "enum": ["auto", "board", "hand", "opponent", "choice"],
+                        "default": "auto",
+                    }
+                },
+                "additionalProperties": False,
+            },
+            kind="service",
+            timeout=5.0,
+            llm_result_fields=["reply"],
+        )
+        self.register_dynamic_entry(
+            entry_id="query_battlegrounds_state",
+            handler=self.query_battlegrounds_state,
+            name=tr(
+                "entries.query_battlegrounds_state.name",
+                default="查询当前酒馆战棋局势",
+            ),
+            description=tr(
+                "entries.query_battlegrounds_state.description",
+                default=(
+                    "用户询问酒馆战棋、酒馆、商店买什么、酒馆法术、英雄选择、流派、阵容、"
+                    "站位、升本、刷新、冻结、稳血、对手或复盘时调用。返回最新玩家可见局势，"
+                    "包括实际费用、卡牌类型、金色、当前关键词和证据完整度；绝不回退到构筑套牌。"
+                    "紧凑结果中 p/r/g/t/f/rf/up 分别表示阶段、回合、金币、酒馆等级、冻结、"
+                    "刷新实际费用和升本实际费用，q 表示目标区域证据是否完整；shop 元组顺序"
+                    "就是商店站位，其余卡牌数组顺序也表示区域站位。满区域结果中 D 依次是"
+                    "type/golden/kw 默认值，X 用“站位+T/G/K:值”覆盖对应卡牌；关键词码"
+                    "t/d/r 分别是嘲讽/圣盾/复生，其余码按工具字段说明解释。"
+                ),
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "enum": [
+                            "current_strategy",
+                            "season_meta",
+                            "hero_performance",
+                            "post_game",
+                        ],
+                        "default": "current_strategy",
+                    },
+                    "focus": {
+                        "type": "string",
+                        "enum": [
+                            "auto",
+                            "shop",
+                            "board",
+                            "hand",
+                            "choice",
+                            "opponent",
+                        ],
+                        "default": "auto",
+                        "description": tr(
+                            "entries.query_battlegrounds_state.focus",
+                            default=(
+                                "买什么/升本/刷新用 shop；阵容/站位/战斗用 board；手牌用 hand；"
+                                "英雄或发现选项用 choice；对手信息用 opponent。"
+                            ),
+                        ),
+                    },
+                    "opponent_relation": {
+                        "type": "string",
+                        "enum": ["auto", "current", "next", "last"],
+                        "default": "auto",
+                        "description": (
+                            "仅 focus=opponent 时使用：正在战斗用 current，下一位用 next，"
+                            "上一轮已观测对手用 last。"
+                        ),
+                    },
+                },
+                "additionalProperties": False,
+            },
+            kind="service",
+            timeout=5.0,
+            llm_result_fields=["reply"],
+        )
+
+    def _local_llm_tool_specs(self) -> dict[str, dict[str, Any]]:
+        cached = dict(getattr(self, "_llm_tool_recovery_specs", {}))
+        list_tools = getattr(self, "list_llm_tools", None)
+        if not callable(list_tools):
+            return cached
+        current = list_tools()
+        if not isinstance(current, list):
+            raise TypeError("list_llm_tools must return a list")
+        for item in current:
+            if not isinstance(item, Mapping):
+                continue
+            name = str(item.get("name") or "")
+            if name not in _LLM_TOOL_HANDLER_NAMES:
+                continue
+            parameters = item.get("parameters")
+            cached[name] = {
+                "name": name,
+                "description": str(item.get("description") or ""),
+                "parameters": dict(parameters) if isinstance(parameters, Mapping) else {},
+                "timeout": float(item.get("timeout_seconds") or 30.0),
+                "role": item.get("role") if isinstance(item.get("role"), str) else None,
+            }
+        self._llm_tool_recovery_specs = cached
+        return cached
+
+    def _runtime_plugin_id(self) -> str:
+        try:
+            plugin_id = str(getattr(self, "plugin_id", "") or "")
+        except Exception:
+            plugin_id = ""
+        if not plugin_id:
+            plugin_id = str(getattr(getattr(self, "ctx", None), "plugin_id", "") or "")
+        return plugin_id
+
+    async def _check_and_recover_llm_tools(self) -> dict[str, Any]:
+        specs = self._local_llm_tool_specs()
+        plugin_id = self._runtime_plugin_id()
+        if set(specs) != set(_LLM_TOOL_HANDLER_NAMES) or not plugin_id:
+            return {
+                "healthy": False,
+                "reason": "local_tool_specs_unavailable",
+                "recovered": [],
+                "missing": sorted(set(_LLM_TOOL_HANDLER_NAMES) - set(specs)),
+            }
+
+        expected_names = set(specs)
+        expected_source = f"plugin:{plugin_id}"
+        registry = await asyncio.to_thread(_fetch_main_tool_registry)
+        tools_by_role = registry.get("tools_by_role")
+        missing = _missing_remote_llm_tools(
+            registry,
+            expected_names=expected_names,
+            expected_source=expected_source,
+            plugin_id=plugin_id,
+        )
+        if not missing:
+            return {"healthy": True, "reason": "healthy", "recovered": [], "missing": []}
+        if not tools_by_role:
+            return {
+                "healthy": False,
+                "reason": "no_active_role_registry",
+                "recovered": [],
+                "missing": sorted(missing),
+            }
+        ownership_lock = self._ownership_lock
+        with ownership_lock:
+            recovery_generation = int(getattr(self, "_lifecycle_generation", 0))
+            recovery_running = bool(getattr(self, "_started", False))
+        if not recovery_running:
+            return {
+                "healthy": False,
+                "reason": "plugin_not_running",
+                "recovered": [],
+                "missing": sorted(missing),
+            }
+
+        unregister = getattr(self, "unregister_llm_tool", None)
+        register = getattr(self, "register_llm_tool", None)
+        if not callable(unregister) or not callable(register):
+            return {
+                "healthy": False,
+                "reason": "sdk_recovery_unavailable",
+                "recovered": [],
+                "missing": sorted(missing),
+            }
+
+        recovered: list[str] = []
+        interrupted_reason = ""
+        for name in sorted(missing):
+            handler = getattr(self, _LLM_TOOL_HANDLER_NAMES[name], None)
+            if not callable(handler):
+                continue
+            spec = specs[name]
+            with ownership_lock:
+                if not bool(getattr(self, "_started", False)):
+                    interrupted_reason = "plugin_not_running"
+                    break
+                if int(getattr(self, "_lifecycle_generation", 0)) != recovery_generation:
+                    interrupted_reason = "lifecycle_superseded"
+                    break
+                unregister(name)
+                if not bool(getattr(self, "_started", False)):
+                    interrupted_reason = "plugin_not_running"
+                    break
+                if int(getattr(self, "_lifecycle_generation", 0)) != recovery_generation:
+                    interrupted_reason = "lifecycle_superseded"
+                    break
+                register(
+                    name=name,
+                    description=spec["description"],
+                    parameters=spec["parameters"],
+                    handler=handler,
+                    timeout=spec["timeout"],
+                    role=spec["role"],
+                )
+                recovered.append(name)
+
+        if interrupted_reason:
+            return {
+                "healthy": False,
+                "reason": interrupted_reason,
+                "recovered": recovered,
+                "missing": sorted(missing),
+            }
+
+        remaining = set(missing)
+        for delay in _LLM_TOOL_CONFIRM_DELAYS_SECONDS:
+            if not recovered:
+                break
+            await asyncio.sleep(delay)
+            with ownership_lock:
+                if not bool(getattr(self, "_started", False)):
+                    return {
+                        "healthy": False,
+                        "reason": "plugin_not_running",
+                        "recovered": recovered,
+                        "missing": sorted(remaining),
+                    }
+                if int(getattr(self, "_lifecycle_generation", 0)) != recovery_generation:
+                    return {
+                        "healthy": False,
+                        "reason": "lifecycle_superseded",
+                        "recovered": recovered,
+                        "missing": sorted(remaining),
+                    }
+            registry = await asyncio.to_thread(_fetch_main_tool_registry)
+            remaining = _missing_remote_llm_tools(
+                registry,
+                expected_names=expected_names,
+                expected_source=expected_source,
+                plugin_id=plugin_id,
+            )
+            if not remaining:
+                break
+        return {
+            "healthy": not remaining,
+            "reason": "recovered" if not remaining else "registration_pending",
+            "recovered": recovered,
+            "missing": sorted(remaining),
+        }
+
+    def _defer_llm_tool_health_check(self, *, failed: bool) -> float:
+        with self._llm_tool_health_lock:
+            if failed:
+                self._llm_tool_health_failures += 1
+                delay = min(
+                    _LLM_TOOL_HEALTH_RETRY_MAX_SECONDS,
+                    _LLM_TOOL_HEALTH_RETRY_BASE_SECONDS
+                    * (2 ** (self._llm_tool_health_failures - 1)),
+                )
+            else:
+                self._llm_tool_health_failures = 0
+                delay = _LLM_TOOL_HEALTH_RETRY_BASE_SECONDS
+            self._llm_tool_health_next_attempt_at = time.monotonic() + delay
+        return delay
+
+    def _reset_llm_tool_health_backoff(self) -> None:
+        with self._llm_tool_health_lock:
+            self._llm_tool_health_failures = 0
+            self._llm_tool_health_next_attempt_at = 0.0
+
+    @timer_interval(id="llm_tool_registration_health", seconds=5, auto_start=True)
+    async def llm_tool_registration_health(self, **_: Any):
+        now = time.monotonic()
+        with self._llm_tool_health_lock:
+            if self._llm_tool_health_in_flight:
+                return Ok({"skipped": True, "reason": "check_in_flight"})
+            if now < self._llm_tool_health_next_attempt_at:
+                return Ok({"skipped": True, "reason": "retry_backoff"})
+            self._llm_tool_health_in_flight = True
+
+        try:
+            if not bool(getattr(self, "_started", False)):
+                self._reset_llm_tool_health_backoff()
+                return Ok({"skipped": True, "reason": "plugin_not_running"})
+            result = await self._check_and_recover_llm_tools()
+            if result["healthy"]:
+                self._reset_llm_tool_health_backoff()
+                if result["recovered"]:
+                    self.logger.info(
+                        "Hearthstone LLM tool registration recovered count=%s",
+                        len(result["recovered"]),
+                    )
+            else:
+                self._defer_llm_tool_health_check(
+                    failed=result["reason"] != "no_active_role_registry"
+                )
+            return Ok(result)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            retry_after = self._defer_llm_tool_health_check(failed=True)
+            self.logger.warning(
+                "Hearthstone LLM tool registry check failed code=%s",
+                type(exc).__name__,
+            )
+            return Ok(
+                {
+                    "healthy": False,
+                    "reason": "registry_unavailable",
+                    "error_code": type(exc).__name__,
+                    "retry_after_seconds": retry_after,
+                }
+            )
+        finally:
+            with self._llm_tool_health_lock:
+                self._llm_tool_health_in_flight = False
 
     @lifecycle(id="startup")
     async def startup(self, **_: Any):
@@ -1973,6 +3466,29 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             base = f"hearthstone:live-state:{digest}"
         return base if segment == "core" else f"{base}:{segment}"
 
+    @staticmethod
+    def _live_state_notice_fingerprint_for(snapshot: GameSnapshot) -> tuple[Any, ...]:
+        choice = snapshot.choice
+        if choice is None and snapshot.battlegrounds is not None:
+            choice = snapshot.battlegrounds.current_choice
+        return (
+            snapshot.game_number,
+            snapshot.mode,
+            snapshot.phase,
+            snapshot.round,
+            snapshot.active_side,
+            getattr(choice, "choice_type", "") if choice is not None else "",
+            len(getattr(choice, "options", ()) or ()) if choice is not None else 0,
+        )
+
+    @staticmethod
+    def _live_state_notice_text() -> str:
+        return (
+            "# 炉石实时查询提示\n"
+            "炉石公开局势已经变化。回答当前回合、手牌、场面、商店、战团或决策问题前，"
+            "请重新调用匹配模式的炉石工具；不要从本提示或较早对话推断当前事实。"
+        )
+
     def _push_context(self, text: str, *, target_lanlan: str, expired: bool) -> bool:
         kwargs: dict[str, Any] = {
             "visibility": [],
@@ -2050,15 +3566,15 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             "parts": [{"type": "text", "text": text}],
             "source": "hearthstone_companion",
             "metadata": {
-                "kind": "game_live_state_expired" if expired else "game_live_state",
-                "context_type": "hearthstone_companion_live_state",
+                "kind": (
+                    "hearthstone_live_state_notice_expired"
+                    if expired
+                    else "hearthstone_live_state_notice"
+                ),
+                "context_type": "hearthstone_live_state_notice",
                 "delivery_intent": "passive_context",
                 "context_expired": expired,
-                "privacy_scope": (
-                    "no_game_state_tombstone"
-                    if expired
-                    else "filtered_player_visible_live_state"
-                ),
+                "privacy_scope": "instructions_only",
                 "segment": segment,
             },
             "priority": 0,
@@ -2081,24 +3597,25 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
     def _share_live_state(self, snapshot: GameSnapshot) -> bool:
         with self._delivery_guard():
             access_reason, _revision = _live_state_access(self)
+            target = self._delivery_target()
             with self._ownership_lock:
                 blocked = bool(
                     access_reason
                     or not self._started
                     or not self._monitor_dispatch_enabled
+                    or not target
                     or snapshot.game_number <= 0
                     or snapshot.phase in {"idle", "ended", "spectator"}
                 )
             if blocked:
                 return False
-            target = self._delivery_target()
+            fingerprint = self._live_state_notice_fingerprint_for(snapshot)
             with self._ownership_lock:
                 already_shared = bool(
                     getattr(self, "_live_state_shared", False)
                     and getattr(self, "_live_state_target", "") == target
-                    and int(getattr(self, "_live_state_game_number", 0) or 0)
-                    == snapshot.game_number
-                    and getattr(self, "_live_state_snapshot", None) == snapshot
+                    and getattr(self, "_live_state_notice_fingerprint", None)
+                    == fingerprint
                 )
                 target_changed = bool(
                     getattr(self, "_live_state_shared", False)
@@ -2113,66 +3630,21 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 return True
             if (target_changed or game_changed) and not self._expire_live_state():
                 return False
-            try:
-                texts = build_live_state_contexts(
-                    snapshot,
-                    observed_at=time.time(),
-                    max_prompt_bytes=_LIVE_STATE_DELIVERY_MAX_BYTES,
-                )
-            except Exception as exc:
-                self.logger.warning(
-                    "Hearthstone live-state serialization failed code=%s",
-                    type(exc).__name__,
-                )
+            if not self._push_live_state(
+                self._live_state_notice_text(),
+                target_lanlan=target,
+                expired=False,
+                segment="core",
+            ):
                 return False
-            segment_names = _LIVE_STATE_SEGMENTS
-            with self._ownership_lock:
-                previous_count = int(
-                    getattr(self, "_live_state_segment_count", 0) or 0
-                )
-                segment_count_changed = bool(
-                    getattr(self, "_live_state_shared", False)
-                    and previous_count != len(texts)
-                )
-            if segment_count_changed and not self._expire_live_state():
+            access_reason, _revision = _live_state_access(self)
+            if access_reason or self._delivery_target() != target:
                 return False
             with self._ownership_lock:
-                previous_count = int(
-                    getattr(self, "_live_state_segment_count", 0) or 0
-                )
-            for index, text in enumerate(texts):
-                access_reason, _revision = _live_state_access(self)
-                with self._ownership_lock:
-                    delivery_invalid = bool(
-                        access_reason
-                        or not self._started
-                        or not self._monitor_dispatch_enabled
-                        or self._delivery_target() != target
-                    )
-                if delivery_invalid:
-                    if getattr(self, "_live_state_shared", False):
-                        self._expire_live_state()
-                    return False
-                if not self._push_live_state(
-                    text,
-                    target_lanlan=target,
-                    expired=False,
-                    segment=segment_names[index],
-                ):
-                    if previous_count > 0:
-                        self._expire_live_state()
-                    return False
-                with self._ownership_lock:
-                    self._live_state_shared = True
-                    self._live_state_target = target
-                    self._live_state_segment_count = max(previous_count, index + 1)
-                    self._live_state_game_number = snapshot.game_number
-                access_reason, _revision = _live_state_access(self)
-                if access_reason or self._delivery_target() != target:
-                    self._expire_live_state()
-                    return False
-            with self._ownership_lock:
-                self._live_state_snapshot = snapshot
+                self._live_state_shared = True
+                self._live_state_target = target
+                self._live_state_game_number = snapshot.game_number
+                self._live_state_notice_fingerprint = fingerprint
             return True
 
     @staticmethod
@@ -2189,35 +3661,23 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 if not getattr(self, "_live_state_shared", False):
                     return True
                 target = str(getattr(self, "_live_state_target", "") or "")
-                segment_names = _LIVE_STATE_SEGMENTS
-                segment_count = max(
-                    1,
-                    min(
-                        len(segment_names),
-                        int(getattr(self, "_live_state_segment_count", 1) or 1),
-                    ),
-                )
             text = self._live_state_expired_text()
-            for segment in segment_names[:segment_count]:
-                if not self._push_live_state(
-                    text,
-                    target_lanlan=target,
-                    expired=True,
-                    segment=segment,
-                ):
-                    return False
+            if not self._push_live_state(
+                text,
+                target_lanlan=target,
+                expired=True,
+                segment="core",
+            ):
+                return False
             with self._ownership_lock:
                 if (
                     getattr(self, "_live_state_shared", False)
                     and getattr(self, "_live_state_target", "") == target
-                    and int(getattr(self, "_live_state_segment_count", 0) or 0)
-                    == segment_count
                 ):
                     self._live_state_shared = False
                     self._live_state_target = ""
-                    self._live_state_segment_count = 0
                     self._live_state_game_number = 0
-                    self._live_state_snapshot = None
+                    self._live_state_notice_fingerprint = None
             return True
 
     def _restore_context(self) -> bool:
@@ -2842,9 +4302,8 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     persisted = await self._persist_settings_config(submitted)
                 except Exception as exc:
                     self.logger.warning(
-                        "Settings config update failed: %s: %s",
+                        "Settings config update failed: %s",
                         type(exc).__name__,
-                        str(exc),
                     )
                     return Err(SdkError(f"settings config update failed: {type(exc).__name__}"))
                 section = persisted.get(_CONFIG_SECTION) if isinstance(persisted, Mapping) else None
@@ -3054,120 +4513,94 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         state["summary"] = "已读取炉石陪玩状态。"
         return Ok(state)
 
-    @plugin_entry(
-        id="query_constructed_state",
-        name=tr(
-            "entries.query_constructed_state.name",
-            default="查询当前炉石对战",
-        ),
-        description=tr(
-            "entries.query_constructed_state.description",
-            default=(
-                "用户询问当前普通、标准、狂野或竞技场炉石对战的回合、行动方、法力、"
-                "手牌、场面、Choice 或出牌建议时调用。每次都读取最新玩家可见状态；"
-                "酒馆战棋问题必须改用 query_battlegrounds_state。"
-            ),
-        ),
-        input_schema={"type": "object", "properties": {}, "additionalProperties": False},
-        kind="service",
-        timeout=5.0,
-        llm_result_fields=["reply"],
-        metadata={"result_kind": "event", "expires_in_s": 8.0},
-    )
-    async def query_constructed_state(self, **_: Any):
-        payload = await self.hearthstone_current_state()
-        return Ok(
-            {
-                "reply": _agent_query_reply(payload, mode="constructed"),
-                "payload": payload,
-            }
-        )
-
-    @plugin_entry(
-        id="query_battlegrounds_state",
-        name=tr(
-            "entries.query_battlegrounds_state.name",
-            default="查询当前酒馆战棋局势",
-        ),
-        description=tr(
-            "entries.query_battlegrounds_state.description",
-            default=(
-                "用户询问酒馆战棋、酒馆、商店买什么、酒馆法术、英雄选择、流派、阵容、"
-                "站位、升本、刷新、冻结、稳血、对手或复盘时调用。返回最新玩家可见局势，"
-                "包括实际费用、卡牌类型、金色、当前关键词和证据完整度；绝不回退到构筑套牌。"
-            ),
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "topic": {
-                    "type": "string",
-                    "enum": [
-                        "current_strategy",
-                        "season_meta",
-                        "hero_performance",
-                        "post_game",
-                    ],
-                    "default": "current_strategy",
-                },
-                "focus": {
-                    "type": "string",
-                    "enum": ["auto", "shop", "board", "choice", "opponent"],
-                    "default": "auto",
-                    "description": tr(
-                        "entries.query_battlegrounds_state.focus",
-                        default=(
-                            "买什么/升本/刷新用 shop；阵容/站位/战斗用 board；"
-                            "英雄或发现选项用 choice；对手信息用 opponent。"
-                        ),
-                    ),
-                },
-            },
-            "additionalProperties": False,
-        },
-        kind="service",
-        timeout=5.0,
-        llm_result_fields=["reply"],
-        metadata={"result_kind": "event", "expires_in_s": 8.0},
-    )
-    async def query_battlegrounds_state(
+    async def query_constructed_state(
         self,
-        topic: str = "current_strategy",
         focus: str = "auto",
         _ctx: Mapping[str, Any] | None = None,
         **_: Any,
     ):
         if focus == "auto" and isinstance(_ctx, Mapping):
             focus = _agent_focus_from_request(_ctx.get("latest_user_request"))
+        payload = await self.hearthstone_current_state()
+        return await self.finish(
+            data={
+                "reply": _agent_query_reply(
+                    payload,
+                    mode="constructed",
+                    focus=focus,
+                ),
+                "payload": payload,
+            },
+            delivery="silent",
+            meta={
+                "agent": {
+                    "result_kind": "event",
+                    "expires_in_s": 8.0,
+                    "delivery": "silent",
+                }
+            },
+        )
+
+    async def query_battlegrounds_state(
+        self,
+        topic: str = "current_strategy",
+        focus: str = "auto",
+        opponent_relation: str = "auto",
+        _ctx: Mapping[str, Any] | None = None,
+        **_: Any,
+    ):
+        if isinstance(_ctx, Mapping):
+            latest_request = _ctx.get("latest_user_request")
+            if focus == "auto":
+                focus = _agent_focus_from_request(latest_request)
+            if opponent_relation == "auto":
+                opponent_relation = _agent_opponent_relation_from_request(latest_request)
         payload = await self.hearthstone_battlegrounds_advice(topic=topic)
-        return Ok(
-            {
+        return await self.finish(
+            data={
                 "reply": _agent_query_reply(
                     payload,
                     mode="battlegrounds",
                     focus=focus,
+                    opponent_relation=opponent_relation,
                 ),
                 "payload": payload,
-            }
+            },
+            delivery="silent",
+            meta={
+                "agent": {
+                    "result_kind": "event",
+                    "expires_in_s": 8.0,
+                    "delivery": "silent",
+                }
+            },
         )
 
     @llm_tool(
         name="hearthstone_current_state",
         description=(
-            "Always call this tool before answering current constructed Hearthstone questions such as round, turn, "
-            "active player, health, mana, hand, board, recent plays, which card to play, or current choices. "
-            "For a user's 'which round/第几回合' question, answer with state.round; "
-            "state.turn is only the raw alternating player-turn counter, and state.active_side says whose action it is. "
-            "It reads the fresh privacy-filtered player-visible state and never includes raw logs, opponent "
-            "hidden cards, secret identities, or deck order. Do not use this tool alone for Battlegrounds/酒馆战棋 strategy or meta questions "
-            "such as 流派、阵容、升本、稳血、买什么; do not call it for any Battlegrounds current-state question. "
-            "Call hearthstone_battlegrounds_advice instead; this tool returns only a redirect when the live mode is Battlegrounds, and "
-            "never answer those questions as constructed Hearthstone."
+            "Use for current constructed Hearthstone facts or decisions: round, active side, health, mana, "
+            "visible hand, public board, recent plays, choices, or what to play. For 第几回合 use state.round; "
+            "state.turn is the raw alternating action-turn counter. Returns fresh player-visible data only. "
+            "Do not use for any Battlegrounds/酒馆战棋 question; use hearthstone_battlegrounds_advice."
         ),
-        parameters={"type": "object", "properties": {}, "additionalProperties": False},
+        parameters={
+            "type": "object",
+            "properties": {
+                "focus": {
+                    "type": "string",
+                    "enum": list(_CONSTRUCTED_TOOL_FOCUSES),
+                    "description": "The exact visible area needed to answer the current question.",
+                }
+            },
+            "required": ["focus"],
+            "additionalProperties": False,
+        },
         timeout=5.0,
     )
-    async def hearthstone_current_state(self, **_: Any) -> dict[str, Any]:
+    async def hearthstone_current_state(
+        self, focus: str | None = None, **_: Any
+    ) -> dict[str, Any]:
         answer_contract = {
             "never_recommend_from_cached_state": True,
             "separate_observation_from_recommendation": True,
@@ -3228,14 +4661,23 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 "capabilities": capabilities_for(),
             }
 
+        def finalize(payload: Mapping[str, Any]) -> dict[str, Any]:
+            if focus is None:
+                return dict(payload)
+            return _focused_llm_tool_result(
+                payload,
+                mode="constructed",
+                focus=focus,
+            )
+
         access_reason, transition_revision = _live_state_access(self)
         if access_reason:
-            return blocked_payload(access_reason)
+            return finalize(blocked_payload(access_reason))
         monitor = self._ensure_monitor()
         try:
             snapshot, runtime, _generation = _capture_monitor(monitor, timeout_seconds=0.05)
         except TimeoutError:
-            return blocked_payload("state_refresh_in_progress")
+            return finalize(blocked_payload("state_refresh_in_progress"))
         captured_at = time.time()
         freshness = _state_freshness(snapshot, runtime, captured_at=captured_at)
         has_state = snapshot.phase != "idle"
@@ -3273,30 +4715,26 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             expected_transition_revision=transition_revision,
         )
         if access_reason:
-            return blocked_payload(access_reason)
-        return result
+            return finalize(blocked_payload(access_reason))
+        return finalize(result)
 
     @llm_tool(
         name="hearthstone_battlegrounds_advice",
         description=(
-            "Always call this tool first for every Battlegrounds/酒馆/酒馆战棋 question that needs facts or advice, "
-            "including hero selection, triples/discover choices, quests, trinkets, buddies, tavern spells, "
-            "archetypes/流派, warband composition and positioning, transitions, opponent targeting, leveling, "
-            "stabilizing, purchases, sales, refreshes, and freezes. Query the fresh privacy-filtered public state, "
-            "per-area completeness, observed actual costs and current card attributes, attributed current-pool card "
-            "facts, official season rules, and aggregate-only local results. Respect each capability status and "
-            "missing_evidence. shop_card_priority_advice may support a qualitative ranking when actual card costs "
-            "are unknown; purchase_affordability and specific_purchase_advice must not infer a default minion cost, "
-            "and exact affordability or purchase sequences require observed gold and actual costs. If any shop "
-            "current_cost is null, whole-shop affordability is unknown even with 0 Gold. Never conclude that nothing "
-            "can be bought, the turn must be passed, or no free action exists. Obey decision_guardrails and never turn "
-            "partial or unavailable evidence into a specific recommendation. "
-            "This tool is Battlegrounds-only: never answer with constructed decks or constructed archetypes. "
-            "It never provides unlicensed global win rates."
+            "Use for every current Battlegrounds/酒馆战棋 fact or decision: hero/Choice, shop, tavern spells, "
+            "warband, positioning, opponents, archetype, buying, leveling, refreshing, freezing, or stabilizing. "
+            "Returns fresh public state, area completeness, observed actual costs/current attributes, sourced card "
+            "facts, official rules, and local aggregate results. Respect capability status, missing_evidence, and "
+            "decision_guardrails; never infer unknown costs or exact affordability. Battlegrounds only, not constructed."
         ),
         parameters={
             "type": "object",
             "properties": {
+                "focus": {
+                    "type": "string",
+                    "enum": list(_BATTLEGROUNDS_TOOL_FOCUSES),
+                    "description": "The exact Battlegrounds area needed to answer the current question.",
+                },
                 "topic": {
                     "type": "string",
                     "enum": ["current_strategy", "season_meta", "hero_performance", "post_game"],
@@ -3307,14 +4745,25 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                         "season_meta only for official season mechanics or patch rules, never composition "
                         "win-rate rankings. hero_performance is aggregate local history; post_game is review."
                     ),
-                }
+                },
+                "opponent_relation": {
+                    "type": "string",
+                    "enum": ["auto", "current", "next", "last"],
+                    "default": "auto",
+                    "description": "Which public opponent observation the question refers to.",
+                },
             },
+            "required": ["focus"],
             "additionalProperties": False,
         },
         timeout=5.0,
     )
     async def hearthstone_battlegrounds_advice(
-        self, topic: str = "current_strategy", **_: Any
+        self,
+        topic: str = "current_strategy",
+        focus: str | None = None,
+        opponent_relation: str = "auto",
+        **_: Any,
     ) -> dict[str, Any]:
         answer_contract = {
             "answer_as_battlegrounds_not_constructed": True,
@@ -3359,16 +4808,26 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 ),
             }
 
+        def finalize(payload: Mapping[str, Any]) -> dict[str, Any]:
+            if focus is None:
+                return dict(payload)
+            return _focused_llm_tool_result(
+                payload,
+                mode="battlegrounds",
+                focus=focus,
+                opponent_relation=opponent_relation,
+            )
+
         allowed_topics = {"current_strategy", "season_meta", "hero_performance", "post_game"}
         selected_topic = topic if topic in allowed_topics else "current_strategy"
         access_reason, transition_revision = _live_state_access(self)
         if access_reason:
-            return blocked_payload(access_reason)
+            return finalize(blocked_payload(access_reason))
         monitor = self._ensure_monitor()
         try:
             snapshot, runtime, _generation = _capture_monitor(monitor, timeout_seconds=0.05)
         except TimeoutError:
-            return blocked_payload("state_refresh_in_progress")
+            return finalize(blocked_payload("state_refresh_in_progress"))
         captured_at = time.time()
         freshness = _state_freshness(snapshot, runtime, captured_at=captured_at)
         battlegrounds = snapshot.battlegrounds.to_public_dict() if snapshot.battlegrounds else None
@@ -3393,13 +4852,13 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 expected_transition_revision=transition_revision,
             )
             if access_reason:
-                return blocked_payload(access_reason)
+                return finalize(blocked_payload(access_reason))
             try:
                 snapshot, runtime, _generation = _capture_monitor(
                     monitor, timeout_seconds=0.05
                 )
             except TimeoutError:
-                return blocked_payload("state_refresh_in_progress")
+                return finalize(blocked_payload("state_refresh_in_progress"))
             captured_at = time.time()
             freshness = _state_freshness(snapshot, runtime, captured_at=captured_at)
         season_key = str(self._season.get("key") or "local-unversioned")
@@ -3446,7 +4905,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             expected_transition_revision=transition_revision,
         )
         if access_reason:
-            return blocked_payload(access_reason)
+            return finalize(blocked_payload(access_reason))
         if catalog_facts_needed:
             catalog_state = snapshot.battlegrounds
             if catalog_state is not None and battlegrounds_phase == "combat":
@@ -4100,8 +5559,8 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             expected_transition_revision=transition_revision,
         )
         if access_reason:
-            return blocked_payload(access_reason)
-        return result
+            return finalize(blocked_payload(access_reason))
+        return finalize(result)
 
 
 __all__ = ["HearthstoneCompanionPlugin"]

@@ -493,6 +493,183 @@ def test_live_constructed_context_never_shares_hand_or_choice_identities() -> No
     assert '"choice_type":"discover"' in prompt
 
 
+def test_live_constructed_delivery_includes_turn_owner_and_public_boards() -> None:
+    snapshot = GameSnapshot(
+        mode="constructed",
+        phase="playing",
+        game_number=4,
+        turn=7,
+        round=4,
+        active_side="opponent",
+        constructed=ConstructedSnapshot(
+            variant="ranked",
+            player=ConstructedSideSnapshot(
+                hand_count=3,
+                known_hand=(
+                    ConstructedCardSnapshot(
+                        card_id="PRIVATE_PLAYER_HAND",
+                        name="私有手牌",
+                        card_type="SPELL",
+                    ),
+                ),
+                board=(
+                    ConstructedCardSnapshot(
+                        card_id="PLAYER_PUBLIC_MINION",
+                        name="我方公开随从",
+                        card_type="MINION",
+                        zone_position=2,
+                        attack=4,
+                        health=5,
+                        keywords=("taunt", "divine_shield"),
+                    ),
+                ),
+            ),
+            opponent=ConstructedSideSnapshot(
+                hand_count=5,
+                known_hand=(
+                    ConstructedCardSnapshot(
+                        card_id="PRIVATE_OPPONENT_HAND",
+                        name="对手隐藏手牌",
+                        card_type="SPELL",
+                    ),
+                ),
+                board=(
+                    ConstructedCardSnapshot(
+                        card_id="OPPONENT_PUBLIC_MINION",
+                        name="对方公开随从",
+                        card_type="MINION",
+                        zone_position=1,
+                        attack=3,
+                        health=4,
+                        keywords=("reborn", "stealth"),
+                    ),
+                ),
+            ),
+        ),
+        choice=ChoiceSnapshot(
+            choice_type="discover",
+            options=(ConstructedCardSnapshot(card_id="PRIVATE_CHOICE"),),
+        ),
+    )
+
+    prompts = build_live_state_contexts(
+        snapshot,
+        observed_at=1_770_000_000.123,
+        max_prompt_bytes=900,
+    )
+    payloads = [json.loads(prompt.split(":", 1)[1]) for prompt in prompts]
+    by_segment = {payload["segment"]: payload for payload in payloads}
+    serialized = json.dumps(payloads, ensure_ascii=False)
+
+    assert set(by_segment) == {
+        "core",
+        "status",
+        "opponent_board_1",
+        "player_board_1",
+        "player_hand_1",
+    }
+    assert all(len(prompt.encode("utf-8")) <= 900 for prompt in prompts)
+    assert by_segment["core"]["action_turn"] == 7
+    assert by_segment["core"]["round"] == 4
+    assert by_segment["core"]["active_side"] == "opponent"
+    assert by_segment["status"]["choice"] == {
+        "type": "discover",
+        "min": 0,
+        "max": 0,
+        "option_count": 1,
+    }
+    assert "我方公开随从" in serialized
+    assert "对方公开随从" in serialized
+    assert by_segment["player_board_1"]["cards"][0] == [
+        "PLAYER_PUBLIC_MINION",
+        "我方公开随从",
+        2,
+        4,
+        5,
+        "td",
+        "",
+    ]
+    assert by_segment["opponent_board_1"]["cards"][0] == [
+        "OPPONENT_PUBLIC_MINION",
+        "对方公开随从",
+        1,
+        3,
+        4,
+        "rs",
+        "",
+    ]
+    assert "私有手牌" in serialized
+    assert "PRIVATE_OPPONENT_HAND" not in serialized
+    assert "PRIVATE_CHOICE" not in serialized
+
+
+def test_live_constructed_delivery_keeps_full_public_board_under_byte_limit() -> None:
+    oversized_name = "公开但超长的随从名称" * 50
+    player_board = tuple(
+        ConstructedCardSnapshot(
+            card_id=f"PLAYER_BOARD_{index}",
+            name=oversized_name,
+            card_type="MINION",
+            zone_position=(1, 3, 4, 6, 8, 9, 12)[index],
+            attack=index + 1,
+            health=index + 2,
+            keywords=("taunt", "lifesteal", "rush"),
+            states=("frozen", "silenced", "future_state") if index == 0 else (),
+        )
+        for index in range(7)
+    )
+    opponent_board = tuple(
+        ConstructedCardSnapshot(
+            card_id=f"OPPONENT_BOARD_{index}",
+            name=oversized_name,
+            card_type="MINION",
+            zone_position=index + 1,
+            attack=index + 3,
+            health=index + 4,
+            keywords=("divine_shield", "reborn", "charge"),
+        )
+        for index in range(7)
+    )
+    snapshot = GameSnapshot(
+        mode="constructed",
+        phase="playing",
+        game_number=6,
+        turn=19,
+        round=10,
+        active_side="player",
+        constructed=ConstructedSnapshot(
+            player=ConstructedSideSnapshot(board=player_board),
+            opponent=ConstructedSideSnapshot(board=opponent_board),
+        ),
+    )
+
+    prompts = build_live_state_contexts(snapshot, max_prompt_bytes=900)
+    serialized = "\n".join(prompts)
+
+    payloads = [json.loads(prompt.split(":", 1)[1]) for prompt in prompts]
+    segment_names = {payload["segment"] for payload in payloads}
+    assert {"core", "status"} <= segment_names
+    assert sum(name.startswith("opponent_board_") for name in segment_names) > 1
+    assert sum(name.startswith("player_board_") for name in segment_names) > 1
+    assert all(len(prompt.encode("utf-8")) <= 900 for prompt in prompts)
+    assert all(len(payload.get("cards", [])) <= 7 for payload in payloads)
+    assert all(f"PLAYER_BOARD_{index}" in serialized for index in range(7))
+    assert all(f"OPPONENT_BOARD_{index}" in serialized for index in range(7))
+    assert oversized_name not in serialized
+    rows = [
+        card
+        for payload in payloads
+        for card in payload.get("cards", [])
+    ]
+    rows_by_id = {card[0]: card for card in rows}
+    assert rows_by_id["PLAYER_BOARD_0"][1]
+    assert rows_by_id["PLAYER_BOARD_0"][2] == 1
+    assert rows_by_id["PLAYER_BOARD_6"][2] == 12
+    assert rows_by_id["PLAYER_BOARD_0"][5] == "tlu"
+    assert rows_by_id["PLAYER_BOARD_0"][6] == "fs?"
+    assert rows_by_id["OPPONENT_BOARD_0"][5] == "drc"
+
+
 def test_live_state_context_is_valid_json_and_respects_host_safe_hard_limit() -> None:
     oversized = "超长不可信卡名" * 200
     cards = tuple(
@@ -594,24 +771,37 @@ def test_live_state_contexts_survive_packaged_host_byte_fallback_with_dynamic_st
 
     prompts = build_live_state_contexts(
         snapshot,
-        observed_at=1235.0,
+        observed_at=1_770_000_000.123,
         max_prompt_bytes=900,
     )
 
-    assert len(prompts) in {2, 3}
     assert all(len(prompt.encode("utf-8")) <= 900 for prompt in prompts)
     payloads = [json.loads(prompt.split(":", 1)[1]) for prompt in prompts]
-    assert {payload["segment"] for payload in payloads} >= {"core", "board"}
-    assert all(payload["of"] == len(prompts) for payload in payloads)
+    assert {payload["segment"] for payload in payloads} >= {
+        "core",
+        "shop_1",
+        "hand_1",
+        "warband_1",
+    }
+    assert all(len(payload.get("cards", [])) <= 10 for payload in payloads)
     serialized = json.dumps(payloads, ensure_ascii=False)
     assert "BG_RUNTIME_CARD" in serialized
     assert oversized not in serialized
-    assert '"p": "recruit"' in serialized
-    assert '"g": [8, 10]' in serialized
-    assert '"c": [0, 6]' in serialized
-    assert "BS" in serialized
-    assert "golden" in serialized
-    assert "divine_shield" in serialized
+    assert '"phase": "recruit"' in serialized
+    assert '"gold": 8' in serialized
+    assert '"refresh_actual_cost": 0' in serialized
+    assert '"upgrade_actual_cost": 6' in serialized
+    rows = [
+        card
+        for payload in payloads
+        for card in payload.get("cards", [])
+    ]
+    runtime_rows = [card for card in rows if card[0] == "BG_RUNTIME_CARD_0"]
+    assert runtime_rows
+    assert all(card[1] for card in runtime_rows)
+    assert all(card[2] == 1 for card in runtime_rows)
+    assert any(card[7].startswith("sg") for card in runtime_rows)
+    assert any("D" in card[7] for card in runtime_rows)
 
 
 def test_live_state_contexts_change_with_mode_and_observation_time() -> None:
@@ -620,7 +810,7 @@ def test_live_state_contexts_change_with_mode_and_observation_time() -> None:
         observed_at=1235.0,
         max_prompt_bytes=900,
     )[0]
-    battlegrounds_prompt = build_live_state_contexts(
+    battlegrounds_prompts = build_live_state_contexts(
         GameSnapshot(
             mode="battlegrounds",
             phase="recruit",
@@ -636,10 +826,16 @@ def test_live_state_contexts_change_with_mode_and_observation_time() -> None:
         ),
         observed_at=9999.0,
         max_prompt_bytes=900,
-    )[0]
+    )
+    battlegrounds_prompt = battlegrounds_prompts[0]
 
     assert constructed_prompt != battlegrounds_prompt
     assert '"mode":"constructed"' in constructed_prompt
     assert '"turn":5' in constructed_prompt
-    assert "PRIVATE_RUNTIME_CARD" in battlegrounds_prompt
-    assert '"at":9999.0' in battlegrounds_prompt
+    assert "PRIVATE_RUNTIME_CARD" in "\n".join(battlegrounds_prompts)
+    revisions = {
+        json.loads(prompt.split(":", 1)[1])["revision"]
+        for prompt in battlegrounds_prompts
+    }
+    assert len(revisions) == 1
+    assert next(iter(revisions)).startswith("g99:")

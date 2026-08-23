@@ -121,6 +121,33 @@ class _HostContext:
     def update_status(self, _status: dict[str, object]) -> None:
         return None
 
+    async def finish(
+        self,
+        *,
+        data: object = None,
+        delivery: str | bool | None = None,
+        reply: bool | None = None,
+        message: str = "",
+        trace_id: str | None = None,
+        meta: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        del reply
+        normalized_meta = dict(meta or {})
+        agent_meta = dict(normalized_meta.get("agent") or {})
+        agent_meta["delivery"] = delivery if isinstance(delivery, str) else "proactive"
+        agent_meta["reply"] = agent_meta["delivery"] != "silent"
+        agent_meta.setdefault("include", True)
+        normalized_meta["agent"] = agent_meta
+        return {
+            "success": True,
+            "code": 0,
+            "data": data,
+            "message": message,
+            "error": None,
+            "trace_id": trace_id,
+            "meta": normalized_meta,
+        }
+
 
 def _install_stable_sdk(sdk_root: Path) -> tuple[type[Any], Any]:
     plugin_path = sdk_root / "plugin"
@@ -167,7 +194,7 @@ def _load_plugin(plugin_root: Path) -> types.ModuleType:
     return module
 
 
-async def _exercise_lifecycle(plugin: Any, unwrap_or: Any) -> None:
+async def _exercise_lifecycle(plugin: Any, unwrap_or: Any, host_ctx: _HostContext) -> None:
     shutdown: dict[str, Any] = {}
     try:
         tools = {item["name"] for item in plugin.list_llm_tools()}
@@ -177,6 +204,36 @@ async def _exercise_lifecycle(plugin: Any, unwrap_or: Any) -> None:
         }
         if tools != expected_tools:
             raise RuntimeError(f"stable SDK did not auto-register LLM tools: {tools!r}")
+        entries = {item["id"]: item for item in plugin.list_entries()}
+        health_timer = entries.get("llm_tool_registration_health")
+        if (
+            not health_timer
+            or health_timer.get("kind") != "timer"
+            or health_timer.get("auto_start") is not True
+        ):
+            raise RuntimeError(
+                f"stable SDK did not expose the LLM tool health timer: {health_timer!r}"
+            )
+        for entry_id in ("query_constructed_state", "query_battlegrounds_state"):
+            item = entries.get(entry_id)
+            if not item or item.get("dynamic") is not True:
+                raise RuntimeError(f"stable SDK did not expose dynamic Agent entry: {entry_id}")
+            if item.get("kind") != "service" or item.get("llm_result_fields") != ["reply"]:
+                raise RuntimeError(f"unexpected dynamic Agent entry metadata: {item!r}")
+
+        entry_updates: dict[str, dict[str, Any]] = {}
+        while True:
+            try:
+                message = host_ctx.message_queue.get_nowait()
+            except queue.Empty:
+                break
+            if message.get("type") == "ENTRY_UPDATE" and message.get("action") == "register":
+                entry_updates[str(message.get("entry_id") or "")] = message
+        if not {"query_constructed_state", "query_battlegrounds_state"}.issubset(entry_updates):
+            raise RuntimeError(f"stable SDK did not queue Agent ENTRY_UPDATE messages: {entry_updates!r}")
+        for entry_id in ("query_constructed_state", "query_battlegrounds_state"):
+            if entry_updates[entry_id].get("meta", {}).get("llm_result_fields") != ["reply"]:
+                raise RuntimeError(f"ENTRY_UPDATE lost result filtering for {entry_id}")
         startup = unwrap_or(await plugin.startup(), {})
         if startup.get("status") != "ready":
             raise RuntimeError(f"unexpected startup result: {startup!r}")
@@ -184,6 +241,19 @@ async def _exercise_lifecycle(plugin: Any, unwrap_or: Any) -> None:
             raise RuntimeError("stable SDK smoke unexpectedly started the log monitor")
         if startup.get("card_catalog_started") is not False:
             raise RuntimeError("stable SDK smoke unexpectedly started the network catalog")
+        for result in (
+            await plugin.query_constructed_state(),
+            await plugin.query_battlegrounds_state(),
+        ):
+            agent_meta = result.get("meta", {}).get("agent", {})
+            if agent_meta.get("result_kind") != "event":
+                raise RuntimeError(f"Agent query lost event result semantics: {result!r}")
+            if agent_meta.get("expires_in_s") != 8.0:
+                raise RuntimeError(f"Agent query lost realtime expiry: {result!r}")
+            if agent_meta.get("delivery") != "silent":
+                raise RuntimeError(f"legacy Agent query could append a duplicate reply: {result!r}")
+            if not str(result.get("data", {}).get("reply") or "").startswith("HS_QUERY "):
+                raise RuntimeError(f"Agent query returned no compact reply: {result!r}")
         saved = unwrap_or(
             await plugin.save_settings(
                 llm_data_consent=True,
@@ -234,7 +304,8 @@ def main() -> int:
         try:
             stable_base, unwrap_or = _install_stable_sdk(sdk_root)
             entry = _load_plugin(plugin_root)
-            plugin = entry.HearthstoneCompanionPlugin(_HostContext(plugin_root, _Logger()))
+            host_ctx = _HostContext(plugin_root, _Logger())
+            plugin = entry.HearthstoneCompanionPlugin(host_ctx)
             if not isinstance(plugin, stable_base):
                 raise RuntimeError("plugin did not inherit the stable SDK base class")
             if plugin._overlay.plugin_dir != plugin.config_dir:
@@ -244,7 +315,7 @@ def main() -> int:
             )
             if plugin._catalog.cache_file != expected_catalog:
                 raise RuntimeError("catalog path does not use stable data_path")
-            asyncio.run(_exercise_lifecycle(plugin, unwrap_or))
+            asyncio.run(_exercise_lifecycle(plugin, unwrap_or, host_ctx))
         finally:
             if previous_storage_root is None:
                 os.environ.pop("NEKO_STORAGE_SELECTED_ROOT", None)

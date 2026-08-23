@@ -230,7 +230,11 @@ _BATTLEGROUNDS_KEYWORD_TAGS = (
     ("ELUSIVE", "elusive"),
 )
 _BATTLEGROUNDS_BOOLEAN_BASELINE_TAGS = frozenset(
-    {"PREMIUM", *(tag for tag, _public_name in _BATTLEGROUNDS_KEYWORD_TAGS)}
+    {
+        "FROZEN",
+        "PREMIUM",
+        *(tag for tag, _public_name in _BATTLEGROUNDS_KEYWORD_TAGS),
+    }
 )
 _CARD_IDENTITY_TAGS = frozenset(
     {
@@ -429,6 +433,9 @@ class PowerLogParser:
         self._last_recruit_warband_observed_at = 0.0
         self._last_recruit_warband_revision = 0
         self._explicit_battlegrounds_phase_signal_seen = False
+        self._battlegrounds_turn_phase_seen = False
+        self._battlegrounds_fallback_phase_state_used = False
+        self._battlegrounds_global_turn = 0
         self._battlegrounds_counter_highs: dict[tuple[int, str], int] = {}
         self.entity_capacity_exceeded = False
         self.entities_evicted = 0
@@ -488,6 +495,9 @@ class PowerLogParser:
         self._last_recruit_warband_observed_at = 0.0
         self._last_recruit_warband_revision = 0
         self._explicit_battlegrounds_phase_signal_seen = False
+        self._battlegrounds_turn_phase_seen = False
+        self._battlegrounds_fallback_phase_state_used = False
+        self._battlegrounds_global_turn = 0
         self._battlegrounds_counter_highs.clear()
         self.entity_capacity_exceeded = False
         self.entities_evicted = 0
@@ -1848,14 +1858,56 @@ class PowerLogParser:
                     )
         elif tag == "TURN":
             turn = _int(value)
-            if turn is not None and turn > self.turn:
+            is_global_game_turn = bool(
+                turn is not None
+                and turn > 0
+                and entity.card_type == "GAME"
+                and (
+                    self.game_entity_id is None
+                    or entity.entity_id == self.game_entity_id
+                )
+            )
+            if self.mode == "battlegrounds" and is_global_game_turn:
+                if turn > self._battlegrounds_global_turn:
+                    fallback_state_used = (
+                        not self._battlegrounds_turn_phase_seen
+                        and self._battlegrounds_fallback_phase_state_used
+                    )
+                    fallback_ahead = (
+                        not self._battlegrounds_turn_phase_seen and self.turn > turn
+                    )
+                    self._battlegrounds_global_turn = turn
+                    self._battlegrounds_turn_phase_seen = True
+                    if fallback_state_used:
+                        # A non-GameEntity TURN is only a legacy fallback. Once
+                        # the authoritative game turn arrives, discard phase
+                        # bookkeeping derived from that fallback even when both
+                        # signals carry the same turn number.
+                        self.turn = turn
+                        if fallback_ahead:
+                            self.battlegrounds_round = 0
+                        self._discard_battlegrounds_fallback_phase_state()
+                        if not self.spectating and self.phase not in {
+                            "spectator",
+                            "ended",
+                        }:
+                            self.phase = "unknown"
+                    else:
+                        self.turn = max(self.turn, turn)
+                    self._battlegrounds_fallback_phase_state_used = False
+                    events.extend(
+                        self._reconcile_battlegrounds_turn_phase(turn, timestamp)
+                    )
+            elif (
+                self.mode == "battlegrounds"
+                and not self._battlegrounds_turn_phase_seen
+                and turn is not None
+                and turn > self.turn
+            ):
                 self.turn = turn
-                if self.mode == "battlegrounds":
-                    next_round = (turn + 1) // 2
-                    if next_round <= self.battlegrounds_round:
-                        return self._defer(events)
-                    if self.phase == "combat":
-                        events.extend(self._finish_battlegrounds_combat(timestamp))
+                self._battlegrounds_fallback_phase_state_used = True
+                next_round = (turn + 1) // 2
+                if next_round > self.battlegrounds_round:
                     self.battlegrounds_round = next_round
                     events.append(
                         GameEvent(
@@ -1866,7 +1918,13 @@ class PowerLogParser:
                             {"turn": turn, "round": self.battlegrounds_round},
                         )
                     )
-                elif self.mode == "constructed" and self._constructed_setup_done:
+            elif (
+                self.mode != "battlegrounds"
+                and turn is not None
+                and turn > self.turn
+            ):
+                self.turn = turn
+                if self.mode == "constructed" and self._constructed_setup_done:
                     if self.phase not in {"spectator", "ended"}:
                         self.phase = "playing"
                     events.extend(self._emit_constructed_turn_if_ready(timestamp))
@@ -1879,6 +1937,7 @@ class PowerLogParser:
                 if (
                     self.mode == "battlegrounds"
                     and not self.spectating
+                    and not self._battlegrounds_turn_phase_seen
                     and not self._explicit_battlegrounds_phase_signal_seen
                 ):
                     if (
@@ -1890,6 +1949,8 @@ class PowerLogParser:
                     ):
                         previous = self.phase
                         self.phase = "recruit"
+                        if previous != self.phase:
+                            self._battlegrounds_fallback_phase_state_used = True
                         if previous == "combat":
                             events.extend(self._finish_battlegrounds_combat(timestamp))
                             events.append(
@@ -1907,6 +1968,7 @@ class PowerLogParser:
                         and self.battlegrounds_round > 0
                         and self.turn % 2 == 1
                     ):
+                        self._battlegrounds_fallback_phase_state_used = True
                         self._cache_recruit_warband()
                         self.phase = "combat"
                         if self._begin_battlegrounds_combat():
@@ -1998,22 +2060,27 @@ class PowerLogParser:
         elif tag in {"2022", "3533"} and self.mode == "battlegrounds":
             expected = "3533" if self.battlegrounds_variant == "duos" else "2022"
             previous, current = _int(old_value), _int(value)
-            if tag == expected:
+            if tag == expected and not self._battlegrounds_turn_phase_seen:
                 self._explicit_battlegrounds_phase_signal_seen = True
             if (
                 tag == expected
+                and not self._battlegrounds_turn_phase_seen
                 and previous is None
                 and current == 1
                 and self.phase not in {"combat", "ended", "spectator"}
             ):
+                if self.phase != "recruit":
+                    self._battlegrounds_fallback_phase_state_used = True
                 self.phase = "recruit"
             elif (
                 tag == expected
+                and not self._battlegrounds_turn_phase_seen
                 and previous is None
                 and current == 0
                 and self.battlegrounds_round > 0
                 and self.phase not in {"combat", "ended", "spectator"}
             ):
+                self._battlegrounds_fallback_phase_state_used = True
                 self._cache_recruit_warband()
                 self.phase = "combat"
                 if self._begin_battlegrounds_combat():
@@ -2029,7 +2096,14 @@ class PowerLogParser:
                             },
                         )
                     )
-            elif tag == expected and previous == 1 and current == 0 and self.phase != "combat":
+            elif (
+                tag == expected
+                and not self._battlegrounds_turn_phase_seen
+                and previous == 1
+                and current == 0
+                and self.phase != "combat"
+            ):
+                self._battlegrounds_fallback_phase_state_used = True
                 self._cache_recruit_warband()
                 self.phase = "combat"
                 if self._begin_battlegrounds_combat():
@@ -2045,7 +2119,13 @@ class PowerLogParser:
                             },
                         )
                     )
-            elif tag == expected and previous == 0 and current == 1:
+            elif (
+                tag == expected
+                and not self._battlegrounds_turn_phase_seen
+                and previous == 0
+                and current == 1
+            ):
+                self._battlegrounds_fallback_phase_state_used = True
                 was_combat = self.phase == "combat"
                 events.extend(self._finish_battlegrounds_combat(timestamp))
                 self.phase = "recruit"
@@ -2547,6 +2627,7 @@ class PowerLogParser:
                 shop_entities,
                 shop_cards,
                 allow_empty=False,
+                require_current_observation=True,
             ),
             "hand": self._battlegrounds_area(
                 hand_entities,
@@ -2605,7 +2686,13 @@ class PowerLogParser:
             refresh_cost=economy.refresh_cost,
             upgrade_cost=economy.upgrade_cost,
             tavern_tier=self._battlegrounds_tavern_tier(local_hero, local_player),
-            frozen=any(entity.tag_int("FROZEN") > 0 for entity in shop_entities),
+            frozen=(
+                True
+                if any(card.frozen is True for card in shop_cards)
+                else False
+                if shop_cards and all(card.frozen is False for card in shop_cards)
+                else None
+            ),
             next_opponent_player_id=self._resolved_next_opponent_player_id(),
             current_opponent_player_id=self.current_opponent_player_id,
             last_opponent_player_id=self.last_opponent_player_id,
@@ -2710,6 +2797,11 @@ class PowerLogParser:
                 if "PREMIUM" in entity.tags
                 else missing_boolean
             )
+            frozen = (
+                entity.tag_int("FROZEN") > 0
+                if "FROZEN" in entity.tags
+                else missing_boolean
+            )
             keywords = {
                 public_name: (
                     entity.tag_int(tag) > 0 if tag in entity.tags else missing_boolean
@@ -2724,7 +2816,7 @@ class PowerLogParser:
                     attack=entity.attack,
                     health=entity.health,
                     tier=max(entity.tag_int("TECH_LEVEL"), entity.tag_int("BACON_CARD_TIER")),
-                    frozen=entity.tag_int("FROZEN") > 0,
+                    frozen=frozen,
                     position=entity.tag_int("ZONE_POSITION"),
                     premium=premium,
                     current_cost=(
@@ -3025,6 +3117,7 @@ class PowerLogParser:
         *,
         allow_empty: bool,
         fallback: Entity | None = None,
+        require_current_observation: bool = False,
     ) -> BattlegroundsAreaSnapshot:
         visible_entities = [entity for entity in entities if not entity.hidden]
         observed_entities = [*visible_entities]
@@ -3039,25 +3132,32 @@ class PowerLogParser:
             bool(entity.card_id or entity.public_name()) and bool(entity.card_type)
             for entity in visible_entities
         )
+        observation_current = bool(
+            not require_current_observation
+            or (
+                observed_entities
+                and all(
+                    entity.last_battlegrounds_round == self.battlegrounds_round
+                    and entity.last_battlegrounds_phase == self.phase
+                    for entity in observed_entities
+                )
+            )
+        )
         complete = bool(
             (visible_entities or allow_empty)
             and len(cards) == len(visible_entities)
             and positioned_complete
             and identities_complete
+            and observation_current
         )
+        revisions = [entity.last_revision for entity in observed_entities]
+        observed_times = [entity.last_seen_at for entity in observed_entities]
         return BattlegroundsAreaSnapshot(
             complete=complete,
-            revision=max(
-                (entity.last_revision for entity in observed_entities),
-                default=0,
-            ),
-            observed_at=max(
-                (entity.last_seen_at for entity in observed_entities),
-                default=0.0,
-            )
-            or None,
-            round=self.battlegrounds_round,
-            phase=self.phase,
+            revision=min(revisions, default=0),
+            observed_at=min(observed_times, default=0.0) or None,
+            round=self.battlegrounds_round if observation_current else 0,
+            phase=self.phase if observation_current else "unknown",
         )
 
     def _battlegrounds_hero_choices(self) -> tuple[BattlegroundsHeroChoiceSnapshot, ...]:
@@ -3307,6 +3407,95 @@ class PowerLogParser:
         if controller != self.bob_controller and controller != opponent_player_id:
             return
         self._capture_observed_opponent_board()
+
+    def _reconcile_battlegrounds_turn_phase(
+        self,
+        turn: int,
+        timestamp: float,
+    ) -> list[GameEvent]:
+        events: list[GameEvent] = []
+        next_round = (turn + 1) // 2
+        recruit_turn = turn % 2 == 1
+        phase_locked = self.spectating or self.phase in {"spectator", "ended"}
+        previous_phase = self.phase
+
+        if recruit_turn and previous_phase == "combat" and not phase_locked:
+            events.extend(self._finish_battlegrounds_combat(timestamp))
+
+        if next_round > self.battlegrounds_round:
+            self.battlegrounds_round = next_round
+            events.append(
+                GameEvent(
+                    "battlegrounds_round",
+                    3,
+                    f"酒馆第{self.battlegrounds_round}回合",
+                    timestamp,
+                    {"turn": turn, "round": self.battlegrounds_round},
+                )
+            )
+
+        if phase_locked:
+            return events
+        if recruit_turn:
+            self.phase = "recruit"
+            if previous_phase == "combat":
+                events.append(
+                    GameEvent(
+                        "battlegrounds_recruit_started",
+                        5,
+                        f"第{self.battlegrounds_round}回合开始招募",
+                        timestamp,
+                        {"round": self.battlegrounds_round},
+                    )
+                )
+            return events
+
+        if previous_phase != "combat":
+            if previous_phase == "recruit":
+                self._cache_recruit_warband()
+            self.phase = "combat"
+            if self._begin_battlegrounds_combat():
+                events.append(
+                    GameEvent(
+                        "battlegrounds_combat_started",
+                        6,
+                        f"第{self.battlegrounds_round}回合战斗开始",
+                        timestamp,
+                        {
+                            "round": self.battlegrounds_round,
+                            "opponent_player_id": self.current_opponent_player_id,
+                        },
+                    )
+                )
+        return events
+
+    def _discard_battlegrounds_fallback_phase_state(self) -> None:
+        fallback_opponent_player_id = self.current_opponent_player_id
+        if (
+            fallback_opponent_player_id <= 0
+            and self._combat_result_emitted_round > 0
+            and self.last_opponent_round == self._combat_result_emitted_round
+        ):
+            fallback_opponent_player_id = self.last_opponent_player_id
+        if self.next_opponent_player_id <= 0 and fallback_opponent_player_id > 0:
+            self.next_opponent_player_id = fallback_opponent_player_id
+        self.current_opponent_player_id = 0
+        if (
+            self._combat_result_emitted_round > 0
+            and self.last_opponent_round == self._combat_result_emitted_round
+        ):
+            self.last_opponent_player_id = 0
+            self.last_opponent_round = 0
+        self._combat_active_round = 0
+        self._combat_result_emitted_round = 0
+        self._combat_damage_taken = 0
+        self._combat_damage_dealt = 0
+        self._combat_bob_stale_entity_ids.clear()
+        self._recruit_bob_stale_entity_ids.clear()
+        self._last_recruit_warband = ()
+        self._last_recruit_warband_area = BattlegroundsAreaSnapshot()
+        self._last_recruit_warband_observed_at = 0.0
+        self._last_recruit_warband_revision = 0
 
     def _begin_battlegrounds_combat(self) -> bool:
         round_number = max(1, self.battlegrounds_round)

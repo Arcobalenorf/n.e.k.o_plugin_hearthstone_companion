@@ -226,10 +226,7 @@ def test_active_battlegrounds_bootstrap_notifies_state_ready_before_first_turn()
     assert results == []
 
 
-def test_monitor_publishes_live_snapshot_and_refreshes_it_without_new_state(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(monitor_module, "LIVE_STATE_PUBLISH_INTERVAL_SECONDS", 0.0)
+def test_monitor_publishes_live_snapshot_only_when_state_changes() -> None:
     path = Path("battlegrounds-passive/Power.log")
     lines = (
         "D 12:00:00.0000000 GameState.DebugPrintPower() - CREATE_GAME",
@@ -264,7 +261,7 @@ def test_monitor_publishes_live_snapshot_and_refreshes_it_without_new_state(
         time.sleep(0.01)
     assert monitor.stop(timeout=2.0)
 
-    assert len(published) >= 2
+    assert len(published) == 1
     assert all(snapshot.mode == "battlegrounds" for snapshot in published)
     assert all(snapshot.phase == "hero_select" for snapshot in published)
     assert monitor.status().events_seen == 0

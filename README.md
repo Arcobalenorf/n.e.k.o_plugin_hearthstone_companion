@@ -6,20 +6,21 @@
 
 ## 陪伴体验
 
-- 监听到新鲜对局后，以隐藏 `read` 按固定 key 覆盖更新过滤后的实时公开状态；普通对战为一个精简分段，酒馆为二至三个分段，每段不超过 900 UTF-8 字节。酒馆分段保留模式、阶段、回合、金币、刷新/升本费用，以及商店、手牌、战团中实际观测的 CardID、类型、费用、金色状态和当前关键词。
-- 显式配置固定 `target_lanlan` 时，额外建立稳定炉石场景并定向投递；目标为空时，隐藏 `read` 省略目标，由 N.E.K.O 只在恰好一个角色会话已连接时安全接收，多会话歧义时宿主会丢弃而不会广播。插件不会从消息上下文或宿主私有接口猜测角色；需要稳定多会话路由或主动解说时必须填写角色名，工具结果则自动返回实际发起调用的对话。
+- 监听到新鲜对局后，本机持续维护完整结构化状态。显式配置固定 `target_lanlan` 时，只在回合、阶段、行动方或 Choice 等语义变化时定向发送一条不含牌局事实的隐藏查询提示；目标为空时不发送被动提示。
+- 当前事实由生成回答的同一轮 `@llm_tool` 查询，工具结果自动返回实际发起调用的对话。插件不会从消息上下文、Conversations Bus 或宿主私有接口猜测角色。
 - 三连、低血量、升本、逐轮战果与最终名次等公开事实会形成结构化情绪信号；真正的台词始终由当前 N.E.K.O 角色生成。
 - 主动解说只选择稀疏且有情绪价值的事件，并受普通/关键冷却与 30 秒用户聊天静默窗约束；静默窗内只有优先级 `>=9` 的关键事件可以绕过。
-- 用户问“现在酒馆玩什么流派”“这局怎么走”或任何酒馆当前事实时，Agent 路由调用 `query_battlegrounds_state`，其内部读取 `hearthstone_battlegrounds_advice` 的最新动态局势、规则依据、统计边界和逐项 evidence gate。
-- 用户问普通对战“第几回合”“轮到谁”、具体手牌、Choice 或出牌取舍时，Agent 路由调用 `query_constructed_state`，其内部重新读取 `hearthstone_current_state`；不能只沿用聊天历史中的快照或短评。
-- 通用状态工具在酒馆模式只返回专用工具重定向，不重复发送整份酒馆快照；酒馆结果先给出逐卡 `known_affordable`、`known_unaffordable` 或 `unknown_cost_may_be_zero` 的紧凑决策面，再附完整局势与规则依据。
-- 启用插件即默认允许过滤后的实时公开状态和问答查询入口供当前角色使用，用户仍可随时关闭；主动解说默认关闭，其开关只控制角色是否主动插话。
+- 用户问“现在酒馆玩什么流派”“这局怎么走”或任何酒馆当前事实时，模型使用 `hearthstone_battlegrounds_advice` 读取最新动态局势、规则依据、统计边界和逐项 evidence gate。
+- 用户问普通对战“第几回合”“轮到谁”、具体手牌、Choice 或出牌取舍时，模型使用 `hearthstone_current_state`；不能只沿用聊天历史中的旧事实或短评。
+- 通用状态工具在酒馆模式只返回专用工具重定向，不重复发送酒馆状态；酒馆工具在本机建立逐卡 `known_affordable`、`known_unaffordable` 或 `unknown_cost_may_be_zero` 的决策面，再按问题焦点返回必要局势、证据和规则依据。
+- 两个对话工具要求模型选择 `focus`。回合、场面、手牌、商店、经济、Choice、对手或综合策略只返回相应紧凑视图、证据门禁和相关卡牌规则，JSON 硬上限为 4096 bytes；避免完整酒馆状态挤占单轮上下文。旧动态兼容入口的内部直调仍可取得完整结构。
+- 启用插件即默认允许问答工具按需向当前对话提供过滤后的玩家可见状态，用户仍可随时关闭；主动解说默认关闭，其开关只控制角色是否主动插话。
 
 公开 Plugin SDK 不提供 `respond` 最终文本回调，因此插件不会伪称能把角色实际台词复制到自己的窗口。NEKO 的角色回复、语音和宿主界面是主输出；随包提供的透明浮层只用于用户显式执行诊断测试。
 
 ## 酒馆战棋支持
 
-`v0.3.3` 支持普通对战与单排/双排酒馆的可验证公开状态：
+`v0.3.4` 支持普通对战与单排/双排酒馆的可验证公开状态：
 
 - 战棋模式、Bob、本地玩家与最多八名英雄；
 - 英雄选择阶段实际观测到的本地候选、选择完成后的我方英雄、招募/战斗阶段、逐轮胜负、回合、当前对手；
@@ -43,7 +44,7 @@ HSReplay Tier7 与 Firestone 的全局表现数据属于各自的私有遥测；
 - 只读 Hearthstone 自己生成的 `Power.log`，不注入、不读内存、不抓包、不模拟协议。
 - 自动连接仅查询进程列表中名称精确为 `Hearthstone.exe` 的可执行文件路径，再检查同目录 `Logs`；不扫描磁盘、不读取进程内存。
 - 不自动点击、出牌或代打，不推断隐藏手牌、未揭示奥秘或未来商店。
-- 不上传原始日志，不保留玩家名、BattleTag、账号 ID 或完整单局历史；默认共享仅发送隐私文档列明的有限近期公开事实，包括有界实时上下文、按需查询结果和已启用主动解说的事件上下文，并可在面板中关闭。
+- 不上传原始日志，不保留玩家名、BattleTag、账号 ID 或完整单局历史；默认共享仅在工具调用或已启用的主动解说中发送隐私文档列明的有限近期公开事实，并可在面板中关闭。定向被动查询提示本身不含牌局事实。
 - 首次接入已有日志默认且最多只在本机恢复解析末尾 64 MiB，这些日志字节不会整体发送给模型。
 - 卡牌目录更新只发送固定的公共目录 GET，不发送牌局、卡牌 ID 或玩家信息；可用 `card_catalog_network_enabled=false` 关闭。
 - 本机统计只保存按赛季、模式和英雄聚合的场次与名次计数。
@@ -101,7 +102,7 @@ uv run python -m plugin.neko_plugin_cli.cli verify "<plugin-repo>\dist\hearthsto
 
 ## English summary
 
-Hearthstone Catgirl Companion is a read-only N.E.K.O plugin for constructed Hearthstone and Battlegrounds. Hidden `read` messages keep a bounded, filtered live public snapshot available to the active role, while Agent-visible query entries fetch fresh, richer facts and evidence gates on demand. Users can disable data sharing without disabling local log monitoring, while proactive commentary remains off by default. It supports Power.log-observed local hero choices, solo and Duos Battlegrounds state, per-combat outcomes, aggregate-only local results, and versioned official season rules. N.E.K.O owns the actual character response; the separate transparent overlay is diagnostic-only because the public SDK does not return generated reply text. The plugin never claims access to unlicensed global win-rate telemetry.
+Hearthstone Catgirl Companion is a read-only N.E.K.O plugin for constructed Hearthstone and Battlegrounds. Same-turn `@llm_tool` calls fetch fresh, filtered player-visible facts and evidence gates on demand; an optional targeted hidden notice contains instructions only and never carries a live snapshot. Users can disable data sharing without disabling local log monitoring, while proactive commentary remains off by default. It supports Power.log-observed local hero choices, solo and Duos Battlegrounds state, per-combat outcomes, aggregate-only local results, and versioned official season rules. N.E.K.O owns the actual character response; the separate transparent overlay is diagnostic-only because the public SDK does not return generated reply text. The plugin never claims access to unlicensed global win-rate telemetry.
 
 ## 许可证
 

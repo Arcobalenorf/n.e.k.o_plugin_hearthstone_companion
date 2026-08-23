@@ -281,7 +281,7 @@ class BattlegroundsCardSnapshot:
     attack: int = 0
     health: int | None = None
     tier: int = 0
-    frozen: bool = False
+    frozen: bool | None = None
     position: int = 0
     premium: bool | None = None
     current_cost: int | None = None
@@ -456,7 +456,7 @@ class BattlegroundsSnapshot:
     gold: int | None = None
     max_gold: int | None = None
     tavern_tier: int = 0
-    frozen: bool = False
+    frozen: bool | None = None
     next_opponent_player_id: int = 0
     current_opponent_player_id: int = 0
     last_opponent_player_id: int = 0

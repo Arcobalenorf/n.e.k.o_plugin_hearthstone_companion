@@ -36,15 +36,17 @@ Get-ChildItem "$env:LOCALAPPDATA\Blizzard\Hearthstone" -Filter Power.log -Recurs
 
 ## 主动解说关闭后还能问酒馆问题吗
 
-可以。保持 `llm_data_consent=true`；隐藏 `read` 会继续更新过滤后的有界酒馆实时状态，Agent 在具体提问时调用 `query_battlegrounds_state`，再由它读取 `hearthstone_battlegrounds_advice` 的本轮完整状态和 evidence gate。主动解说开关只控制插件是否主动发起角色回复。
+可以。保持 `llm_data_consent=true`；模型在需要最新完整事实时可在首答同一轮调用 `hearthstone_battlegrounds_advice`，等待工具结果后再回答。实时状态保留在本机，主动解说开关只控制插件是否主动发起角色回复。
 
-若查询返回 `llm_data_sharing_not_authorized`，说明数据共享未开启。若状态为空，确认已经进入酒馆且日志正在增长。若面板已有商店/战团但角色仍声称没有炉石能力，检查已安装版本是否包含 Agent 可见的 `query_battlegrounds_state`，并确认插件清单不是 `passive=true`；仅有 `/api/tools` 中的动态 LLM tool 不等于用户插件 Agent 路由能发现它。
+若查询返回 `llm_data_sharing_not_authorized`，说明数据共享未开启。若状态为空，确认已经进入酒馆且日志正在增长。若面板已有商店/战团但角色仍声称没有炉石能力，检查 `/api/tools` 是否已注册 `hearthstone_battlegrounds_advice`，以及插件日志是否收到对应 callback。`passive=true` 只让插件退出首答结束后的用户插件 Agent 分派，不影响同轮 `@llm_tool` 注册；不要通过关闭 passive 来补偿工具注册或会话刷新问题。
 
 ## 为什么候选英雄不完整或不能给出具体出牌
 
 候选列表只显示 `Power.log` 明确归属于本地玩家、未隐藏且未锁定的英雄。日志尚未建立本地 controller、某个选项未公开或选择阶段已经结束时，列表可能为空；插件不会根据常见候选数或卡池补猜。列表可用时，`hearthstone_battlegrounds_advice` 可以结合公共英雄规则和本机样本供角色比较，但不会提供没有来源的全局胜率。“哪张更值得考虑”等定性酒馆建议要求工具当次读到招募阶段、正在更新的完整商店和规则证据；个别费用缺失不会关闭定性比较。若询问可负担性、剩余金币或购买顺序，当前金币和商店所有卡牌的实际费用也必须完整，角色不得用默认 3 费补算，也不得在金币为 0 时把未知费用卡牌直接判为买不起。战斗阶段或缓存状态只能解释已观察信息。
 
-普通对战会在用户主动提问时通过 `query_constructed_state` 调用 `hearthstone_current_state`，共享本地玩家当前可见的具体手牌。若角色仍答不出回合或手牌，先确认局势问答授权已开启、状态为实时，再明确询问“现在第几回合”或“根据当前手牌应该出什么牌”；这类当前问题必须重新查询，不能仅凭被动精简状态回答。入口不会提供完整合法操作与目标枚举；字段缺失时应如实说明。对手隐藏手牌、奥秘身份和牌序是永久边界，重新配置日志也不会开放。
+普通对战可在用户主动提问时同轮调用 `hearthstone_current_state`，共享本地玩家当前可见的具体手牌。若角色仍答不出回合或手牌，先确认局势问答授权已开启、状态为实时，再核对 `/api/tools` 中的注册项、对应 tool call 和 callback；这类当前问题应重新查询，不能沿用较早对话。工具不会提供完整合法操作与目标枚举；字段缺失时应如实说明。对手隐藏手牌、奥秘身份和牌序是永久边界，重新配置日志也不会开放。
+
+排查模型链路时分别核对四项：`/api/tools` 中目标角色可见正确工具；模型请求实际携带工具 schema；模型产生带 `focus` 的 tool call；user-plugin-server callback 返回 `is_error=false` 且 `output.format=hearthstone_compact_v1`。模型选择工具本身是概率行为，验收重点是这四段链路可用、明确问题能正常取得对应视图，而不是要求所有自由表达都 100% 触发。
 
 ## 为什么没有全服胜率
 
