@@ -853,7 +853,7 @@ def test_constructed_agent_query_reuses_native_tool_payload(monkeypatch) -> None
     assert result["meta"]["agent"] == {
         "result_kind": "event",
         "expires_in_s": 8.0,
-        "delivery": "silent",
+        "delivery": "proactive",
     }
     data = result["data"]
     assert data["payload"] == payload
@@ -1125,7 +1125,7 @@ def test_battlegrounds_agent_query_prioritizes_live_decision_fields(monkeypatch)
     assert result["meta"]["agent"] == {
         "result_kind": "event",
         "expires_in_s": 8.0,
-        "delivery": "silent",
+        "delivery": "proactive",
     }
     data = result["data"]
     assert data["payload"] == payload
@@ -1722,7 +1722,7 @@ def test_legacy_none_push_receipt_preserves_targeted_context_lifecycle(monkeypat
     assert plugin._context_target is None
 
 
-def test_proactive_commentary_requires_explicit_target_even_with_cached_test_attribute(
+def test_proactive_commentary_uses_safe_host_fallback_without_cached_role_hint(
     monkeypatch,
 ) -> None:
     entry = _load_sdk_entry(monkeypatch)
@@ -1753,8 +1753,10 @@ def test_proactive_commentary_requires_explicit_target_even_with_cached_test_att
         100.0,
     )
 
-    assert submitted == []
-    assert monitor.status().llm_submissions == 0
+    assert len(submitted) == 1
+    assert submitted[0]["ai_behavior"] == "respond"
+    assert "target_lanlan" not in submitted[0]
+    assert monitor.status().llm_submissions == 1
 
 
 def test_startup_failure_rolls_back_started_workers(monkeypatch) -> None:
@@ -2998,8 +3000,9 @@ def test_live_state_is_shared_silently_to_explicit_target(
     plugin._context_target = None
     plugin._live_state_shared = False
     plugin._live_state_target = ""
+    plugin._live_state_segments = ()
     plugin._live_state_game_number = 0
-    plugin._live_state_notice_fingerprint = None
+    plugin._live_state_snapshot = None
     plugin._ownership_lock = threading.RLock()
     plugin._started = True
     plugin._monitor_dispatch_enabled = True
@@ -3032,28 +3035,36 @@ def test_live_state_is_shared_silently_to_explicit_target(
 
     assert plugin._share_live_state(snapshot) is True
 
-    assert len(submitted) == 1
-    assert [message["metadata"]["segment"] for message in submitted] == ["core"]
+    assert len(submitted) == 2
+    assert [message["metadata"]["segment"] for message in submitted] == [
+        "core",
+        "shop_1",
+    ]
     assert submitted[0]["coalesce_key"] == plugin._live_state_key("当前角色")
     assert all(message["visibility"] == [] for message in submitted)
     assert all(message["ai_behavior"] == "read" for message in submitted)
     assert all(message["target_lanlan"] == "当前角色" for message in submitted)
     assert all(
-        message["metadata"]["kind"] == "hearthstone_live_state_notice"
+        message["metadata"]["kind"] == "game_live_state"
         for message in submitted
     )
     assert all(
-        message["metadata"]["privacy_scope"] == "instructions_only"
+        message["metadata"]["privacy_scope"]
+        == "filtered_player_visible_live_state"
         for message in submitted
     )
-    notice = submitted[0]["parts"][0]["text"]
-    assert "hearthstone" not in notice.casefold()
-    assert "实时酒馆法术" not in notice
-    assert "BG_SPELL_RUNTIME" not in notice
-    assert "金币" not in notice
-    assert "调用" in notice
+    texts = [message["parts"][0]["text"] for message in submitted]
+    payloads = [json.loads(text.split(":", 1)[1]) for text in texts]
+    assert all(len(text.encode("utf-8")) <= 900 for text in texts)
+    assert payloads[0]["gold"] == 7
+    assert payloads[0]["refresh_actual_cost"] == 0
+    assert payloads[0]["upgrade_actual_cost"] == 6
+    assert payloads[1]["cards"] == [
+        ["BG_SPELL_RUNTIME", "实时酒馆法术", 1, 0, None, 0, 1, "s-D"]
+    ]
     assert plugin._live_state_shared is True
     assert plugin._live_state_target == "当前角色"
+    assert plugin._live_state_segments == ("core", "shop_1")
     assert plugin._live_state_game_number == 3
 
 
@@ -3366,7 +3377,7 @@ def test_battlegrounds_live_segments_survive_real_host_200_token_boundary() -> N
     )
 
 
-def test_live_state_notice_ignores_same_turn_card_and_economy_changes(monkeypatch) -> None:
+def test_live_state_republishes_same_turn_card_and_economy_changes(monkeypatch) -> None:
     entry = _load_sdk_entry(monkeypatch)
     submitted: list[dict[str, Any]] = []
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
@@ -3374,8 +3385,9 @@ def test_live_state_notice_ignores_same_turn_card_and_economy_changes(monkeypatc
     plugin._context_target = None
     plugin._live_state_shared = False
     plugin._live_state_target = ""
+    plugin._live_state_segments = ()
     plugin._live_state_game_number = 0
-    plugin._live_state_notice_fingerprint = None
+    plugin._live_state_snapshot = None
     plugin._ownership_lock = threading.RLock()
     plugin._started = True
     plugin._monitor_dispatch_enabled = True
@@ -3401,9 +3413,56 @@ def test_live_state_notice_ignores_same_turn_card_and_economy_changes(monkeypatc
     assert plugin._share_live_state(snapshot(gold=6, card_id="SHOP_A")) is True
     assert plugin._share_live_state(snapshot(gold=5, card_id="SHOP_B")) is True
 
-    assert len(submitted) == 1
-    assert submitted[0]["metadata"]["kind"] == "hearthstone_live_state_notice"
-    assert "SHOP_A" not in submitted[0]["parts"][0]["text"]
+    assert len(submitted) == 4
+    assert {item["metadata"]["kind"] for item in submitted} == {
+        "game_live_state"
+    }
+    assert [item["metadata"]["segment"] for item in submitted] == [
+        "core",
+        "shop_1",
+        "core",
+        "shop_1",
+    ]
+    assert "SHOP_A" in submitted[1]["parts"][0]["text"]
+    assert "SHOP_B" in submitted[3]["parts"][0]["text"]
+    assert submitted[0]["coalesce_key"] == submitted[2]["coalesce_key"]
+    assert submitted[1]["coalesce_key"] == submitted[3]["coalesce_key"]
+
+
+def test_live_state_deduplicates_an_identical_snapshot(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    submitted: list[dict[str, Any]] = []
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(llm_data_consent=True, target_lanlan="当前角色")
+    plugin._context_target = None
+    plugin._live_state_shared = False
+    plugin._live_state_target = ""
+    plugin._live_state_segments = ()
+    plugin._live_state_game_number = 0
+    plugin._live_state_snapshot = None
+    plugin._ownership_lock = threading.RLock()
+    plugin._started = True
+    plugin._monitor_dispatch_enabled = True
+    plugin._settings_transition = False
+    plugin.push_message = lambda **kwargs: submitted.append(kwargs) or {
+        "submitted": True
+    }
+    snapshot = GameSnapshot(
+        mode="constructed",
+        phase="playing",
+        game_number=4,
+        round=3,
+        active_side="player",
+        constructed=ConstructedSnapshot(),
+    )
+
+    assert plugin._share_live_state(snapshot) is True
+    first_count = len(submitted)
+    assert first_count > 0
+    assert plugin._share_live_state(snapshot) is True
+
+    assert len(submitted) == first_count
+    assert plugin._live_state_snapshot == snapshot
 
 
 def test_live_state_notice_republishes_on_semantic_change(monkeypatch) -> None:
@@ -3414,8 +3473,9 @@ def test_live_state_notice_republishes_on_semantic_change(monkeypatch) -> None:
     plugin._context_target = None
     plugin._live_state_shared = False
     plugin._live_state_target = ""
+    plugin._live_state_segments = ()
     plugin._live_state_game_number = 0
-    plugin._live_state_notice_fingerprint = None
+    plugin._live_state_snapshot = None
     plugin._ownership_lock = threading.RLock()
     plugin._started = True
     plugin._monitor_dispatch_enabled = True
@@ -3440,7 +3500,7 @@ def test_live_state_notice_republishes_on_semantic_change(monkeypatch) -> None:
 
     assert len(submitted) == 3
     assert {item["metadata"]["kind"] for item in submitted} == {
-        "hearthstone_live_state_notice"
+        "game_live_state"
     }
     assert len({item["coalesce_key"] for item in submitted}) == 1
 
@@ -3560,7 +3620,7 @@ def test_constructed_live_segments_keep_seven_named_minions_after_host_parser() 
     assert required <= set(host_selection["selected_names"]), json.dumps(host_selection)
 
 
-def test_unresolved_current_role_does_not_publish_notice_or_query_bus(
+def test_unresolved_current_role_uses_safe_host_fallback_without_querying_bus(
     monkeypatch,
 ) -> None:
     entry = _load_sdk_entry(monkeypatch)
@@ -3580,8 +3640,9 @@ def test_unresolved_current_role_does_not_publish_notice_or_query_bus(
     plugin._context_target = None
     plugin._live_state_shared = False
     plugin._live_state_target = ""
+    plugin._live_state_segments = ()
     plugin._live_state_game_number = 0
-    plugin._live_state_notice_fingerprint = None
+    plugin._live_state_snapshot = None
     plugin._ownership_lock = threading.RLock()
     plugin._delivery_lock = threading.RLock()
     plugin._last_user_chat_at = 0.0
@@ -3600,16 +3661,13 @@ def test_unresolved_current_role_does_not_publish_notice_or_query_bus(
         battlegrounds=BattlegroundsSnapshot(round=3, phase="recruit"),
     )
 
-    assert plugin._publish_live_state(snapshot) is False
-    assert plugin._share_live_state(snapshot) is False
-    assert plugin._dispatch_llm(
-        "prompt",
-        GameEvent("battlegrounds_triple", 9, "triple", 100.0, {}),
-        snapshot,
-    ) is False
+    assert plugin._publish_live_state(snapshot) is True
     assert bus_calls == 0
-    assert submitted == []
-    assert plugin._live_state_shared is False
+    assert len(submitted) == 1
+    assert submitted[0]["metadata"]["kind"] == "game_live_state"
+    assert "target_lanlan" not in submitted[0]
+    assert submitted[0]["coalesce_key"] == plugin._live_state_key("")
+    assert plugin._live_state_shared is True
     assert plugin._live_state_target == ""
 
 
@@ -3621,8 +3679,9 @@ def test_live_state_expiration_replaces_pending_snapshot_with_same_key(monkeypat
     plugin._context_target = None
     plugin._live_state_shared = False
     plugin._live_state_target = ""
+    plugin._live_state_segments = ()
     plugin._live_state_game_number = 0
-    plugin._live_state_notice_fingerprint = None
+    plugin._live_state_snapshot = None
     plugin._ownership_lock = threading.RLock()
     plugin._started = True
     plugin._monitor_dispatch_enabled = True
@@ -3632,31 +3691,39 @@ def test_live_state_expiration_replaces_pending_snapshot_with_same_key(monkeypat
         mode="battlegrounds",
         phase="recruit",
         game_number=3,
-        battlegrounds=BattlegroundsSnapshot(round=3, phase="recruit"),
+        battlegrounds=BattlegroundsSnapshot(
+            round=3,
+            phase="recruit",
+            shop=(BattlegroundsCardSnapshot(card_id="BG_SHOP_1", position=1),),
+        ),
     )
 
     assert plugin._share_live_state(snapshot) is True
     assert plugin._expire_live_state() is True
 
-    assert [item["ai_behavior"] for item in submitted] == ["read"] * 2
-    assert submitted[0]["coalesce_key"] == submitted[1]["coalesce_key"]
+    assert [item["ai_behavior"] for item in submitted] == ["read"] * 4
+    assert submitted[0]["coalesce_key"] == submitted[2]["coalesce_key"]
+    assert submitted[1]["coalesce_key"] == submitted[3]["coalesce_key"]
     assert [item["metadata"]["segment"] for item in submitted] == [
         "core",
+        "shop_1",
         "core",
+        "shop_1",
     ]
     assert all(
-        item["metadata"]["kind"] == "hearthstone_live_state_notice_expired"
-        for item in submitted[1:]
+        item["metadata"]["kind"] == "game_live_state_expired"
+        for item in submitted[2:]
     )
-    assert all(item["metadata"]["context_expired"] is True for item in submitted[1:])
-    assert "实时公开状态已失效" in submitted[1]["parts"][0]["text"]
-    assert "BG_" not in submitted[1]["parts"][0]["text"]
+    assert all(item["metadata"]["context_expired"] is True for item in submitted[2:])
+    assert "实时公开状态已失效" in submitted[2]["parts"][0]["text"]
+    assert "BG_" not in submitted[2]["parts"][0]["text"]
     assert all(
-        item["metadata"]["privacy_scope"] == "instructions_only"
-        for item in submitted
+        item["metadata"]["privacy_scope"] == "no_game_state_tombstone"
+        for item in submitted[2:]
     )
     assert plugin._live_state_shared is False
-    assert plugin._live_state_notice_fingerprint is None
+    assert plugin._live_state_segments == ()
+    assert plugin._live_state_snapshot is None
 
 
 def test_live_state_rejection_does_not_mark_notice_as_shared(monkeypatch) -> None:
@@ -3667,8 +3734,9 @@ def test_live_state_rejection_does_not_mark_notice_as_shared(monkeypatch) -> Non
     plugin._context_target = None
     plugin._live_state_shared = False
     plugin._live_state_target = ""
+    plugin._live_state_segments = ()
     plugin._live_state_game_number = 0
-    plugin._live_state_notice_fingerprint = None
+    plugin._live_state_snapshot = None
     plugin._ownership_lock = threading.RLock()
     plugin._started = True
     plugin._monitor_dispatch_enabled = True
@@ -3695,9 +3763,62 @@ def test_live_state_rejection_does_not_mark_notice_as_shared(monkeypatch) -> Non
     assert [
         (item["metadata"]["kind"], item["metadata"]["segment"])
         for item in submitted
-    ] == [("hearthstone_live_state_notice", "core")]
+    ] == [("game_live_state", "core")]
     assert plugin._live_state_shared is False
-    assert plugin._live_state_notice_fingerprint is None
+    assert plugin._live_state_segments == ()
+    assert plugin._live_state_snapshot is None
+
+
+def test_live_state_partial_publish_expires_the_entire_segment_set(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    submitted: list[dict[str, Any]] = []
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(llm_data_consent=True, target_lanlan="当前角色")
+    plugin._context_target = None
+    plugin._live_state_shared = False
+    plugin._live_state_target = ""
+    plugin._live_state_segments = ()
+    plugin._live_state_game_number = 0
+    plugin._live_state_snapshot = None
+    plugin._ownership_lock = threading.RLock()
+    plugin._started = True
+    plugin._monitor_dispatch_enabled = True
+    plugin._settings_transition = False
+
+    def push_message(**kwargs: Any) -> dict[str, bool]:
+        submitted.append(kwargs)
+        rejected = (
+            kwargs["metadata"]["kind"] == "game_live_state"
+            and kwargs["metadata"]["segment"] == "shop_1"
+        )
+        return {"submitted": not rejected}
+
+    plugin.push_message = push_message
+    snapshot = GameSnapshot(
+        mode="battlegrounds",
+        phase="recruit",
+        game_number=3,
+        battlegrounds=BattlegroundsSnapshot(
+            round=3,
+            phase="recruit",
+            shop=(BattlegroundsCardSnapshot(card_id="BG_SHOP_1", position=1),),
+        ),
+    )
+
+    assert plugin._share_live_state(snapshot) is False
+
+    assert [
+        (item["metadata"]["kind"], item["metadata"]["segment"])
+        for item in submitted
+    ] == [
+        ("game_live_state", "core"),
+        ("game_live_state", "shop_1"),
+        ("game_live_state_expired", "core"),
+        ("game_live_state_expired", "shop_1"),
+    ]
+    assert plugin._live_state_shared is False
+    assert plugin._live_state_segments == ()
+    assert plugin._live_state_snapshot is None
 
 
 def test_restore_context_expires_targeted_notice_after_consent_revocation(
@@ -3710,8 +3831,9 @@ def test_restore_context_expires_targeted_notice_after_consent_revocation(
     plugin._context_target = None
     plugin._live_state_shared = True
     plugin._live_state_target = "当前角色"
+    plugin._live_state_segments = ("core",)
     plugin._live_state_game_number = 3
-    plugin._live_state_notice_fingerprint = (3, "battlegrounds", "recruit")
+    plugin._live_state_snapshot = None
     plugin._ownership_lock = threading.RLock()
     plugin.push_message = lambda **kwargs: submitted.append(kwargs) or {"submitted": True}
 
@@ -3722,7 +3844,8 @@ def test_restore_context_expires_targeted_notice_after_consent_revocation(
     assert submitted[0]["target_lanlan"] == "当前角色"
     assert all(item["metadata"]["context_expired"] is True for item in submitted)
     assert plugin._live_state_shared is False
-    assert plugin._live_state_notice_fingerprint is None
+    assert plugin._live_state_segments == ()
+    assert plugin._live_state_snapshot is None
 
 
 def test_shared_notice_requires_cleanup_for_privacy_and_routing_changes(
@@ -4064,7 +4187,7 @@ def test_target_change_restores_old_role_before_injecting_and_responding_to_new_
     assert plugin._context_target == "兰兰B"
 
 
-def test_empty_config_ignores_uncontracted_role_hints_for_proactive_output(
+def test_empty_config_uses_host_fallback_and_ignores_uncontracted_role_hints(
     monkeypatch,
 ) -> None:
     entry = _load_sdk_entry(monkeypatch)
@@ -4091,8 +4214,9 @@ def test_empty_config_ignores_uncontracted_role_hints_for_proactive_output(
     )
 
     assert observed["target_configured"] is False
-    assert accepted is False
-    assert submitted == []
+    assert accepted is True
+    assert len(submitted) == 1
+    assert "target_lanlan" not in submitted[0]
     assert plugin._context_target is None
 
 
@@ -4186,8 +4310,9 @@ def test_restore_then_explicit_target_routes_the_new_notice(monkeypatch) -> None
     plugin._context_target = None
     plugin._live_state_shared = True
     plugin._live_state_target = "旧角色"
+    plugin._live_state_segments = ("core",)
     plugin._live_state_game_number = 3
-    plugin._live_state_notice_fingerprint = (3, "battlegrounds", "recruit")
+    plugin._live_state_snapshot = None
     plugin._ownership_lock = threading.RLock()
     plugin._delivery_lock = threading.RLock()
     plugin._started = True
@@ -4205,8 +4330,8 @@ def test_restore_then_explicit_target_routes_the_new_notice(monkeypatch) -> None
         "当前角色",
     ]
     assert [item["metadata"]["kind"] for item in submitted] == [
-        "hearthstone_live_state_notice_expired",
-        "hearthstone_live_state_notice",
+        "game_live_state_expired",
+        "game_live_state",
     ]
     assert submitted[1]["coalesce_key"] == plugin._live_state_key("当前角色")
 
@@ -4227,8 +4352,9 @@ def test_blocked_live_delivery_does_not_hold_ownership_lock_during_revocation(
     plugin._context_target = None
     plugin._live_state_shared = False
     plugin._live_state_target = ""
+    plugin._live_state_segments = ()
     plugin._live_state_game_number = 0
-    plugin._live_state_notice_fingerprint = None
+    plugin._live_state_snapshot = None
     plugin._ownership_lock = threading.RLock()
     plugin._delivery_lock = threading.RLock()
     plugin._started = True
@@ -4237,7 +4363,7 @@ def test_blocked_live_delivery_does_not_hold_ownership_lock_during_revocation(
 
     def push_message(**kwargs: Any) -> dict[str, bool]:
         submitted.append(kwargs)
-        if kwargs["metadata"]["kind"] == "hearthstone_live_state_notice":
+        if kwargs["metadata"]["kind"] == "game_live_state":
             push_started.set()
             assert release_push.wait(1.0)
         return {"submitted": True}
@@ -4268,7 +4394,8 @@ def test_blocked_live_delivery_does_not_hold_ownership_lock_during_revocation(
     assert result == [False]
     assert plugin.cfg.llm_data_consent is False
     assert [item["metadata"]["kind"] for item in submitted] == [
-        "hearthstone_live_state_notice",
+        "game_live_state",
+        "game_live_state_expired",
     ]
     assert plugin._live_state_shared is False
 
@@ -4313,8 +4440,9 @@ def test_explicit_target_switch_expires_old_notice_before_sharing_to_new_role(
     plugin._context_target = None
     plugin._live_state_shared = True
     plugin._live_state_target = "角色A"
+    plugin._live_state_segments = ("core",)
     plugin._live_state_game_number = 3
-    plugin._live_state_notice_fingerprint = (3, "battlegrounds", "recruit")
+    plugin._live_state_snapshot = None
     plugin._ownership_lock = threading.RLock()
     plugin._last_user_chat_at = 0.0
     plugin._started = True
@@ -4335,8 +4463,8 @@ def test_explicit_target_switch_expires_old_notice_before_sharing_to_new_role(
         "角色B",
     ]
     assert [item["metadata"]["kind"] for item in submitted] == [
-        "hearthstone_live_state_notice_expired",
-        "hearthstone_live_state_notice",
+        "game_live_state_expired",
+        "game_live_state",
     ]
     assert submitted[0]["coalesce_key"] != submitted[1]["coalesce_key"]
     assert plugin._live_state_target == "角色B"
@@ -4362,8 +4490,9 @@ def test_live_state_publish_does_not_call_tool_registry_http(
     plugin._context_target = None
     plugin._live_state_shared = False
     plugin._live_state_target = ""
+    plugin._live_state_segments = ()
     plugin._live_state_game_number = 0
-    plugin._live_state_notice_fingerprint = None
+    plugin._live_state_snapshot = None
     plugin._ownership_lock = threading.RLock()
     plugin._delivery_lock = threading.RLock()
     plugin._last_user_chat_at = 0.0
@@ -4382,11 +4511,12 @@ def test_live_state_publish_does_not_call_tool_registry_http(
     assert plugin._publish_live_state(snapshot) is True
     assert len(submitted) == 1
     assert all(
-        item["metadata"]["kind"] == "hearthstone_live_state_notice"
+        item["metadata"]["kind"] == "game_live_state"
         for item in submitted
     )
     assert all(
-        item["metadata"]["privacy_scope"] == "instructions_only"
+        item["metadata"]["privacy_scope"]
+        == "filtered_player_visible_live_state"
         for item in submitted
     )
     assert all(item["target_lanlan"] == "角色A" for item in submitted)
@@ -5495,7 +5625,7 @@ def test_settings_transition_resyncs_active_game_context(monkeypatch) -> None:
     assert [message["ai_behavior"] for message in submitted_messages] == ["read", "read"]
     assert (
         submitted_messages[1]["metadata"]["kind"]
-        == "hearthstone_live_state_notice"
+        == "game_live_state"
     )
     assert plugin._context_target == "兰兰A"
 
@@ -7439,7 +7569,7 @@ def test_start_monitoring_opens_dispatch_gate_before_state_ready(monkeypatch) ->
     assert plugin._monitor_dispatch_enabled is True
     assert len(submitted) == 2
     assert [message["ai_behavior"] for message in submitted] == ["read", "read"]
-    assert submitted[1]["metadata"]["kind"] == "hearthstone_live_state_notice"
+    assert submitted[1]["metadata"]["kind"] == "game_live_state"
     assert plugin._context_target == "兰兰A"
 
 
@@ -7777,7 +7907,7 @@ def test_active_outputs_and_stats_require_monitor_applied_config(monkeypatch) ->
     plugin._record_battlegrounds_result(event, snapshot)
 
     assert [item["ai_behavior"] for item in submitted] == ["read", "read", "respond"]
-    assert submitted[1]["metadata"]["kind"] == "hearthstone_live_state_notice"
+    assert submitted[1]["metadata"]["kind"] == "game_live_state"
     assert len(recorded) == 1
     assert monitor.capture_calls == 1
 

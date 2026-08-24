@@ -71,7 +71,7 @@ hsbg.cards public API --> fixed-origin background GET --> atomic cache --> obser
 - 普通或关键冷却结束；
 - 用户最近 30 秒没有聊天，除非事件优先级达到 9。
 
-主动解说请求包含事件事实、适合情绪陪伴的精简快照和 `emotion_cue`。被动 `read` 不主动触发回复，也不携带回合、卡牌、金币或费用等事实；仅当配置了明确 `target_lanlan`，且对局、模式、阶段、完整轮次、行动方或 Choice 发生语义变化时，用一个固定 key 覆盖查询提示。金币、商店身材等同回合同阶段的细节变化不会制造高频提示。普通对战与酒馆的完整当前事实、规则、evidence gate 和具体建议始终由同轮查询工具按需返回。主动提示要求保持当前角色人设、只依据已给事实、避免机械报字段，并限制主动发言为一句。低血量、三连、升本、战斗和结算只决定情绪方向，不决定角色具体措辞。
+主动解说请求包含事件事实、适合情绪陪伴的精简快照和 `emotion_cue`。被动 `read` 不主动触发回复；它把最新玩家可见状态按每段 900 bytes 上限编码，并用区域级 `coalesce_key` 覆盖上一版。普通对战分开传输核心回合、双方状态、双方公开场面和我方可见手牌；酒馆分开传输核心经济、Choice、商店、战团、手牌及已观察对手。完全相同的不可变快照去重，金币、费用、卡牌或关键词等任一实际变化都会更新对应状态。规则、evidence gate 和聚焦建议仍可由同轮查询工具按需刷新。主动提示要求保持当前角色人设、只依据已给事实、避免机械报字段，并限制主动发言为一句。低血量、三连、升本、战斗和结算只决定情绪方向，不决定角色具体措辞。
 
 ## 普通对战状态工具
 
@@ -79,9 +79,9 @@ hsbg.cards public API --> fixed-origin background GET --> atomic cache --> obser
 
 正式 `@llm_tool` schema 要求模型声明 `focus`。普通对战支持 `overview/board/hand/opponent/choice/strategy`，酒馆支持 `overview/shop/economy/board/hand/choice/opponent/strategy`；对手查询还可声明 `current/next/last`。插件先在本机建立完整事实和 capability，再只把所问视图、对应 evidence gate 与相关卡牌规则编码为 `hearthstone_compact_v1`。聚焦 JSON 限制为 4096 bytes，超限时明确标记 `truncated` 并进一步收敛，避免工具已成功但回灌内容过大导致最终回答截断或误归纳。无 `focus` 的 Python 内部直调仅用于旧动态兼容入口和测试，不属于模型可见 schema。
 
-显式目标的新鲜对局会生成 `visibility=[] + ai_behavior="read"` 的单条查询提示。相同语义指纹使用同一个 `coalesce_key` 并去重，不设周期心跳；目标为空时完全不发送。SDK 回执只确认本地提交，不能证明某个模型 turn 已消费提示，因此当前事实的权威路径始终是同会话 `@llm_tool`。兼容动态入口不参与首答结束后的用户插件 Agent 自动分派，也不能作为实时首答路径。通用状态工具若被误用于酒馆，只返回专用入口重定向而不复制完整酒馆工具结果。日志换源、读取异常、状态过期、对局结束、停止监听、关闭插件、撤销共享或更换目标时，插件会为已发布提示提交同 key、无牌局数据的 tombstone；无论 tombstone 是否抵达，查询入口都会重新检查授权与新鲜度并 fail-closed。
+新鲜对局会生成 `visibility=[] + ai_behavior="read"` 的完整紧凑分段。显式目标时定向发送；目标为空时省略 `target_lanlan`，由宿主仅在恰好一个会话已连接时安全回退，多会话歧义直接丢弃而不广播。SDK 回执只确认本地提交，不能证明某个模型 turn 已消费状态，因此同会话 `@llm_tool` 与 Agent 查询入口仍保留为按需刷新路径。通用状态工具若被误用于酒馆，只返回专用入口重定向而不复制完整酒馆工具结果。日志换源、读取异常、状态过期、对局结束、停止监听、关闭插件、撤销共享或更换目标时，插件会为全部已发布分段提交同 key、无牌局数据的 tombstone；无论 tombstone 是否抵达，查询入口都会重新检查授权与新鲜度并 fail-closed。
 
-显式配置非空 `target_lanlan` 时，场景进入会发送稳定的隐藏查询说明，关键事件发送定向的 `visibility=[] + ai_behavior="respond"`，场景结束时恢复。目标为空时既不发送被动提示，也不主动 `respond`；工具结果仍由宿主自动返回实际发起调用的对话。插件不从消息上下文、Conversations Bus 或宿主私有接口猜测角色。配置目标从 A 切换到 B 时会先尝试向 A 提交 tombstone，再同步 B。
+显式配置非空 `target_lanlan` 时，场景进入会发送稳定说明，实时状态和关键事件均定向给该角色。目标为空时，`read` 与已启用的主动 `respond` 都省略目标并使用宿主的唯一会话安全回退；插件不从消息上下文、Conversations Bus 或宿主私有接口猜测角色。配置目标从 A 切换到 B 时会先尝试向 A 提交 tombstone，再同步 B。
 
 公开 SDK 的 push receipt 只确认提交，不确认宿主已消费、生成或播放，也没有返回最终角色文本的正式回调。因此独立浮层不能承接自动角色台词，也不会自动显示解析器事件；它只接受用户显式触发的诊断文本。
 
@@ -101,7 +101,7 @@ hsbg.cards public API --> fixed-origin background GET --> atomic cache --> obser
 
 酒馆卡牌快照保存日志实际观测的 `card_type`、`current_cost`、`premium`、当前位置、冻结和当前关键词；刷新/升本费用优先读取对应 `GAME_MODE_BUTTON_SLOT` 按钮实体。完整实体包中的 boolean 标签缺失按默认 false，包尚未收尾时保持 `null`，防止截断包伪装成完整状态，也防止旧冻结/金色/关键词续命。商店、手牌、战团、经济和 Choice 分别携带完整度、revision、回合、阶段与观测时间；金币、刷新费用和升本费用还分别保存自己的 observation。每项费用只有来源回合和阶段都等于当前招募状态时才可用于 capability，不能借用玩家实体或另一项经济字段的较新时间续命。金币以当前 `RESOURCES` 建立基线；历史 `RESOURCES_USED/TEMP_RESOURCES` 会过期并按未发生处理，只有同回合同阶段重报后才加入当前值。未观测或已过期的动态值保持 `null`，不使用公共目录或默认规则补猜。`CHANGE_ENTITY` 真正换 CardID 时先撤销旧类型、费用、攻血、星级、金色和关键词，直到新身份重新提供证据。购买拆为 `shop_card_priority_advice`、`purchase_affordability` 和 `specific_purchase_advice`：费用缺失不污染已经具备完整实时商店与规则证据的定性选牌，但会让可负担性与精确购买顺序降为 `partial`。工具结果最前面的 `current_recruit_decision` 按卡标记 `known_affordable`、`known_unaffordable` 或 `unknown_cost_may_be_zero`，并将整店可负担性保持为 `unknown`；`decision_guardrails` 再提供完整证据边界，禁止模型因金币为 0 就把未知费用卡牌判为买不起。升本可负担性、升本策略、刷新、Choice 与站位也有独立 capability，角色必须按被问事项检查对应状态，不能因一个子能力不可用而覆盖另一个已可用能力。
 
-两个 `@llm_tool` 由公开 SDK 在插件构造时自动注册并排队提交给宿主，可在生成首答的同一轮调用。`plugin.toml` 使用 `passive=true`，避免宿主在首答完成后再次把同一问题分派给用户插件 Agent，造成延迟追加或矛盾回复；设置、监听、浮层和清空统计入口继续以 `metadata.agent_auto=false` 隐藏。为兼容已缓存旧入口的原地升级，旧动态查询处理器保留有界结果但声明 `delivery="silent"`，即使被误触发也不会生成第二个角色回答。
+两个 `@llm_tool` 由公开 SDK 在插件构造时自动注册并排队提交给宿主，可在生成首答的同一轮调用。`plugin.toml` 使用 `passive=false`，让用户插件 Agent 在模型未选择对话工具时仍能发现 `query_constructed_state` 与 `query_battlegrounds_state`；查询只向主模型回填有界 `reply`，并声明 `delivery="proactive"` 立即完成用户发起的查询。设置、监听、浮层和清空统计入口继续以 `metadata.agent_auto=false` 隐藏。三条链路互补，不假设模型必然调用某个工具。
 
 官方工具文档明确说明 `/api/tools` 注册只存在于当前角色的 `LLMSessionManager` 内，主服务重启、首启竞态或会话管理器重建后不会由 `@llm_tool` 自动回灌。插件因此使用官方 `@timer_interval` 在独立定时线程里读取公开的 `GET /api/tools`：只有某个当前角色缺少本插件的远程工具，或 source、loopback callback、remote 标志不一致时，才通过公开 `unregister_llm_tool()` / `register_llm_tool()` 恢复并再次确认；健康注册不做任何变更，失败使用有界退避且只记录脱敏错误码。这能自动收敛运行期注册丢失，但定时检查仍存在最多一个检查间隔的窗口，不能冒充宿主提供的逐 turn 前同步保证。
 

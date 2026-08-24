@@ -250,8 +250,8 @@ async def _exercise_lifecycle(plugin: Any, unwrap_or: Any, host_ctx: _HostContex
                 raise RuntimeError(f"Agent query lost event result semantics: {result!r}")
             if agent_meta.get("expires_in_s") != 8.0:
                 raise RuntimeError(f"Agent query lost realtime expiry: {result!r}")
-            if agent_meta.get("delivery") != "silent":
-                raise RuntimeError(f"legacy Agent query could append a duplicate reply: {result!r}")
+            if agent_meta.get("delivery") != "proactive":
+                raise RuntimeError(f"Agent query result did not reach the active role: {result!r}")
             if not str(result.get("data", {}).get("reply") or "").startswith("HS_QUERY "):
                 raise RuntimeError(f"Agent query returned no compact reply: {result!r}")
         saved = unwrap_or(

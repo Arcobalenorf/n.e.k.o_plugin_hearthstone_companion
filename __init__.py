@@ -29,7 +29,7 @@ from plugin.sdk.plugin import (
 )
 
 from .card_catalog import BattlegroundsCardCatalog
-from .commentary import build_llm_prompt
+from .commentary import build_live_state_segments, build_llm_prompt
 from .config import CompanionConfig
 from .instructions import HEARTHSTONE_CONTEXT_INSTRUCTIONS, HEARTHSTONE_RESTORE_INSTRUCTIONS
 from .log_config import ensure_power_log_config
@@ -51,6 +51,7 @@ _AGENT_REPLY_TARGET_TOKENS = 180
 _AGENT_REPLY_ESTIMATED_MAX_TOKENS = 170
 _LLM_TOOL_FOCUSED_MAX_BYTES = 4096
 _LLM_TOOL_STATE_MAX_BYTES = 2048
+_LIVE_STATE_DELIVERY_MAX_BYTES = 900
 _CONSTRUCTED_TOOL_FOCUSES = (
     "overview",
     "board",
@@ -1983,8 +1984,9 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         self._context_target: str | None = None
         self._live_state_shared = False
         self._live_state_target = ""
+        self._live_state_segments: tuple[str, ...] = ()
         self._live_state_game_number = 0
-        self._live_state_notice_fingerprint: tuple[Any, ...] | None = None
+        self._live_state_snapshot: GameSnapshot | None = None
         self._ownership_lock = threading.RLock()
         self._delivery_lock = threading.RLock()
         self._settings_lock = asyncio.Lock()
@@ -3466,29 +3468,6 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             base = f"hearthstone:live-state:{digest}"
         return base if segment == "core" else f"{base}:{segment}"
 
-    @staticmethod
-    def _live_state_notice_fingerprint_for(snapshot: GameSnapshot) -> tuple[Any, ...]:
-        choice = snapshot.choice
-        if choice is None and snapshot.battlegrounds is not None:
-            choice = snapshot.battlegrounds.current_choice
-        return (
-            snapshot.game_number,
-            snapshot.mode,
-            snapshot.phase,
-            snapshot.round,
-            snapshot.active_side,
-            getattr(choice, "choice_type", "") if choice is not None else "",
-            len(getattr(choice, "options", ()) or ()) if choice is not None else 0,
-        )
-
-    @staticmethod
-    def _live_state_notice_text() -> str:
-        return (
-            "# 炉石实时查询提示\n"
-            "炉石公开局势已经变化。回答当前回合、手牌、场面、商店、战团或决策问题前，"
-            "请重新调用匹配模式的炉石工具；不要从本提示或较早对话推断当前事实。"
-        )
-
     def _push_context(self, text: str, *, target_lanlan: str, expired: bool) -> bool:
         kwargs: dict[str, Any] = {
             "visibility": [],
@@ -3567,14 +3546,18 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             "source": "hearthstone_companion",
             "metadata": {
                 "kind": (
-                    "hearthstone_live_state_notice_expired"
+                    "game_live_state_expired"
                     if expired
-                    else "hearthstone_live_state_notice"
+                    else "game_live_state"
                 ),
-                "context_type": "hearthstone_live_state_notice",
+                "context_type": "hearthstone_companion_live_state",
                 "delivery_intent": "passive_context",
                 "context_expired": expired,
-                "privacy_scope": "instructions_only",
+                "privacy_scope": (
+                    "no_game_state_tombstone"
+                    if expired
+                    else "filtered_player_visible_live_state"
+                ),
                 "segment": segment,
             },
             "priority": 0,
@@ -3603,19 +3586,16 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     access_reason
                     or not self._started
                     or not self._monitor_dispatch_enabled
-                    or not target
                     or snapshot.game_number <= 0
                     or snapshot.phase in {"idle", "ended", "spectator"}
                 )
             if blocked:
                 return False
-            fingerprint = self._live_state_notice_fingerprint_for(snapshot)
             with self._ownership_lock:
                 already_shared = bool(
                     getattr(self, "_live_state_shared", False)
                     and getattr(self, "_live_state_target", "") == target
-                    and getattr(self, "_live_state_notice_fingerprint", None)
-                    == fingerprint
+                    and getattr(self, "_live_state_snapshot", None) == snapshot
                 )
                 target_changed = bool(
                     getattr(self, "_live_state_shared", False)
@@ -3630,21 +3610,64 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 return True
             if (target_changed or game_changed) and not self._expire_live_state():
                 return False
-            if not self._push_live_state(
-                self._live_state_notice_text(),
-                target_lanlan=target,
-                expired=False,
-                segment="core",
+            try:
+                segments = build_live_state_segments(
+                    snapshot,
+                    observed_at=time.time(),
+                    max_prompt_bytes=_LIVE_STATE_DELIVERY_MAX_BYTES,
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "Hearthstone live-state serialization failed code=%s",
+                    type(exc).__name__,
+                )
+                return False
+
+            segment_names = tuple(name for name, _text in segments)
+            with self._ownership_lock:
+                previous_segments = tuple(
+                    getattr(self, "_live_state_segments", ()) or ()
+                )
+            if (
+                getattr(self, "_live_state_shared", False)
+                and previous_segments != segment_names
+                and not self._expire_live_state()
             ):
                 return False
+
+            for segment, text in segments:
+                access_reason, _revision = _live_state_access(self)
+                with self._ownership_lock:
+                    delivery_invalid = bool(
+                        access_reason
+                        or not self._started
+                        or not self._monitor_dispatch_enabled
+                        or self._delivery_target() != target
+                    )
+                if delivery_invalid:
+                    if getattr(self, "_live_state_shared", False):
+                        self._expire_live_state()
+                    return False
+                if not self._push_live_state(
+                    text,
+                    target_lanlan=target,
+                    expired=False,
+                    segment=segment,
+                ):
+                    if getattr(self, "_live_state_shared", False):
+                        self._expire_live_state()
+                    return False
+                with self._ownership_lock:
+                    self._live_state_shared = True
+                    self._live_state_target = target
+                    self._live_state_segments = segment_names
+                    self._live_state_game_number = snapshot.game_number
             access_reason, _revision = _live_state_access(self)
             if access_reason or self._delivery_target() != target:
+                self._expire_live_state()
                 return False
             with self._ownership_lock:
-                self._live_state_shared = True
-                self._live_state_target = target
-                self._live_state_game_number = snapshot.game_number
-                self._live_state_notice_fingerprint = fingerprint
+                self._live_state_snapshot = snapshot
             return True
 
     @staticmethod
@@ -3661,23 +3684,32 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 if not getattr(self, "_live_state_shared", False):
                     return True
                 target = str(getattr(self, "_live_state_target", "") or "")
+                segments = tuple(
+                    getattr(self, "_live_state_segments", ()) or ("core",)
+                )
             text = self._live_state_expired_text()
-            if not self._push_live_state(
-                text,
-                target_lanlan=target,
-                expired=True,
-                segment="core",
-            ):
-                return False
+            for segment in segments:
+                if not self._push_live_state(
+                    text,
+                    target_lanlan=target,
+                    expired=True,
+                    segment=segment,
+                ):
+                    return False
             with self._ownership_lock:
                 if (
                     getattr(self, "_live_state_shared", False)
                     and getattr(self, "_live_state_target", "") == target
+                    and tuple(
+                        getattr(self, "_live_state_segments", ()) or ("core",)
+                    )
+                    == segments
                 ):
                     self._live_state_shared = False
                     self._live_state_target = ""
+                    self._live_state_segments = ()
                     self._live_state_game_number = 0
-                    self._live_state_notice_fingerprint = None
+                    self._live_state_snapshot = None
             return True
 
     def _restore_context(self) -> bool:
@@ -3811,8 +3843,6 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 stable_target = self._stable_target()
                 context_target = self._context_target
             target = self._delivery_target()
-            if not target:
-                return False
             if context_target is not None and context_target != stable_target:
                 if not self._restore_context():
                     return False
@@ -3864,7 +3894,8 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 },
                 "priority": event.priority,
             }
-            kwargs["target_lanlan"] = target
+            if target:
+                kwargs["target_lanlan"] = target
             kwargs["coalesce_key"] = f"hearthstone:llm:{self._context_key(target)}"
             access_reason, _revision = _live_state_access(self)
             with self._ownership_lock:
@@ -4522,21 +4553,22 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         if focus == "auto" and isinstance(_ctx, Mapping):
             focus = _agent_focus_from_request(_ctx.get("latest_user_request"))
         payload = await self.hearthstone_current_state()
+        reply = _agent_query_reply(
+            payload,
+            mode="constructed",
+            focus=focus,
+        )
         return await self.finish(
             data={
-                "reply": _agent_query_reply(
-                    payload,
-                    mode="constructed",
-                    focus=focus,
-                ),
+                "reply": reply,
                 "payload": payload,
             },
-            delivery="silent",
+            delivery="proactive",
             meta={
                 "agent": {
                     "result_kind": "event",
                     "expires_in_s": 8.0,
-                    "delivery": "silent",
+                    "delivery": "proactive",
                 }
             },
         )
@@ -4556,22 +4588,23 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             if opponent_relation == "auto":
                 opponent_relation = _agent_opponent_relation_from_request(latest_request)
         payload = await self.hearthstone_battlegrounds_advice(topic=topic)
+        reply = _agent_query_reply(
+            payload,
+            mode="battlegrounds",
+            focus=focus,
+            opponent_relation=opponent_relation,
+        )
         return await self.finish(
             data={
-                "reply": _agent_query_reply(
-                    payload,
-                    mode="battlegrounds",
-                    focus=focus,
-                    opponent_relation=opponent_relation,
-                ),
+                "reply": reply,
                 "payload": payload,
             },
-            delivery="silent",
+            delivery="proactive",
             meta={
                 "agent": {
                     "result_kind": "event",
                     "expires_in_s": 8.0,
-                    "delivery": "silent",
+                    "delivery": "proactive",
                 }
             },
         )

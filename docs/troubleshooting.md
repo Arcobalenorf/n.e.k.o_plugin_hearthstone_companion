@@ -36,9 +36,9 @@ Get-ChildItem "$env:LOCALAPPDATA\Blizzard\Hearthstone" -Filter Power.log -Recurs
 
 ## 主动解说关闭后还能问酒馆问题吗
 
-可以。保持 `llm_data_consent=true`；模型在需要最新完整事实时可在首答同一轮调用 `hearthstone_battlegrounds_advice`，等待工具结果后再回答。实时状态保留在本机，主动解说开关只控制插件是否主动发起角色回复。
+可以。保持 `llm_data_consent=true`；插件会把最新玩家可见状态以隐藏 `read` 分段交给当前会话，模型也可在首答同一轮调用 `hearthstone_battlegrounds_advice`，或由 Agent 使用酒馆查询入口。主动解说开关只控制插件是否主动发起角色回复。
 
-若查询返回 `llm_data_sharing_not_authorized`，说明数据共享未开启。若状态为空，确认已经进入酒馆且日志正在增长。若面板已有商店/战团但角色仍声称没有炉石能力，检查 `/api/tools` 是否已注册 `hearthstone_battlegrounds_advice`，以及插件日志是否收到对应 callback。`passive=true` 只让插件退出首答结束后的用户插件 Agent 分派，不影响同轮 `@llm_tool` 注册；不要通过关闭 passive 来补偿工具注册或会话刷新问题。
+若查询返回 `llm_data_sharing_not_authorized`，说明数据共享未开启。若状态为空，确认已经进入酒馆且日志正在增长。若面板已有商店/战团但角色仍声称没有炉石能力，依次确认主日志出现 `game_live_state` 被当前会话以 passive callback 接收、`/api/tools` 已注册 `hearthstone_battlegrounds_advice`，以及 Agent 插件目录包含两个 `query_*` 入口。插件必须保持 `passive=false`，否则 Agent 会完全跳过查询入口；同轮工具注册和 `read` 状态流仍是独立链路。
 
 ## 为什么候选英雄不完整或不能给出具体出牌
 
