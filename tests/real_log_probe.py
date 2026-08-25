@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import sys
 import types
@@ -23,9 +24,11 @@ def _load_package() -> None:
 
 _load_package()
 
-from hearthstone_companion_probe.commentary import build_live_state_segments  # noqa: E402
-from hearthstone_companion_probe.powerlog import PowerLogParser  # noqa: E402
-from hearthstone_companion_probe.tailer import PowerLogLocator  # noqa: E402
+build_live_state_segments = importlib.import_module(
+    f"{PACKAGE_NAME}.commentary"
+).build_live_state_segments
+PowerLogParser = importlib.import_module(f"{PACKAGE_NAME}.powerlog").PowerLogParser
+PowerLogLocator = importlib.import_module(f"{PACKAGE_NAME}.tailer").PowerLogLocator
 
 
 def _card_summary(card: Any) -> dict[str, Any]:

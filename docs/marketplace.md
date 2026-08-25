@@ -164,7 +164,7 @@
 - Python 全量测试、Ruff、compileall 和补丁空白检查必须通过；
 - Hosted UI 必须通过固定版本官方 SDK 编译，稳定版 N.E.K.O v0.8.3 生命周期 smoke 必须通过；
 - 官方 `check --release --market-release`、`build`、`inspect`、`verify` 必须通过，并检查包内容；
-- `plugin.toml`、`pyproject.toml`、`uv.lock`、User-Agent 和包内 manifest/evidence 版本必须均为 `0.3.7`；tag 使用一致的 `v0.3.7`，正式资产名由官方工作流固定为 `hearthstone_companion.neko-plugin`；
+- `plugin.toml`、`pyproject.toml`、`uv.lock`、User-Agent 和包内 manifest/evidence 版本必须均为 `0.3.8`；tag 使用一致的 `v0.3.8`，正式资产名由官方工作流固定为 `hearthstone_companion.neko-plugin`；
 - 在 Windows 执行干净安装、启动/停止、离线保存设置、自动发现日志、局势问答和显式浮层生命周期 smoke；
 - 使用脱敏真实日志回放验证英雄选择、商店、我方战团、下一对手和上次观察阵容的实时公开链路；
 - 截图不包含 BattleTag、聊天、好友或其他个人信息；
