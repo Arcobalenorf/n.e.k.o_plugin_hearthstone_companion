@@ -28,7 +28,7 @@ _MAX_CARDS = 5_000
 _MAX_CHILD_RELATIONSHIPS = 32
 _PAGE_SIZE = 100
 _USER_AGENT = (
-    "NEKO-Hearthstone-Companion/0.3.6 "
+    "NEKO-Hearthstone-Companion/0.3.7 "
     "(+https://github.com/Arcobalenorf/n.e.k.o_plugin_hearthstone_companion)"
 )
 
