@@ -198,10 +198,7 @@ async def _exercise_lifecycle(plugin: Any, unwrap_or: Any, host_ctx: _HostContex
     shutdown: dict[str, Any] = {}
     try:
         tools = {item["name"] for item in plugin.list_llm_tools()}
-        expected_tools = {
-            "hearthstone_current_state",
-            "hearthstone_battlegrounds_advice",
-        }
+        expected_tools = {"hearthstone_live_state"}
         if tools != expected_tools:
             raise RuntimeError(f"stable SDK did not auto-register LLM tools: {tools!r}")
         entries = {item["id"]: item for item in plugin.list_entries()}
@@ -214,12 +211,12 @@ async def _exercise_lifecycle(plugin: Any, unwrap_or: Any, host_ctx: _HostContex
             raise RuntimeError(
                 f"stable SDK did not expose the LLM tool health timer: {health_timer!r}"
             )
-        for entry_id in ("query_constructed_state", "query_battlegrounds_state"):
-            item = entries.get(entry_id)
-            if not item or item.get("dynamic") is not True:
-                raise RuntimeError(f"stable SDK did not expose dynamic Agent entry: {entry_id}")
-            if item.get("kind") != "service" or item.get("llm_result_fields") != ["reply"]:
-                raise RuntimeError(f"unexpected dynamic Agent entry metadata: {item!r}")
+        entry_id = "query_hearthstone_live_state"
+        item = entries.get(entry_id)
+        if not item or item.get("dynamic") is True:
+            raise RuntimeError(f"stable SDK did not expose static Agent entry: {entry_id}")
+        if item.get("kind") != "service" or item.get("llm_result_fields") != ["reply"]:
+            raise RuntimeError(f"unexpected static Agent entry metadata: {item!r}")
 
         entry_updates: dict[str, dict[str, Any]] = {}
         while True:
@@ -229,11 +226,15 @@ async def _exercise_lifecycle(plugin: Any, unwrap_or: Any, host_ctx: _HostContex
                 break
             if message.get("type") == "ENTRY_UPDATE" and message.get("action") == "register":
                 entry_updates[str(message.get("entry_id") or "")] = message
-        if not {"query_constructed_state", "query_battlegrounds_state"}.issubset(entry_updates):
-            raise RuntimeError(f"stable SDK did not queue Agent ENTRY_UPDATE messages: {entry_updates!r}")
-        for entry_id in ("query_constructed_state", "query_battlegrounds_state"):
-            if entry_updates[entry_id].get("meta", {}).get("llm_result_fields") != ["reply"]:
-                raise RuntimeError(f"ENTRY_UPDATE lost result filtering for {entry_id}")
+        unexpected_query_updates = {
+            entry_id
+            for entry_id in ("query_hearthstone_live_state",)
+            if entry_id in entry_updates
+        }
+        if unexpected_query_updates:
+            raise RuntimeError(
+                f"static Agent entries unexpectedly emitted ENTRY_UPDATE: {unexpected_query_updates!r}"
+            )
         startup = unwrap_or(await plugin.startup(), {})
         if startup.get("status") != "ready":
             raise RuntimeError(f"unexpected startup result: {startup!r}")
@@ -241,10 +242,7 @@ async def _exercise_lifecycle(plugin: Any, unwrap_or: Any, host_ctx: _HostContex
             raise RuntimeError("stable SDK smoke unexpectedly started the log monitor")
         if startup.get("card_catalog_started") is not False:
             raise RuntimeError("stable SDK smoke unexpectedly started the network catalog")
-        for result in (
-            await plugin.query_constructed_state(),
-            await plugin.query_battlegrounds_state(),
-        ):
+        for result in (await plugin.query_hearthstone_live_state(),):
             agent_meta = result.get("meta", {}).get("agent", {})
             if agent_meta.get("result_kind") != "event":
                 raise RuntimeError(f"Agent query lost event result semantics: {result!r}")

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
+from .install_discovery import hearthstone_install_paths
 from .process_discovery import hearthstone_executable_paths
 
 MAX_LINE_BYTES = 256 * 1024
@@ -30,13 +31,17 @@ class PowerLogLocator:
         configured_path: str = "",
         *,
         executable_paths_provider: Callable[[], Iterable[Path]] = hearthstone_executable_paths,
+        install_paths_provider: Callable[[], Iterable[Path]] = hearthstone_install_paths,
         process_scan_interval_seconds: float = 15.0,
     ) -> None:
         self.configured_path = configured_path.strip()
         self._executable_paths_provider = executable_paths_provider
+        self._install_paths_provider = install_paths_provider
         self._process_scan_interval_seconds = max(1.0, float(process_scan_interval_seconds))
         self._process_log_roots: tuple[Path, ...] = ()
+        self._install_log_roots: tuple[Path, ...] = ()
         self._next_process_scan_at = 0.0
+        self._next_install_scan_at = 0.0
 
     def candidates(self) -> list[Path]:
         if self.configured_path:
@@ -45,8 +50,9 @@ class PowerLogLocator:
                 return self._directory_candidates(configured)
             return [configured]
 
-        log_roots = self._default_log_roots()
-        log_roots.extend(self._running_game_log_roots())
+        log_roots = self._running_game_log_roots()
+        log_roots.extend(self._installed_game_log_roots())
+        log_roots.extend(self._default_log_roots())
         candidates: list[Path] = []
         for logs_root in log_roots:
             candidates.extend(self._directory_candidates(logs_root))
@@ -86,6 +92,26 @@ class PowerLogLocator:
         self._process_log_roots = tuple(dict.fromkeys(roots))
         return list(self._process_log_roots)
 
+    def _installed_game_log_roots(self) -> list[Path]:
+        now = time.monotonic()
+        if now < self._next_install_scan_at:
+            return list(self._install_log_roots)
+        self._next_install_scan_at = now + self._process_scan_interval_seconds
+        try:
+            install_paths = tuple(self._install_paths_provider())
+        except (OSError, RuntimeError, ValueError):
+            install_paths = ()
+        roots: list[Path] = []
+        for raw_path in install_paths:
+            try:
+                path = Path(raw_path).resolve()
+                if path.name.casefold() == "hearthstone":
+                    roots.append(path / "Logs")
+            except (OSError, RuntimeError, TypeError, ValueError):
+                continue
+        self._install_log_roots = tuple(dict.fromkeys(roots))
+        return list(self._install_log_roots)
+
     @staticmethod
     def _directory_candidates(root: Path) -> list[Path]:
         candidates = [root / "Power.log"]
@@ -98,17 +124,17 @@ class PowerLogLocator:
         return candidates
 
     def resolve(self) -> Path | None:
-        existing: list[tuple[int, Path]] = []
-        for path in self.candidates():
+        existing: list[tuple[int, int, Path]] = []
+        for priority, path in enumerate(self.candidates()):
             try:
                 stat = path.stat()
                 if stat_module.S_ISREG(stat.st_mode):
-                    existing.append((stat.st_mtime_ns, path))
+                    existing.append((stat.st_mtime_ns, -priority, path))
             except OSError:
                 continue
         if not existing:
             return None
-        return max(existing, key=lambda item: item[0])[1]
+        return max(existing, key=lambda item: (item[0], item[1]))[2]
 
 
 @dataclass(frozen=True, slots=True)

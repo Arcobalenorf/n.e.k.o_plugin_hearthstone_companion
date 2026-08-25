@@ -1920,6 +1920,53 @@ def test_battlegrounds_snapshot_uses_observed_interactable_object_cost() -> None
     assert card.current_cost == 2
 
 
+@pytest.mark.parametrize(
+    ("helper_card_id", "target_tag", "actual_cost"),
+    [
+        ("TB_BaconShop_DragBuy", "2442", 1),
+        ("TB_BaconShop_DragBuy_Spell", "CARD_TARGET", 2),
+    ],
+)
+def test_battlegrounds_shop_uses_slot_action_actual_cost(
+    helper_card_id: str,
+    target_tag: str,
+    actual_cost: int,
+) -> None:
+    parser = recruit_parser()
+    add_entity(
+        parser,
+        300,
+        "BG_SHOP_CARD",
+        controller=11,
+        zone="PLAY",
+        card_type="MINION",
+    )
+    feed(
+        parser,
+        "    tag=ZONE_POSITION value=1",
+        "    tag=COST value=3",
+    )
+    add_entity(
+        parser,
+        301,
+        helper_card_id,
+        controller=3,
+        zone="PLAY",
+        card_type="SPELL",
+    )
+    feed(
+        parser,
+        f"    tag={target_tag} value=300",
+        f"    tag=COST value={actual_cost}",
+    )
+
+    battlegrounds = parser.snapshot().battlegrounds
+
+    assert battlegrounds is not None
+    assert [card.card_id for card in battlegrounds.shop] == ["BG_SHOP_CARD"]
+    assert battlegrounds.shop[0].current_cost == actual_cost
+
+
 def test_battlegrounds_shop_area_rejects_mixed_current_and_stale_entities() -> None:
     parser = recruit_parser()
     parser.battlegrounds_round = 3
@@ -3319,6 +3366,33 @@ def test_late_battlegrounds_hint_reconciles_completed_hero_selection() -> None:
 
     assert parser._battlegrounds_hero_selection_complete is True
     assert parser.snapshot().phase == "recruit"
+
+
+@pytest.mark.parametrize(
+    ("tag", "value"),
+    [
+        ("BACON_TRIPLE_UPGRADE_MINION_ID", "57339"),
+        ("BACON_TRINKETS_ACTIVE", "1"),
+    ],
+)
+def test_bacon_card_metadata_cannot_override_explicit_constructed_game_type(
+    tag: str,
+    value: str,
+) -> None:
+    parser = PowerLogParser()
+    feed(
+        parser,
+        "CREATE_GAME",
+        "GameType=GT_RANKED",
+        "FULL_ENTITY - Creating ID=40 CardID=CORE_EX1_506",
+        f"    tag={tag} value={value}",
+    )
+
+    snapshot = parser.snapshot()
+
+    assert snapshot.mode == "constructed"
+    assert snapshot.constructed is not None
+    assert snapshot.battlegrounds is None
 
 
 def test_terminal_event_escapes_stale_block_and_is_emitted_once() -> None:

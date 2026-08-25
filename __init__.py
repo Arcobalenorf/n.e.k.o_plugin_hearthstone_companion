@@ -31,7 +31,11 @@ from plugin.sdk.plugin import (
 from .card_catalog import BattlegroundsCardCatalog
 from .commentary import build_live_state_segments, build_llm_prompt
 from .config import CompanionConfig
-from .instructions import HEARTHSTONE_CONTEXT_INSTRUCTIONS, HEARTHSTONE_RESTORE_INSTRUCTIONS
+from .instructions import HEARTHSTONE_CONTEXT_INSTRUCTIONS
+from .live_query import (
+    classify_live_query,
+    normalize_query_text,
+)
 from .log_config import ensure_power_log_config
 from .models import GameEvent, GameSnapshot
 from .monitor import LIVE_STATE_MAX_AGE_SECONDS, CompanionMonitor
@@ -52,6 +56,7 @@ _AGENT_REPLY_ESTIMATED_MAX_TOKENS = 170
 _LLM_TOOL_FOCUSED_MAX_BYTES = 4096
 _LLM_TOOL_STATE_MAX_BYTES = 2048
 _LIVE_STATE_DELIVERY_MAX_BYTES = 900
+_LIVE_STATE_REFRESH_SECONDS = 1.0
 _CONSTRUCTED_TOOL_FOCUSES = (
     "overview",
     "board",
@@ -81,8 +86,7 @@ _LLM_TOOL_HEALTH_RETRY_MAX_SECONDS = 15.0
 _LLM_TOOL_CONFIRM_DELAYS_SECONDS = (0.2, 0.4)
 _DEFAULT_USER_PLUGIN_SERVER_PORT = 48916
 _LLM_TOOL_HANDLER_NAMES = {
-    "hearthstone_current_state": "hearthstone_current_state",
-    "hearthstone_battlegrounds_advice": "hearthstone_battlegrounds_advice",
+    "hearthstone_live_state": "hearthstone_live_state",
 }
 _OVERLAY_RUNTIME_FIELDS = (
     "overlay_enabled",
@@ -1933,7 +1937,7 @@ def _focused_llm_tool_result(
         "mode": mode,
         "focus": selected_focus,
         "available": bool(payload.get("available")),
-        "views": views[:1],
+        "views": views,
         "evidence": {},
         "catalog_rules": "",
         "truncated": True,
@@ -1942,6 +1946,8 @@ def _focused_llm_tool_result(
     }
     if reason:
         fallback["reason"] = reason
+    if _focused_tool_json_bytes(fallback) > _LLM_TOOL_FOCUSED_MAX_BYTES:
+        fallback["views"] = views[:1]
     if _focused_tool_json_bytes(fallback) > _LLM_TOOL_FOCUSED_MAX_BYTES:
         fallback["views"] = [
             {
@@ -1981,12 +1987,12 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         self._stats_recovery_generation = 0
         self._stats_recovery_lock = threading.RLock()
         self._store_writer = AsyncStoreWriter(self._persist_stats, self.logger)
-        self._context_target: str | None = None
         self._live_state_shared = False
         self._live_state_target = ""
         self._live_state_segments: tuple[str, ...] = ()
         self._live_state_game_number = 0
         self._live_state_snapshot: GameSnapshot | None = None
+        self._live_state_published_at = 0.0
         self._ownership_lock = threading.RLock()
         self._delivery_lock = threading.RLock()
         self._settings_lock = asyncio.Lock()
@@ -2020,110 +2026,6 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         self._llm_tool_health_failures = 0
         self._llm_tool_health_next_attempt_at = 0.0
         self._llm_tool_recovery_specs: dict[str, dict[str, Any]] = {}
-        self._register_agent_query_entries()
-
-    def _register_agent_query_entries(self) -> None:
-        # ENTRY_UPDATE makes these query routes visible after an in-place
-        # upgrade even when the host still has an older static preview cached.
-        self.register_dynamic_entry(
-            entry_id="query_constructed_state",
-            handler=self.query_constructed_state,
-            name=tr(
-                "entries.query_constructed_state.name",
-                default="查询当前炉石对战",
-            ),
-            description=tr(
-                "entries.query_constructed_state.description",
-                default=(
-                    "用户询问当前普通、标准、狂野或竞技场炉石对战的回合、行动方、法力、"
-                    "手牌、场面、Choice 或出牌建议时调用。每次都读取最新玩家可见状态；"
-                    "酒馆战棋问题必须改用 query_battlegrounds_state；紧凑手牌结果的 q 表示"
-                    "手牌身份是否完整。"
-                ),
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "focus": {
-                        "type": "string",
-                        "enum": ["auto", "board", "hand", "opponent", "choice"],
-                        "default": "auto",
-                    }
-                },
-                "additionalProperties": False,
-            },
-            kind="service",
-            timeout=5.0,
-            llm_result_fields=["reply"],
-        )
-        self.register_dynamic_entry(
-            entry_id="query_battlegrounds_state",
-            handler=self.query_battlegrounds_state,
-            name=tr(
-                "entries.query_battlegrounds_state.name",
-                default="查询当前酒馆战棋局势",
-            ),
-            description=tr(
-                "entries.query_battlegrounds_state.description",
-                default=(
-                    "用户询问酒馆战棋、酒馆、商店买什么、酒馆法术、英雄选择、流派、阵容、"
-                    "站位、升本、刷新、冻结、稳血、对手或复盘时调用。返回最新玩家可见局势，"
-                    "包括实际费用、卡牌类型、金色、当前关键词和证据完整度；绝不回退到构筑套牌。"
-                    "紧凑结果中 p/r/g/t/f/rf/up 分别表示阶段、回合、金币、酒馆等级、冻结、"
-                    "刷新实际费用和升本实际费用，q 表示目标区域证据是否完整；shop 元组顺序"
-                    "就是商店站位，其余卡牌数组顺序也表示区域站位。满区域结果中 D 依次是"
-                    "type/golden/kw 默认值，X 用“站位+T/G/K:值”覆盖对应卡牌；关键词码"
-                    "t/d/r 分别是嘲讽/圣盾/复生，其余码按工具字段说明解释。"
-                ),
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "topic": {
-                        "type": "string",
-                        "enum": [
-                            "current_strategy",
-                            "season_meta",
-                            "hero_performance",
-                            "post_game",
-                        ],
-                        "default": "current_strategy",
-                    },
-                    "focus": {
-                        "type": "string",
-                        "enum": [
-                            "auto",
-                            "shop",
-                            "board",
-                            "hand",
-                            "choice",
-                            "opponent",
-                        ],
-                        "default": "auto",
-                        "description": tr(
-                            "entries.query_battlegrounds_state.focus",
-                            default=(
-                                "买什么/升本/刷新用 shop；阵容/站位/战斗用 board；手牌用 hand；"
-                                "英雄或发现选项用 choice；对手信息用 opponent。"
-                            ),
-                        ),
-                    },
-                    "opponent_relation": {
-                        "type": "string",
-                        "enum": ["auto", "current", "next", "last"],
-                        "default": "auto",
-                        "description": (
-                            "仅 focus=opponent 时使用：正在战斗用 current，下一位用 next，"
-                            "上一轮已观测对手用 last。"
-                        ),
-                    },
-                },
-                "additionalProperties": False,
-            },
-            kind="service",
-            timeout=5.0,
-            llm_result_fields=["reply"],
-        )
 
     def _local_llm_tool_specs(self) -> dict[str, dict[str, Any]]:
         cached = dict(getattr(self, "_llm_tool_recovery_specs", {}))
@@ -3428,7 +3330,19 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
 
     def _delivery_target(self) -> str:
         with self._ownership_lock:
-            return self._stable_target()
+            configured = self._stable_target()
+            if configured:
+                return configured
+            if getattr(self, "_live_state_shared", False):
+                captured = str(getattr(self, "_live_state_target", "") or "").strip()
+                if captured:
+                    return captured[:80]
+            ctx = getattr(self, "ctx", None)
+            for field in ("_current_lanlan", "current_lanlan", "lanlan_name"):
+                value = getattr(ctx, field, None)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()[:80]
+            return ""
 
     def _context_restore_required(
         self,
@@ -3440,96 +3354,23 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         source_changed = updated.log_path != previous.log_path
         access_revoked = not updated.llm_data_consent
         configured_target_changed = previous_target != updated_target
-        context_target = getattr(self, "_context_target", None)
         live_state_shared = bool(getattr(self, "_live_state_shared", False))
         return bool(
-            context_target is not None
-            and (
-                access_revoked
-                or source_changed
-                or configured_target_changed
-                or updated_target != context_target
-            )
-            or live_state_shared
+            live_state_shared
             and (access_revoked or source_changed or configured_target_changed)
         )
 
     @staticmethod
-    def _context_key(target: str) -> str:
-        digest = hashlib.sha256(target.encode("utf-8")).hexdigest()[:16]
-        return f"hearthstone:context:{digest}"
-
-    @staticmethod
-    def _live_state_key(target: str, segment: str = "core") -> str:
+    def _live_state_key(
+        target: str,
+        segment: str = "core",
+    ) -> str:
         if not target:
             base = "hearthstone:live-state:active-session"
         else:
             digest = hashlib.sha256(target.encode("utf-8")).hexdigest()[:16]
             base = f"hearthstone:live-state:{digest}"
-        return base if segment == "core" else f"{base}:{segment}"
-
-    def _push_context(self, text: str, *, target_lanlan: str, expired: bool) -> bool:
-        kwargs: dict[str, Any] = {
-            "visibility": [],
-            "ai_behavior": "read",
-            "parts": [{"type": "text", "text": text}],
-            "source": "hearthstone_companion",
-            "metadata": {
-                "kind": "game_context_restore" if expired else "game_context",
-                "context_type": "hearthstone_companion",
-                "delivery_intent": "passive_context",
-                "context_expired": expired,
-                "privacy_scope": "instructions_only",
-            },
-            "priority": 0,
-            "coalesce_key": self._context_key(target_lanlan),
-        }
-        if target_lanlan:
-            kwargs["target_lanlan"] = target_lanlan
-        try:
-            return _submitted(self.push_message(**kwargs))
-        except Exception as exc:
-            self.logger.warning(
-                "Hearthstone character context delivery failed code=%s",
-                type(exc).__name__,
-            )
-            return False
-
-    def _inject_context(self, target_lanlan: str | None = None) -> bool:
-        with self._delivery_guard():
-            with self._ownership_lock:
-                stable_target = self._stable_target()
-                if not stable_target:
-                    return self._context_target is None
-                target = stable_target if target_lanlan is None else target_lanlan
-                if target != stable_target:
-                    return False
-                if self._context_target is not None:
-                    return self._context_target == target
-            if not self._push_context(
-                HEARTHSTONE_CONTEXT_INSTRUCTIONS,
-                target_lanlan=target,
-                expired=False,
-            ):
-                return False
-            with self._ownership_lock:
-                self._context_target = target
-                access_reason, _revision = _live_state_access(self)
-                if (
-                    not access_reason
-                    and self._stable_target() == target
-                ):
-                    return True
-            restored = self._push_context(
-                HEARTHSTONE_RESTORE_INSTRUCTIONS,
-                target_lanlan=target,
-                expired=True,
-            )
-            if restored:
-                with self._ownership_lock:
-                    if self._context_target == target:
-                        self._context_target = None
-            return False
+        return f"{base}:{segment}"
 
     def _push_live_state(
         self,
@@ -3537,7 +3378,8 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         *,
         target_lanlan: str,
         expired: bool,
-        segment: str,
+        segment: str = "core",
+        game_number: int = 0,
     ) -> bool:
         kwargs: dict[str, Any] = {
             "visibility": [],
@@ -3545,11 +3387,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             "parts": [{"type": "text", "text": text}],
             "source": "hearthstone_companion",
             "metadata": {
-                "kind": (
-                    "game_live_state_expired"
-                    if expired
-                    else "game_live_state"
-                ),
+                "kind": "game_live_state_expired" if expired else "game_live_state",
                 "context_type": "hearthstone_companion_live_state",
                 "delivery_intent": "passive_context",
                 "context_expired": expired,
@@ -3558,10 +3396,15 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     if expired
                     else "filtered_player_visible_live_state"
                 ),
+                "format": "hearthstone_live_segments_v1",
                 "segment": segment,
+                "match_id": game_number,
             },
             "priority": 0,
-            "coalesce_key": self._live_state_key(target_lanlan, segment),
+            "coalesce_key": self._live_state_key(
+                target_lanlan,
+                segment,
+            ),
         }
         if target_lanlan:
             kwargs["target_lanlan"] = target_lanlan
@@ -3581,6 +3424,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         with self._delivery_guard():
             access_reason, _revision = _live_state_access(self)
             target = self._delivery_target()
+            published_at = time.monotonic()
             with self._ownership_lock:
                 blocked = bool(
                     access_reason
@@ -3596,6 +3440,9 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     getattr(self, "_live_state_shared", False)
                     and getattr(self, "_live_state_target", "") == target
                     and getattr(self, "_live_state_snapshot", None) == snapshot
+                    and published_at
+                    - float(getattr(self, "_live_state_published_at", 0.0) or 0.0)
+                    < _LIVE_STATE_REFRESH_SECONDS
                 )
                 target_changed = bool(
                     getattr(self, "_live_state_shared", False)
@@ -3608,7 +3455,9 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 )
             if already_shared:
                 return True
-            if (target_changed or game_changed) and not self._expire_live_state():
+            if (target_changed or game_changed) and not self._expire_live_state(
+                reason="route_or_match_changed"
+            ):
                 return False
             try:
                 segments = build_live_state_segments(
@@ -3622,19 +3471,15 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     type(exc).__name__,
                 )
                 return False
-
             segment_names = tuple(name for name, _text in segments)
             with self._ownership_lock:
-                previous_segments = tuple(
-                    getattr(self, "_live_state_segments", ()) or ()
-                )
+                previous_segments = tuple(getattr(self, "_live_state_segments", ()) or ())
             if (
                 getattr(self, "_live_state_shared", False)
                 and previous_segments != segment_names
-                and not self._expire_live_state()
+                and not self._expire_live_state(reason="segment_set_changed")
             ):
                 return False
-
             for segment, text in segments:
                 access_reason, _revision = _live_state_access(self)
                 with self._ownership_lock:
@@ -3646,16 +3491,17 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     )
                 if delivery_invalid:
                     if getattr(self, "_live_state_shared", False):
-                        self._expire_live_state()
+                        self._expire_live_state(reason="delivery_invalidated")
                     return False
                 if not self._push_live_state(
                     text,
                     target_lanlan=target,
                     expired=False,
                     segment=segment,
+                    game_number=snapshot.game_number,
                 ):
                     if getattr(self, "_live_state_shared", False):
-                        self._expire_live_state()
+                        self._expire_live_state(reason="partial_publish")
                     return False
                 with self._ownership_lock:
                     self._live_state_shared = True
@@ -3663,110 +3509,79 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     self._live_state_segments = segment_names
                     self._live_state_game_number = snapshot.game_number
             access_reason, _revision = _live_state_access(self)
-            if access_reason or self._delivery_target() != target:
-                self._expire_live_state()
+            with self._ownership_lock:
+                delivery_invalid = bool(
+                    access_reason
+                    or not self._started
+                    or not self._monitor_dispatch_enabled
+                    or self._delivery_target() != target
+                )
+            if delivery_invalid:
+                self._expire_live_state(reason="delivery_invalidated")
                 return False
             with self._ownership_lock:
                 self._live_state_snapshot = snapshot
+                self._live_state_published_at = published_at
             return True
 
-    @staticmethod
-    def _live_state_expired_text() -> str:
-        return (
-            "# 炉石实时公开状态已失效\n"
-            "不得继续使用之前的局势快照。"
-            "如果主人继续询问当前对局，请调用炉石查询入口；拒绝或不可用时如实说明。"
-        )
-
-    def _expire_live_state(self) -> bool:
+    def _expire_live_state(self, *, reason: str = "unavailable") -> bool:
         with self._delivery_guard():
             with self._ownership_lock:
                 if not getattr(self, "_live_state_shared", False):
                     return True
                 target = str(getattr(self, "_live_state_target", "") or "")
-                segments = tuple(
-                    getattr(self, "_live_state_segments", ()) or ("core",)
-                )
-            text = self._live_state_expired_text()
+                game_number = int(getattr(self, "_live_state_game_number", 0) or 0)
+                segments = tuple(getattr(self, "_live_state_segments", ()) or ("core",))
+            text = (
+                "# 炉石实时公开状态已失效\n"
+                f"reason={str(reason or 'unavailable')[:48]};"
+                "不得继续使用此前同一局和分段的局势；需要当前事实时调用 hearthstone_live_state。"
+            )
             for segment in segments:
                 if not self._push_live_state(
                     text,
                     target_lanlan=target,
                     expired=True,
                     segment=segment,
+                    game_number=game_number,
                 ):
                     return False
             with self._ownership_lock:
                 if (
                     getattr(self, "_live_state_shared", False)
                     and getattr(self, "_live_state_target", "") == target
-                    and tuple(
-                        getattr(self, "_live_state_segments", ()) or ("core",)
-                    )
-                    == segments
                 ):
                     self._live_state_shared = False
                     self._live_state_target = ""
                     self._live_state_segments = ()
                     self._live_state_game_number = 0
                     self._live_state_snapshot = None
+                    self._live_state_published_at = 0.0
             return True
 
     def _restore_context(self) -> bool:
-        with self._delivery_guard():
-            live_state_restored = self._expire_live_state()
-            with self._ownership_lock:
-                target = self._context_target
-            if target is None:
-                return live_state_restored
-            if not self._push_context(
-                HEARTHSTONE_RESTORE_INSTRUCTIONS,
-                target_lanlan=target,
-                expired=True,
-            ):
-                return False
-            with self._ownership_lock:
-                if self._context_target == target:
-                    self._context_target = None
-            return live_state_restored
+        return self._expire_live_state(reason="context_invalidated")
 
     def _observe_game_event(self, event: GameEvent, snapshot: GameSnapshot) -> None:
-        action = ""
-        with self._ownership_lock:
-            access_reason, _revision = _live_state_access(self)
-            if access_reason:
-                if access_reason == "llm_data_sharing_not_authorized":
-                    action = "restore"
-            else:
-                leaving = event.kind in {
-                    "source_reset",
-                    "state_stale",
-                    "state_unavailable",
-                    "battlegrounds_game_ended",
-                    "game_ended",
-                }
-                if snapshot.phase == "spectator" or leaving:
-                    action = "restore"
-                elif self._started and self._monitor_dispatch_enabled:
-                    entering = event.kind in {
-                        "state_ready",
-                        "state_resumed",
-                        "battlegrounds_detected",
-                        "mulligan",
-                        "turn_started",
-                    }
-                    if entering:
-                        action = "inject"
-        if action == "restore":
-            self._restore_context()
-        elif action == "inject":
-            self._inject_context()
+        leaving = event.kind in {
+            "source_reset",
+            "state_stale",
+            "state_unavailable",
+            "battlegrounds_game_ended",
+            "game_ended",
+        }
+        if snapshot.phase == "spectator" or leaving:
+            self._expire_live_state(reason=event.kind)
+
+    @timer_interval(id="live_state_context_refresh", seconds=1, auto_start=True)
+    async def live_state_context_refresh(self, **_: Any):
+        self._sync_active_game_context()
+        return Ok({"refreshed": True})
 
     def _sync_active_game_context(self) -> None:
         access_reason, transition_revision = _live_state_access(self)
         if access_reason:
-            if access_reason == "llm_data_sharing_not_authorized":
-                self._restore_context()
+            self._expire_live_state(reason=access_reason)
             return
         monitor = getattr(self, "_monitor", None)
         if monitor is None:
@@ -3784,36 +3599,21 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             expected_transition_revision=transition_revision,
         )
         if access_reason:
-            if access_reason == "llm_data_sharing_not_authorized":
-                self._restore_context()
+            self._expire_live_state(reason=access_reason)
             return
         try:
             freshness = _state_freshness(snapshot, runtime, captured_at=time.time())
         except Exception:
-            self._restore_context()
+            self._expire_live_state(reason="freshness_unavailable")
             return
         if (
             snapshot.game_number <= 0
             or snapshot.phase in {"idle", "ended", "spectator"}
             or freshness["source"] != "live"
         ):
-            self._restore_context()
+            self._expire_live_state(reason="no_fresh_active_game")
             return
         try:
-            self._observe_game_event(
-                GameEvent(
-                    "state_ready",
-                    0,
-                    "当前局势已就绪",
-                    time.time(),
-                    {
-                        "mode": snapshot.mode,
-                        "phase": snapshot.phase,
-                        "game_number": snapshot.game_number,
-                    },
-                ),
-                snapshot,
-            )
             self._publish_live_state(snapshot)
         except Exception as exc:
             logger = getattr(self, "logger", None)
@@ -3821,6 +3621,13 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 logger.warning(
                     "Hearthstone active context sync failed code=%s", type(exc).__name__
                 )
+
+    @staticmethod
+    def _commentary_key(target: str) -> str:
+        if not target:
+            return "hearthstone:commentary:active-session"
+        digest = hashlib.sha256(target.encode("utf-8")).hexdigest()[:16]
+        return f"hearthstone:commentary:{digest}"
 
     def _dispatch_llm(self, prompt: str, event: GameEvent, snapshot: GameSnapshot) -> bool:
         with self._delivery_guard():
@@ -3840,45 +3647,28 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     < config.user_chat_quiet_window_seconds
                 ):
                     return False
-                stable_target = self._stable_target()
-                context_target = self._context_target
             target = self._delivery_target()
-            if context_target is not None and context_target != stable_target:
-                if not self._restore_context():
-                    return False
-            if stable_target and not self._inject_context(stable_target):
-                return False
             terminal = event.kind in {"battlegrounds_game_ended", "game_ended"}
-            response_prompt = prompt
-            if terminal or not stable_target:
-                heading = "# 本次终局事件" if terminal else "# 本次公开事件"
-                prompt_budget = (
-                    _LLM_DELIVERY_MAX_CHARS
-                    - len(HEARTHSTONE_CONTEXT_INSTRUCTIONS)
-                    - len(heading)
-                    - 4
-                )
-                if len(prompt) > prompt_budget:
-                    prompt = build_llm_prompt(
-                        event,
-                        snapshot,
-                        max_reply_chars=config.llm_max_reply_chars,
-                        max_prompt_chars=prompt_budget,
-                        context_already_included=True,
-                    )
-                response_prompt = (
-                    f"{HEARTHSTONE_CONTEXT_INSTRUCTIONS}\n\n"
-                    f"{heading}\n"
-                    f"{prompt}"
-                )
-            elif len(prompt) > _LLM_DELIVERY_MAX_CHARS:
-                response_prompt = build_llm_prompt(
+            heading = "# 本次终局事件" if terminal else "# 本次公开事件"
+            prompt_budget = (
+                _LLM_DELIVERY_MAX_CHARS
+                - len(HEARTHSTONE_CONTEXT_INSTRUCTIONS)
+                - len(heading)
+                - 4
+            )
+            if len(prompt) > prompt_budget:
+                prompt = build_llm_prompt(
                     event,
                     snapshot,
                     max_reply_chars=config.llm_max_reply_chars,
-                    max_prompt_chars=_LLM_DELIVERY_MAX_CHARS,
+                    max_prompt_chars=prompt_budget,
                     context_already_included=True,
                 )
+            response_prompt = (
+                f"{HEARTHSTONE_CONTEXT_INSTRUCTIONS}\n\n"
+                f"{heading}\n"
+                f"{prompt}"
+            )
             kwargs: dict[str, Any] = {
                 "visibility": [],
                 "ai_behavior": "respond",
@@ -3896,7 +3686,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             }
             if target:
                 kwargs["target_lanlan"] = target
-            kwargs["coalesce_key"] = f"hearthstone:llm:{self._context_key(target)}"
+            kwargs["coalesce_key"] = self._commentary_key(target)
             access_reason, _revision = _live_state_access(self)
             with self._ownership_lock:
                 delivery_invalid = bool(
@@ -3910,7 +3700,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 return False
             submitted = _submitted(self.push_message(**kwargs))
             if submitted and terminal:
-                self._restore_context()
+                self._expire_live_state(reason=event.kind)
             return submitted
 
     def _dashboard_state(self) -> dict[str, Any]:
@@ -4544,61 +4334,130 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         state["summary"] = "已读取炉石陪玩状态。"
         return Ok(state)
 
-    async def query_constructed_state(
+    async def _resolve_live_query_payload(
         self,
-        focus: str = "auto",
-        _ctx: Mapping[str, Any] | None = None,
-        **_: Any,
-    ):
-        if focus == "auto" and isinstance(_ctx, Mapping):
-            focus = _agent_focus_from_request(_ctx.get("latest_user_request"))
-        payload = await self.hearthstone_current_state()
-        reply = _agent_query_reply(
-            payload,
-            mode="constructed",
-            focus=focus,
-        )
-        return await self.finish(
-            data={
-                "reply": reply,
-                "payload": payload,
-            },
-            delivery="proactive",
-            meta={
-                "agent": {
-                    "result_kind": "event",
-                    "expires_in_s": 8.0,
-                    "delivery": "proactive",
-                }
-            },
-        )
-
-    async def query_battlegrounds_state(
-        self,
+        *,
+        mode: str = "auto",
         topic: str = "current_strategy",
+    ) -> tuple[str, dict[str, Any]]:
+        selected_mode = mode if mode in {"constructed", "battlegrounds"} else "auto"
+        if selected_mode == "auto":
+            try:
+                snapshot, _runtime, _generation = _capture_monitor(
+                    self._ensure_monitor(), timeout_seconds=0.05
+                )
+                selected_mode = (
+                    "battlegrounds" if snapshot.mode == "battlegrounds" else "constructed"
+                )
+            except Exception:
+                selected_mode = "constructed"
+        if selected_mode == "battlegrounds":
+            return selected_mode, await self.hearthstone_battlegrounds_advice(topic=topic)
+        payload = await self.hearthstone_current_state()
+        if payload.get("reason") == "battlegrounds_requires_specialized_tool":
+            return "battlegrounds", await self.hearthstone_battlegrounds_advice(topic=topic)
+        return "constructed", payload
+
+    @plugin_entry(
+        id="query_hearthstone_live_state",
+        name=tr(
+            "entries.query_hearthstone_live_state.name",
+            default="查询当前炉石局势",
+        ),
+        description=tr(
+            "entries.query_hearthstone_live_state.description",
+            default=(
+                "用户询问当前炉石或酒馆战棋的回合、行动方、双方场面、手牌、Choice、"
+                "商店、战团、金币、实际费用、升本、刷新、对手或决策建议时调用。"
+                "每次读取最新玩家可见快照；query 可省略，宿主会提供用户原问题。"
+            ),
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "可选；用户当前关于炉石的原问题，不要改写。",
+                },
+                "focus": {
+                    "type": "string",
+                    "enum": [
+                        "auto",
+                        "overview",
+                        "shop",
+                        "economy",
+                        "board",
+                        "hand",
+                        "choice",
+                        "opponent",
+                        "strategy",
+                    ],
+                    "default": "auto",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["auto", "constructed", "battlegrounds"],
+                    "default": "auto",
+                },
+                "topic": {
+                    "type": "string",
+                    "enum": [
+                        "current_strategy",
+                        "season_meta",
+                        "hero_performance",
+                        "post_game",
+                    ],
+                    "default": "current_strategy",
+                },
+                "opponent_relation": {
+                    "type": "string",
+                    "enum": ["auto", "current", "next", "last"],
+                    "default": "auto",
+                },
+            },
+            "additionalProperties": False,
+        },
+        kind="service",
+        timeout=5.0,
+        llm_result_fields=["reply"],
+        metadata={"agent_auto": True},
+    )
+    async def query_hearthstone_live_state(
+        self,
+        query: str = "",
         focus: str = "auto",
+        mode: str = "auto",
+        topic: str = "current_strategy",
         opponent_relation: str = "auto",
         _ctx: Mapping[str, Any] | None = None,
         **_: Any,
     ):
-        if isinstance(_ctx, Mapping):
-            latest_request = _ctx.get("latest_user_request")
+        context = _ctx if isinstance(_ctx, Mapping) else {}
+        query_text = normalize_query_text(
+            query or context.get("latest_user_request"),
+            limit=240,
+        )
+        intent = classify_live_query(query_text)
+        if intent is not None:
             if focus == "auto":
-                focus = _agent_focus_from_request(latest_request)
+                focus = intent.focus
+            if mode == "auto":
+                mode = intent.mode_hint
             if opponent_relation == "auto":
-                opponent_relation = _agent_opponent_relation_from_request(latest_request)
-        payload = await self.hearthstone_battlegrounds_advice(topic=topic)
+                opponent_relation = intent.opponent_relation
+
+        selected_mode, payload = await self._resolve_live_query_payload(
+            mode=mode,
+            topic=topic,
+        )
         reply = _agent_query_reply(
             payload,
-            mode="battlegrounds",
+            mode=selected_mode,
             focus=focus,
             opponent_relation=opponent_relation,
         )
         return await self.finish(
-            data={
-                "reply": reply,
-                "payload": payload,
-            },
+            data={"reply": reply, "payload": payload},
             delivery="proactive",
             meta={
                 "agent": {
@@ -4610,27 +4469,92 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         )
 
     @llm_tool(
-        name="hearthstone_current_state",
+        name="hearthstone_live_state",
         description=(
-            "Use for current constructed Hearthstone facts or decisions: round, active side, health, mana, "
-            "visible hand, public board, recent plays, choices, or what to play. For 第几回合 use state.round; "
-            "state.turn is the raw alternating action-turn counter. Returns fresh player-visible data only. "
-            "Do not use for any Battlegrounds/酒馆战棋 question; use hearthstone_battlegrounds_advice."
+            "回答任何当前炉石传说或酒馆战棋问题前必须调用。适用于第几回合、轮到谁、"
+            "双方场面、手牌、Choice、商店、酒馆法术、战团、金币、实际费用、升本、刷新、"
+            "冻结、对手、买什么、怎么出牌或怎么站位。无需参数也会自动识别当前游戏模式；"
+            "能取得用户原问题时请原样传入 query，以便自动聚焦。"
         ),
         parameters={
             "type": "object",
             "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "可选；用户当前关于炉石的原问题，不要改写。",
+                },
                 "focus": {
                     "type": "string",
-                    "enum": list(_CONSTRUCTED_TOOL_FOCUSES),
-                    "description": "The exact visible area needed to answer the current question.",
-                }
+                    "enum": [
+                        "auto",
+                        "overview",
+                        "shop",
+                        "economy",
+                        "board",
+                        "hand",
+                        "choice",
+                        "opponent",
+                        "strategy",
+                    ],
+                    "default": "auto",
+                    "description": "可选；不确定时省略，插件会返回当前模式的综合视图。",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["auto", "constructed", "battlegrounds"],
+                    "default": "auto",
+                },
+                "topic": {
+                    "type": "string",
+                    "enum": ["current_strategy", "season_meta", "hero_performance", "post_game"],
+                    "default": "current_strategy",
+                },
+                "opponent_relation": {
+                    "type": "string",
+                    "enum": ["auto", "current", "next", "last"],
+                    "default": "auto",
+                },
             },
-            "required": ["focus"],
             "additionalProperties": False,
         },
         timeout=5.0,
     )
+    async def hearthstone_live_state(
+        self,
+        query: str = "",
+        focus: str = "auto",
+        mode: str = "auto",
+        topic: str = "current_strategy",
+        opponent_relation: str = "auto",
+        _ctx: Mapping[str, Any] | None = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        context = _ctx if isinstance(_ctx, Mapping) else {}
+        query_text = normalize_query_text(
+            query or context.get("latest_user_request"),
+            limit=240,
+        )
+        intent = classify_live_query(query_text)
+        if intent is not None:
+            if focus == "auto":
+                focus = intent.focus
+            if mode == "auto":
+                mode = intent.mode_hint
+            if opponent_relation == "auto":
+                opponent_relation = intent.opponent_relation
+        selected_mode, payload = await self._resolve_live_query_payload(mode=mode, topic=topic)
+        selected_focus = focus if focus != "auto" else "strategy"
+        if selected_mode == "constructed" and selected_focus not in _CONSTRUCTED_TOOL_FOCUSES:
+            selected_focus = "strategy"
+        if selected_mode == "battlegrounds" and selected_focus not in _BATTLEGROUNDS_TOOL_FOCUSES:
+            selected_focus = "strategy"
+        return _focused_llm_tool_result(
+            payload,
+            mode=selected_mode,
+            focus=selected_focus,
+            opponent_relation=opponent_relation,
+        )
+
     async def hearthstone_current_state(
         self, focus: str | None = None, **_: Any
     ) -> dict[str, Any]:
@@ -4751,46 +4675,6 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             return finalize(blocked_payload(access_reason))
         return finalize(result)
 
-    @llm_tool(
-        name="hearthstone_battlegrounds_advice",
-        description=(
-            "Use for every current Battlegrounds/酒馆战棋 fact or decision: hero/Choice, shop, tavern spells, "
-            "warband, positioning, opponents, archetype, buying, leveling, refreshing, freezing, or stabilizing. "
-            "Returns fresh public state, area completeness, observed actual costs/current attributes, sourced card "
-            "facts, official rules, and local aggregate results. Respect capability status, missing_evidence, and "
-            "decision_guardrails; never infer unknown costs or exact affordability. Battlegrounds only, not constructed."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "focus": {
-                    "type": "string",
-                    "enum": list(_BATTLEGROUNDS_TOOL_FOCUSES),
-                    "description": "The exact Battlegrounds area needed to answer the current question.",
-                },
-                "topic": {
-                    "type": "string",
-                    "enum": ["current_strategy", "season_meta", "hero_performance", "post_game"],
-                    "default": "current_strategy",
-                    "description": (
-                        "Use current_strategy for the live match, shop, warband, archetype/流派, purchases, "
-                        "leveling, or stabilizing; it is the default for '现在酒馆玩什么流派'. Use "
-                        "season_meta only for official season mechanics or patch rules, never composition "
-                        "win-rate rankings. hero_performance is aggregate local history; post_game is review."
-                    ),
-                },
-                "opponent_relation": {
-                    "type": "string",
-                    "enum": ["auto", "current", "next", "last"],
-                    "default": "auto",
-                    "description": "Which public opponent observation the question refers to.",
-                },
-            },
-            "required": ["focus"],
-            "additionalProperties": False,
-        },
-        timeout=5.0,
-    )
     async def hearthstone_battlegrounds_advice(
         self,
         topic: str = "current_strategy",

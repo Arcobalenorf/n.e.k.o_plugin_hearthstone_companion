@@ -276,7 +276,9 @@ def test_locator_and_tailer_rotate_to_newest_session_directory(
     os.utime(old_path, ns=(1_000_000_000, 1_000_000_000))
     os.utime(new_path, ns=(2_000_000_000, 2_000_000_000))
 
-    locator = PowerLogLocator(executable_paths_provider=lambda: ())
+    locator = PowerLogLocator(
+        executable_paths_provider=lambda: (), install_paths_provider=lambda: ()
+    )
     tailer = PowerLogTailer(locator)
     first = tailer.poll()
     assert first.path == new_path.resolve()
@@ -305,7 +307,9 @@ def test_locator_discovers_non_default_uid_session(tmp_path: Path, monkeypatch) 
     path.parent.mkdir(parents=True)
     path.write_text("CREATE_GAME\n", encoding="utf-8")
 
-    assert PowerLogLocator(executable_paths_provider=lambda: ()).resolve() == path.resolve()
+    assert PowerLogLocator(
+        executable_paths_provider=lambda: (), install_paths_provider=lambda: ()
+    ).resolve() == path.resolve()
 
 
 def test_configured_logs_directory_discovers_nested_session(tmp_path: Path) -> None:
@@ -331,7 +335,9 @@ def test_locator_discovers_logs_beside_running_game_executable(
     log_path.parent.mkdir(parents=True)
     log_path.write_text("CREATE_GAME\n", encoding="utf-8")
 
-    locator = PowerLogLocator(executable_paths_provider=lambda: (game,))
+    locator = PowerLogLocator(
+        executable_paths_provider=lambda: (game,), install_paths_provider=lambda: ()
+    )
 
     assert locator.resolve() == log_path.resolve()
 
@@ -350,7 +356,9 @@ def test_locator_chooses_newest_session_beside_running_game(
     os.utime(older, ns=(1_000_000_000, 1_000_000_000))
     os.utime(current, ns=(2_000_000_000, 2_000_000_000))
 
-    locator = PowerLogLocator(executable_paths_provider=lambda: (game,))
+    locator = PowerLogLocator(
+        executable_paths_provider=lambda: (game,), install_paths_provider=lambda: ()
+    )
 
     assert locator.resolve() == current.resolve()
 
@@ -372,6 +380,7 @@ def test_locator_retries_running_game_discovery_after_cache_interval(
 
     locator = PowerLogLocator(
         executable_paths_provider=executable_paths,
+        install_paths_provider=lambda: (),
         process_scan_interval_seconds=1.0,
     )
     assert locator.resolve() is None
@@ -408,7 +417,9 @@ def test_process_discovery_failure_keeps_appdata_fallback(tmp_path: Path, monkey
     def denied_provider() -> tuple[Path, ...]:
         raise OSError("access denied")
 
-    assert PowerLogLocator(executable_paths_provider=denied_provider).resolve() == log_path.resolve()
+    assert PowerLogLocator(
+        executable_paths_provider=denied_provider, install_paths_provider=lambda: ()
+    ).resolve() == log_path.resolve()
 
 
 def test_locator_chooses_newest_log_across_appdata_and_running_game(
@@ -428,4 +439,70 @@ def test_locator_chooses_newest_log_across_appdata_and_running_game(
     os.utime(appdata_log, ns=(1_000_000_000, 1_000_000_000))
     os.utime(game_log, ns=(2_000_000_000, 2_000_000_000))
 
-    assert PowerLogLocator(executable_paths_provider=lambda: (game,)).resolve() == game_log.resolve()
+    assert PowerLogLocator(
+        executable_paths_provider=lambda: (game,), install_paths_provider=lambda: ()
+    ).resolve() == game_log.resolve()
+
+
+def test_locator_discovers_logs_from_installed_game_when_process_is_stopped(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    install = tmp_path / "library" / "Hearthstone"
+    log_path = install / "Logs" / "session" / "Power.log"
+    log_path.parent.mkdir(parents=True)
+    log_path.write_text("CREATE_GAME\n", encoding="utf-8")
+
+    locator = PowerLogLocator(
+        executable_paths_provider=lambda: (),
+        install_paths_provider=lambda: (install,),
+    )
+
+    assert locator.resolve() == log_path.resolve()
+
+
+def test_configured_path_never_queries_install_metadata(tmp_path: Path) -> None:
+    log_path = tmp_path / "Power.log"
+    log_path.write_text("CREATE_GAME\n", encoding="utf-8")
+
+    def unexpected_provider() -> tuple[Path, ...]:
+        raise AssertionError("configured path must not query install metadata")
+
+    locator = PowerLogLocator(
+        str(log_path),
+        executable_paths_provider=unexpected_provider,
+        install_paths_provider=unexpected_provider,
+    )
+
+    assert locator.resolve() == log_path.resolve()
+
+
+def test_locator_retries_install_discovery_after_cache_interval(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    now = [20.0]
+    monkeypatch.setattr(tailer_module.time, "monotonic", lambda: now[0])
+    install = tmp_path / "library" / "Hearthstone"
+    log_path = install / "Logs" / "session" / "Power.log"
+    calls = 0
+
+    def install_paths() -> tuple[Path, ...]:
+        nonlocal calls
+        calls += 1
+        return () if calls == 1 else (install,)
+
+    locator = PowerLogLocator(
+        executable_paths_provider=lambda: (),
+        install_paths_provider=install_paths,
+        process_scan_interval_seconds=1.0,
+    )
+    assert locator.resolve() is None
+    log_path.parent.mkdir(parents=True)
+    log_path.write_text("CREATE_GAME\n", encoding="utf-8")
+    assert locator.resolve() is None
+    assert calls == 1
+    now[0] = 21.1
+
+    assert locator.resolve() == log_path.resolve()
+    assert calls == 2

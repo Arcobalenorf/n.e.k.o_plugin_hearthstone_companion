@@ -6,7 +6,7 @@ import secrets
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from .models import (
     BattlegroundsAreaSnapshot,
@@ -283,6 +283,10 @@ _BATTLEGROUNDS_HINT_TAGS = frozenset(
         "3533",
     }
 )
+_MODE_EVIDENCE_UNKNOWN = 0
+_MODE_EVIDENCE_HEURISTIC = 1
+_MODE_EVIDENCE_STRONG_TAG = 2
+_MODE_EVIDENCE_GAME_TYPE = 3
 _BATTLEGROUNDS_CARD_TYPES = frozenset({"MINION", "BATTLEGROUND_SPELL"})
 _BATTLEGROUNDS_CONTROL_EVENTS = frozenset(
     {
@@ -402,6 +406,7 @@ class PowerLogParser:
         self._last_emitted_constructed_turn = 0
         self.phase = "idle"
         self.mode = "unknown"
+        self._mode_evidence = _MODE_EVIDENCE_UNKNOWN
         self.game_type = ""
         self.battlegrounds_variant = "solo"
         self.battlegrounds_round = 0
@@ -466,6 +471,7 @@ class PowerLogParser:
         self._last_emitted_constructed_turn = 0
         self.phase = "idle"
         self.mode = "unknown"
+        self._mode_evidence = _MODE_EVIDENCE_UNKNOWN
         self.game_type = ""
         self.battlegrounds_variant = "solo"
         self.battlegrounds_round = 0
@@ -986,6 +992,7 @@ class PowerLogParser:
             self.game_type = normalized
             first_detection = self.mode != "battlegrounds"
             self.mode = "battlegrounds"
+            self._mode_evidence = _MODE_EVIDENCE_GAME_TYPE
             self.battlegrounds_variant = (
                 "duos" if normalized in _BATTLEGROUNDS_DUO_GAME_TYPES else "solo"
             )
@@ -1006,6 +1013,7 @@ class PowerLogParser:
         first_detection = self.mode != "constructed"
         self.game_type = normalized
         self.mode = "constructed"
+        self._mode_evidence = _MODE_EVIDENCE_GAME_TYPE
         if self.phase in {"idle", "hero_select"}:
             self.phase = "starting"
         self._hydrate_committed_game_state()
@@ -1717,8 +1725,22 @@ class PowerLogParser:
         self._record_tag_observation(entity, tag)
         events: list[GameEvent] = []
 
-        if tag in _BATTLEGROUNDS_HINT_TAGS or tag.startswith("BACON_"):
-            if self.mode != "battlegrounds":
+        strong_battlegrounds_hint = tag in _BATTLEGROUNDS_HINT_TAGS
+        weak_battlegrounds_hint = tag.startswith("BACON_")
+        hint_evidence = (
+            _MODE_EVIDENCE_STRONG_TAG
+            if strong_battlegrounds_hint
+            else _MODE_EVIDENCE_HEURISTIC
+        )
+        can_apply_battlegrounds_hint = (
+            (strong_battlegrounds_hint or (weak_battlegrounds_hint and self.mode == "unknown"))
+            and hint_evidence > self._mode_evidence
+        )
+        if can_apply_battlegrounds_hint:
+            first_detection = self.mode != "battlegrounds"
+            self.mode = "battlegrounds"
+            self._mode_evidence = hint_evidence
+            if first_detection:
                 self.mode = "battlegrounds"
                 self.phase = "hero_select" if not self.spectating else "spectator"
                 self._reconcile_battlegrounds_hero_selection()
@@ -1731,10 +1753,11 @@ class PowerLogParser:
                         {"variant": self.battlegrounds_variant},
                     )
                 )
-            if tag == "BACON_DUO_TEAM_ID" and (_int(value) or 0) > 0:
-                self.battlegrounds_variant = "duos"
+        if tag == "BACON_DUO_TEAM_ID" and self.mode == "battlegrounds" and (_int(value) or 0) > 0:
+            self.battlegrounds_variant = "duos"
         elif self.mode == "unknown" and tag in {"MULLIGAN_STATE", "STEP"}:
             self.mode = "constructed"
+            self._mode_evidence = _MODE_EVIDENCE_HEURISTIC
 
         if tag == "BACON_DUMMY_PLAYER" and str(value).upper() in {"1", "TRUE"}:
             self.bob_controller = self._controller(entity)
@@ -2591,7 +2614,10 @@ class PowerLogParser:
             and not entity.hidden
         ]
         warband_entities = self._battlegrounds_board_entities(self.local_controller)
-        shop_cards = self._battlegrounds_cards(shop_entities)
+        shop_cards = self._battlegrounds_cards(
+            shop_entities,
+            observed_costs=self._battlegrounds_shop_action_costs(shop_entities),
+        )
         hand_cards = self._battlegrounds_cards(hand_entities)
         current_warband = self._battlegrounds_cards(warband_entities, maximum=7)
         visible_warband = current_warband
@@ -2768,7 +2794,11 @@ class PowerLogParser:
         return sorted(unpositioned, key=lambda item: item.entity_id)
 
     def _battlegrounds_cards(
-        self, entities: Iterable[Entity], *, maximum: int = 10
+        self,
+        entities: Iterable[Entity],
+        *,
+        maximum: int = 10,
+        observed_costs: Mapping[int, int] | None = None,
     ) -> tuple[BattlegroundsCardSnapshot, ...]:
         cards: list[BattlegroundsCardSnapshot] = []
         ordered = sorted(entities, key=lambda item: (item.tag_int("ZONE_POSITION", 99), item.entity_id))
@@ -2784,6 +2814,8 @@ class PowerLogParser:
                 current_cost = _int(entity.tags.get("INTERACTABLE_OBJECT_COST"))
             else:
                 current_cost = _int(entity.tags.get("COST"))
+            if observed_costs is not None and entity.entity_id in observed_costs:
+                current_cost = observed_costs[entity.entity_id]
             baseline_complete = bool(
                 entity.battlegrounds_realtime_boolean_baseline_complete
                 or (
@@ -2826,6 +2858,45 @@ class PowerLogParser:
                 )
             )
         return tuple(cards[: max(0, maximum)])
+
+    def _battlegrounds_shop_action_costs(
+        self,
+        shop_entities: Iterable[Entity],
+    ) -> dict[int, int]:
+        shop_ids = {entity.entity_id for entity in shop_entities}
+        observed: dict[int, tuple[int, int]] = {}
+        for entity in self.entities.values():
+            if not entity.card_id.lower().startswith("tb_baconshop_dragbuy"):
+                continue
+            target_id = next(
+                (
+                    value
+                    for tag in ("CARD_TARGET", "2442")
+                    if (value := _int(entity.tags.get(tag))) is not None
+                    and value in shop_ids
+                ),
+                None,
+            )
+            if target_id is None:
+                continue
+            current_cost = next(
+                (
+                    value
+                    for tag in (
+                        "BACON_OVERRIDE_BG_COST",
+                        "INTERACTABLE_OBJECT_COST",
+                        "COST",
+                    )
+                    if (value := _int(entity.tags.get(tag))) is not None
+                ),
+                None,
+            )
+            if current_cost is None:
+                continue
+            candidate = (entity.last_revision, max(0, current_cost))
+            if target_id not in observed or candidate[0] > observed[target_id][0]:
+                observed[target_id] = candidate
+        return {target_id: cost for target_id, (_revision, cost) in observed.items()}
 
     def _battlegrounds_current_choice(
         self,

@@ -17,6 +17,7 @@ ResultCallback = Callable[[GameEvent, GameSnapshot], None]
 EventCallback = Callable[[GameEvent, GameSnapshot], None]
 StateCallback = Callable[[GameSnapshot], None]
 LIVE_STATE_MAX_AGE_SECONDS = 300.0
+LIVE_CONTEXT_PUBLISH_INTERVAL_SECONDS = 0.5
 
 
 class CompanionMonitor:
@@ -52,6 +53,8 @@ class CompanionMonitor:
         self._arbiter = CommentaryArbiter(config)
         self._status = RuntimeStatus()
         self._snapshot = GameSnapshot()
+        self._last_notified_snapshot = GameSnapshot()
+        self._next_state_publish_at = 0.0
         self._lock = threading.RLock()
         self._emission_lock = threading.RLock()
         self._lifecycle_lock = threading.RLock()
@@ -88,6 +91,8 @@ class CompanionMonitor:
             initial_read_max_bytes=self.config.initial_read_max_bytes,
         )
         self._snapshot = self._parser.snapshot()
+        self._last_notified_snapshot = GameSnapshot()
+        self._next_state_publish_at = 0.0
         self._begin_source_generation_locked()
 
     def start(self) -> bool:
@@ -272,7 +277,6 @@ class CompanionMonitor:
                             and activity_at > 0
                             and now - activity_at <= LIVE_STATE_MAX_AGE_SECONDS
                         )
-                        publish_state = bool(live_active_snapshot and state_changed)
                         state_ready = bool(
                             batch.bootstrap
                             and self._bootstrap_complete
@@ -282,6 +286,19 @@ class CompanionMonitor:
                         if state_ready:
                             self._state_ready_notified = True
                             self._live_context_generation = self._source_generation
+                        state_waiting_to_publish = bool(
+                            live_active_snapshot
+                            and snapshot != self._last_notified_snapshot
+                        )
+                        publish_state = bool(
+                            state_waiting_to_publish
+                            and (state_ready or now >= self._next_state_publish_at)
+                        )
+                        if publish_state:
+                            self._last_notified_snapshot = snapshot
+                            self._next_state_publish_at = (
+                                now + LIVE_CONTEXT_PUBLISH_INTERVAL_SECONDS
+                            )
                         state_resumed = bool(
                             processed_lines
                             and not batch.bootstrap
