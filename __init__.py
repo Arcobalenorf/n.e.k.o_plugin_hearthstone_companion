@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
+import math
 import os
 import threading
 import time
@@ -31,6 +33,7 @@ from plugin.sdk.plugin import (
 from .card_catalog import BattlegroundsCardCatalog
 from .commentary import build_live_state_segments, build_llm_prompt
 from .config import CompanionConfig
+from .delivery import LiveStatePublisher, QueryLedger
 from .instructions import HEARTHSTONE_CONTEXT_INSTRUCTIONS
 from .live_query import (
     classify_live_query,
@@ -56,7 +59,10 @@ _AGENT_REPLY_ESTIMATED_MAX_TOKENS = 170
 _LLM_TOOL_FOCUSED_MAX_BYTES = 4096
 _LLM_TOOL_STATE_MAX_BYTES = 2048
 _LIVE_STATE_DELIVERY_MAX_BYTES = 900
-_LIVE_STATE_REFRESH_SECONDS = 1.0
+_LIVE_STATE_REFRESH_SECONDS = 30.0
+_LIVE_QUERY_FALLBACK_DELAY_SECONDS = 1.25
+_LIVE_QUERY_FALLBACK_MAX_AGE_SECONDS = 12.0
+_LIVE_QUERY_FALLBACK_MAX_CHARS = 5200
 _CONSTRUCTED_TOOL_FOCUSES = (
     "overview",
     "board",
@@ -925,10 +931,7 @@ def _agent_constructed_reply(
     focused_tool: bool = False,
 ) -> str:
     if not payload.get("available"):
-        return (
-            "HS_QUERY mode=constructed;available=0;"
-            f"reason={_agent_text(payload.get('reason') or 'no_live_game_state')}"
-        )
+        return f"HS_QUERY mode=constructed;available=0;reason={_agent_text(payload.get('reason') or 'no_live_game_state')}"
     state = payload.get("state") if isinstance(payload.get("state"), Mapping) else {}
     constructed = state.get("constructed")
     constructed = constructed if isinstance(constructed, Mapping) else {}
@@ -944,6 +947,10 @@ def _agent_constructed_reply(
     player_hand = player_hand if isinstance(player_hand, Mapping) else {}
     choice = state.get("choice")
     choice = choice if isinstance(choice, Mapping) else None
+    player_summary = state.get("player") if isinstance(state.get("player"), Mapping) else {}
+    opponent_summary = (
+        state.get("opponent") if isinstance(state.get("opponent"), Mapping) else {}
+    )
     selected_focus = str(focus or "auto")
     if selected_focus == "overview":
         selected_focus = "auto"
@@ -1069,9 +1076,9 @@ def _agent_constructed_reply(
                 f"player_hp={_agent_scalar(player_hero.get('health'))}+{_agent_scalar(player_hero.get('armor', 0))}",
                 f"mana={_agent_scalar(mana.get('available'))}/{_agent_scalar(mana.get('maximum'))}",
                 f"hand={_agent_scalar(player_hand.get('count'))}",
-                f"player_board={len(list(player_board.get('minions') or []))}",
+                f"player_board={_agent_scalar((player_summary.get('board') or {}).get('count'))}",
                 f"opponent_hp={_agent_scalar(opponent_hero.get('health'))}+{_agent_scalar(opponent_hero.get('armor', 0))}",
-                f"opponent_board={len(list(opponent_board.get('minions') or []))}",
+                f"opponent_board={_agent_scalar((opponent_summary.get('board') or {}).get('count'))}",
                 "legal_actions=partial",
             ]
         )
@@ -1108,7 +1115,8 @@ def _agent_constructed_reply(
         limit = 7
         hand_shape = False
         extra = [
-            f"hp={_agent_scalar(target_hero.get('health'))}+{_agent_scalar(target_hero.get('armor', 0))}"
+            f"hp={_agent_scalar(target_hero.get('health'))}+{_agent_scalar(target_hero.get('armor', 0))}",
+            f"q={_agent_scalar(target_board.get('identities_complete'))}",
         ]
 
     variants = (
@@ -1803,6 +1811,8 @@ def _focused_tool_evidence(
                 "specific_card_play_analysis",
             ),
             "choice": ("current_choice_options",),
+            "board": ("player_board_identities_complete",),
+            "opponent": ("opponent_board_identities_complete",),
         }
     else:
         keys_by_focus = {
@@ -1958,6 +1968,38 @@ def _focused_llm_tool_result(
     return fallback
 
 
+def _sanitize_constructed_tool_state(state: dict[str, Any]) -> dict[str, Any]:
+    constructed = state.get("constructed")
+    if not isinstance(constructed, Mapping):
+        return state
+    sanitized_constructed = dict(constructed)
+    for side_name in ("player", "opponent"):
+        side = (
+            dict(sanitized_constructed.get(side_name) or {})
+            if isinstance(sanitized_constructed.get(side_name), Mapping)
+            else {}
+        )
+        board = dict(side.get("board") or {}) if isinstance(side.get("board"), Mapping) else {}
+        summary = state.get(side_name) if isinstance(state.get(side_name), Mapping) else {}
+        summary_board = summary.get("board") if isinstance(summary.get("board"), Mapping) else {}
+        expected_count = summary_board.get("count")
+        minions = list(board.get("minions") or [])
+        identities_complete = bool(
+            board.get("identities_complete") is True
+            and isinstance(expected_count, int)
+            and expected_count >= 0
+            and expected_count == len(minions)
+        )
+        board["count"] = expected_count
+        board["identities_complete"] = identities_complete
+        if not identities_complete:
+            board["minions"] = []
+        side["board"] = board
+        sanitized_constructed[side_name] = side
+    state["constructed"] = sanitized_constructed
+    return state
+
+
 @neko_plugin
 class HearthstoneCompanionPlugin(NekoPluginBase):
     """Read-only Hearthstone companion built on the public N.E.K.O Plugin SDK."""
@@ -1993,6 +2035,17 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         self._live_state_game_number = 0
         self._live_state_snapshot: GameSnapshot | None = None
         self._live_state_published_at = 0.0
+        self._state_publisher = LiveStatePublisher(
+            push_message=self._publish_sdk_message,
+            build_segments=build_live_state_segments,
+            logger=self.logger,
+            max_prompt_bytes=_LIVE_STATE_DELIVERY_MAX_BYTES,
+            refresh_seconds=_LIVE_STATE_REFRESH_SECONDS,
+        )
+        self._query_ledger = QueryLedger()
+        self._session_target = ""
+        self._last_user_context_timestamp = 0.0
+        self._last_user_context_signatures: set[str] = set()
         self._ownership_lock = threading.RLock()
         self._delivery_lock = threading.RLock()
         self._settings_lock = asyncio.Lock()
@@ -2103,9 +2156,9 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 "missing": sorted(missing),
             }
 
-        unregister = getattr(self, "unregister_llm_tool", None)
         register = getattr(self, "register_llm_tool", None)
-        if not callable(unregister) or not callable(register):
+        unregister = getattr(self, "unregister_llm_tool", None)
+        if not callable(register) or not callable(unregister):
             return {
                 "healthy": False,
                 "reason": "sdk_recovery_unavailable",
@@ -2128,12 +2181,6 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     interrupted_reason = "lifecycle_superseded"
                     break
                 unregister(name)
-                if not bool(getattr(self, "_started", False)):
-                    interrupted_reason = "plugin_not_running"
-                    break
-                if int(getattr(self, "_lifecycle_generation", 0)) != recovery_generation:
-                    interrupted_reason = "lifecycle_superseded"
-                    break
                 register(
                     name=name,
                     description=spec["description"],
@@ -2142,6 +2189,12 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     timeout=spec["timeout"],
                     role=spec["role"],
                 )
+                if not bool(getattr(self, "_started", False)):
+                    interrupted_reason = "plugin_not_running"
+                    break
+                if int(getattr(self, "_lifecycle_generation", 0)) != recovery_generation:
+                    interrupted_reason = "lifecycle_superseded"
+                    break
                 recovered.append(name)
 
         if interrupted_reason:
@@ -3095,6 +3148,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
 
     def _begin_startup(self) -> int:
         task = asyncio.current_task()
+        self._ensure_query_ledger().clear()
         with self._ownership_lock:
             generation = int(getattr(self, "_lifecycle_generation", 0)) + 1
             self._lifecycle_generation = generation
@@ -3178,6 +3232,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             self._config_reconcile_accepting = False
             startup_task = getattr(self, "_startup_task", None)
             reconcile_task = getattr(self, "_config_reconcile_task", None)
+        self._ensure_query_ledger().clear()
         if (
             startup_task is not None
             and startup_task is not current_task
@@ -3312,7 +3367,13 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             self._overlay_applied_config = updated
 
     @message(id="chat_quiet_window", source="chat")
-    async def on_chat_message(self, **_: Any):
+    async def on_chat_message(self, **kwargs: Any):
+        context = kwargs.get("_ctx")
+        if isinstance(context, Mapping):
+            target = str(context.get("lanlan_name") or "").strip()[:80]
+            if target:
+                with self._ownership_lock:
+                    self._session_target = target
         with self._ownership_lock:
             self._last_user_chat_at = time.time()
         return Ok(
@@ -3333,16 +3394,52 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             configured = self._stable_target()
             if configured:
                 return configured
-            if getattr(self, "_live_state_shared", False):
-                captured = str(getattr(self, "_live_state_target", "") or "").strip()
-                if captured:
-                    return captured[:80]
-            ctx = getattr(self, "ctx", None)
-            for field in ("_current_lanlan", "current_lanlan", "lanlan_name"):
-                value = getattr(ctx, field, None)
-                if isinstance(value, str) and value.strip():
-                    return value.strip()[:80]
+            captured = str(getattr(self, "_session_target", "") or "").strip()
+            if captured:
+                return captured[:80]
             return ""
+
+    def _ensure_state_publisher(self) -> LiveStatePublisher:
+        publisher = getattr(self, "_state_publisher", None)
+        if publisher is None:
+            publisher = LiveStatePublisher(
+                push_message=self._publish_sdk_message,
+                build_segments=build_live_state_segments,
+                logger=getattr(self, "logger", None),
+                max_prompt_bytes=_LIVE_STATE_DELIVERY_MAX_BYTES,
+                refresh_seconds=_LIVE_STATE_REFRESH_SECONDS,
+            )
+            if bool(getattr(self, "_live_state_shared", False)):
+                publisher.restore(
+                    target=str(getattr(self, "_live_state_target", "") or ""),
+                    game_number=int(getattr(self, "_live_state_game_number", 0) or 0),
+                    segments=tuple(
+                        getattr(self, "_live_state_segments", ()) or ("core",)
+                    ),
+                    snapshot=getattr(self, "_live_state_snapshot", None),
+                    published_at=float(
+                        getattr(self, "_live_state_published_at", 0.0) or 0.0
+                    ),
+                )
+            self._state_publisher = publisher
+        return publisher
+
+    def _publish_sdk_message(self, **kwargs: Any) -> Any:
+        return self.push_message(**kwargs)
+
+    def _sync_live_state_compatibility(self) -> None:
+        cursor = self._ensure_state_publisher().cursor
+        with self._ownership_lock:
+            self._live_state_shared = cursor is not None
+            self._live_state_target = cursor.target if cursor is not None else ""
+            self._live_state_segments = cursor.segments if cursor is not None else ()
+            self._live_state_game_number = (
+                cursor.game_number if cursor is not None else 0
+            )
+            self._live_state_snapshot = cursor.snapshot if cursor is not None else None
+            self._live_state_published_at = (
+                cursor.published_at if cursor is not None else 0.0
+            )
 
     def _context_restore_required(
         self,
@@ -3354,11 +3451,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         source_changed = updated.log_path != previous.log_path
         access_revoked = not updated.llm_data_consent
         configured_target_changed = previous_target != updated_target
-        live_state_shared = bool(getattr(self, "_live_state_shared", False))
-        return bool(
-            live_state_shared
-            and (access_revoked or source_changed or configured_target_changed)
-        )
+        return bool(access_revoked or source_changed or configured_target_changed)
 
     @staticmethod
     def _live_state_key(
@@ -3372,51 +3465,6 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             base = f"hearthstone:live-state:{digest}"
         return f"{base}:{segment}"
 
-    def _push_live_state(
-        self,
-        text: str,
-        *,
-        target_lanlan: str,
-        expired: bool,
-        segment: str = "core",
-        game_number: int = 0,
-    ) -> bool:
-        kwargs: dict[str, Any] = {
-            "visibility": [],
-            "ai_behavior": "read",
-            "parts": [{"type": "text", "text": text}],
-            "source": "hearthstone_companion",
-            "metadata": {
-                "kind": "game_live_state_expired" if expired else "game_live_state",
-                "context_type": "hearthstone_companion_live_state",
-                "delivery_intent": "passive_context",
-                "context_expired": expired,
-                "privacy_scope": (
-                    "no_game_state_tombstone"
-                    if expired
-                    else "filtered_player_visible_live_state"
-                ),
-                "format": "hearthstone_live_segments_v1",
-                "segment": segment,
-                "match_id": game_number,
-            },
-            "priority": 0,
-            "coalesce_key": self._live_state_key(
-                target_lanlan,
-                segment,
-            ),
-        }
-        if target_lanlan:
-            kwargs["target_lanlan"] = target_lanlan
-        try:
-            return _submitted(self.push_message(**kwargs))
-        except Exception as exc:
-            self.logger.warning(
-                "Hearthstone live-state delivery failed code=%s",
-                type(exc).__name__,
-            )
-            return False
-
     def _publish_live_state(self, snapshot: GameSnapshot) -> bool:
         return self._share_live_state(snapshot)
 
@@ -3424,10 +3472,10 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         with self._delivery_guard():
             access_reason, _revision = _live_state_access(self)
             target = self._delivery_target()
-            published_at = time.monotonic()
             with self._ownership_lock:
                 blocked = bool(
                     access_reason
+                    or not target
                     or not self._started
                     or not self._monitor_dispatch_enabled
                     or snapshot.game_number <= 0
@@ -3435,131 +3483,39 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 )
             if blocked:
                 return False
-            with self._ownership_lock:
-                already_shared = bool(
-                    getattr(self, "_live_state_shared", False)
-                    and getattr(self, "_live_state_target", "") == target
-                    and getattr(self, "_live_state_snapshot", None) == snapshot
-                    and published_at
-                    - float(getattr(self, "_live_state_published_at", 0.0) or 0.0)
-                    < _LIVE_STATE_REFRESH_SECONDS
-                )
-                target_changed = bool(
-                    getattr(self, "_live_state_shared", False)
-                    and getattr(self, "_live_state_target", "") != target
-                )
-                game_changed = bool(
-                    getattr(self, "_live_state_shared", False)
-                    and int(getattr(self, "_live_state_game_number", 0) or 0)
-                    != snapshot.game_number
-                )
-            if already_shared:
-                return True
-            if (target_changed or game_changed) and not self._expire_live_state(
-                reason="route_or_match_changed"
-            ):
-                return False
-            try:
-                segments = build_live_state_segments(
-                    snapshot,
-                    observed_at=time.time(),
-                    max_prompt_bytes=_LIVE_STATE_DELIVERY_MAX_BYTES,
-                )
-            except Exception as exc:
-                self.logger.warning(
-                    "Hearthstone live-state serialization failed code=%s",
-                    type(exc).__name__,
-                )
-                return False
-            segment_names = tuple(name for name, _text in segments)
-            with self._ownership_lock:
-                previous_segments = tuple(getattr(self, "_live_state_segments", ()) or ())
-            if (
-                getattr(self, "_live_state_shared", False)
-                and previous_segments != segment_names
-                and not self._expire_live_state(reason="segment_set_changed")
-            ):
-                return False
-            for segment, text in segments:
-                access_reason, _revision = _live_state_access(self)
+
+            cursor = self._ensure_state_publisher().cursor
+            if cursor is not None and cursor.game_number != snapshot.game_number:
+                self._ensure_query_ledger().clear()
+
+            def delivery_valid() -> bool:
+                current_reason, _current_revision = _live_state_access(self)
                 with self._ownership_lock:
-                    delivery_invalid = bool(
-                        access_reason
+                    return not bool(
+                        current_reason
                         or not self._started
                         or not self._monitor_dispatch_enabled
                         or self._delivery_target() != target
                     )
-                if delivery_invalid:
-                    if getattr(self, "_live_state_shared", False):
-                        self._expire_live_state(reason="delivery_invalidated")
-                    return False
-                if not self._push_live_state(
-                    text,
-                    target_lanlan=target,
-                    expired=False,
-                    segment=segment,
-                    game_number=snapshot.game_number,
-                ):
-                    if getattr(self, "_live_state_shared", False):
-                        self._expire_live_state(reason="partial_publish")
-                    return False
-                with self._ownership_lock:
-                    self._live_state_shared = True
-                    self._live_state_target = target
-                    self._live_state_segments = segment_names
-                    self._live_state_game_number = snapshot.game_number
-            access_reason, _revision = _live_state_access(self)
-            with self._ownership_lock:
-                delivery_invalid = bool(
-                    access_reason
-                    or not self._started
-                    or not self._monitor_dispatch_enabled
-                    or self._delivery_target() != target
-                )
-            if delivery_invalid:
-                self._expire_live_state(reason="delivery_invalidated")
-                return False
-            with self._ownership_lock:
-                self._live_state_snapshot = snapshot
-                self._live_state_published_at = published_at
-            return True
+
+            published = self._ensure_state_publisher().publish(
+                snapshot,
+                target=target,
+                valid=delivery_valid,
+            )
+            self._sync_live_state_compatibility()
+            return published
 
     def _expire_live_state(self, *, reason: str = "unavailable") -> bool:
         with self._delivery_guard():
-            with self._ownership_lock:
-                if not getattr(self, "_live_state_shared", False):
-                    return True
-                target = str(getattr(self, "_live_state_target", "") or "")
-                game_number = int(getattr(self, "_live_state_game_number", 0) or 0)
-                segments = tuple(getattr(self, "_live_state_segments", ()) or ("core",))
-            text = (
-                "# 炉石实时公开状态已失效\n"
-                f"reason={str(reason or 'unavailable')[:48]};"
-                "不得继续使用此前同一局和分段的局势；需要当前事实时调用 hearthstone_live_state。"
-            )
-            for segment in segments:
-                if not self._push_live_state(
-                    text,
-                    target_lanlan=target,
-                    expired=True,
-                    segment=segment,
-                    game_number=game_number,
-                ):
-                    return False
-            with self._ownership_lock:
-                if (
-                    getattr(self, "_live_state_shared", False)
-                    and getattr(self, "_live_state_target", "") == target
-                ):
-                    self._live_state_shared = False
-                    self._live_state_target = ""
-                    self._live_state_segments = ()
-                    self._live_state_game_number = 0
-                    self._live_state_snapshot = None
-                    self._live_state_published_at = 0.0
-            return True
+            expired = self._ensure_state_publisher().expire(reason=reason)
+            self._sync_live_state_compatibility()
+            return expired
 
     def _restore_context(self) -> bool:
+        self._ensure_query_ledger().clear()
+        with self._ownership_lock:
+            self._session_target = ""
         return self._expire_live_state(reason="context_invalidated")
 
     def _observe_game_event(self, event: GameEvent, snapshot: GameSnapshot) -> None:
@@ -3571,12 +3527,352 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             "game_ended",
         }
         if snapshot.phase == "spectator" or leaving:
+            self._ensure_query_ledger().clear()
             self._expire_live_state(reason=event.kind)
 
     @timer_interval(id="live_state_context_refresh", seconds=1, auto_start=True)
     async def live_state_context_refresh(self, **_: Any):
         self._sync_active_game_context()
         return Ok({"refreshed": True})
+
+    @staticmethod
+    def _user_context_payload(record: Any) -> Mapping[str, Any] | None:
+        # The public memory facade may wrap a MemoryRecord more than once
+        # (SdkBusMemoryRecord.payload["value"] -> MemoryRecord.raw). Follow
+        # only documented wrapper edges and keep the walk strictly bounded.
+        pending: list[tuple[Any, int]] = [(record, 0)]
+        seen: set[int] = set()
+        fallback: Mapping[str, Any] | None = None
+        while pending:
+            candidate, depth = pending.pop()
+            if candidate is None or depth > 6:
+                continue
+            identity = id(candidate)
+            if identity in seen:
+                continue
+            seen.add(identity)
+
+            if isinstance(candidate, Mapping):
+                message_type = str(candidate.get("type") or "").casefold()
+                if message_type == "user_message":
+                    if candidate.get("content") and candidate.get("lanlan"):
+                        return candidate
+                    fallback = fallback or candidate
+                for key in ("value", "raw", "payload"):
+                    if key in candidate:
+                        pending.append((candidate.get(key), depth + 1))
+                continue
+
+            for attribute in ("raw", "payload"):
+                try:
+                    wrapped = getattr(candidate, attribute, None)
+                except Exception:
+                    wrapped = None
+                if wrapped is not None:
+                    pending.append((wrapped, depth + 1))
+            try:
+                dump = getattr(candidate, "dump", None)
+            except Exception:
+                dump = None
+            if callable(dump):
+                try:
+                    pending.append((dump(), depth + 1))
+                except Exception:
+                    continue
+        return fallback
+
+    def _ensure_query_ledger(self) -> QueryLedger:
+        ledger = getattr(self, "_query_ledger", None)
+        if ledger is None:
+            ledger = QueryLedger()
+            self._query_ledger = ledger
+        return ledger
+
+    async def _read_recent_user_context(self) -> tuple[Any, ...]:
+        bus = getattr(getattr(self, "ctx", None), "bus", None)
+        memory = getattr(bus, "memory", None)
+        get_memory = getattr(memory, "get", None)
+        if not callable(get_memory):
+            return ()
+        result = get_memory(bucket_id="default", limit=8, timeout=0.25)
+        if inspect.isawaitable(result):
+            result = await result
+        is_err = getattr(result, "is_err", None)
+        if callable(is_err) and is_err():
+            return ()
+        is_ok = getattr(result, "is_ok", None)
+        if callable(is_ok) and is_ok():
+            result = getattr(result, "value", result)
+        try:
+            return tuple(result)
+        except TypeError:
+            return ()
+
+    def _observe_user_context(self, records: tuple[Any, ...]) -> int:
+        observed: list[tuple[float, str, str, bool]] = []
+        configured_target = self._stable_target()
+        for record in records:
+            try:
+                payload = self._user_context_payload(record)
+            except Exception:
+                continue
+            if payload is None:
+                continue
+            text = normalize_query_text(payload.get("content"), limit=240)
+            target = str(payload.get("lanlan") or "").strip()[:80]
+            if not text or not target:
+                continue
+            try:
+                source_timestamp = float(payload.get("_ts") or 0.0)
+            except (TypeError, ValueError):
+                source_timestamp = 0.0
+            if not math.isfinite(source_timestamp) or source_timestamp <= 0:
+                continue
+            observed.append(
+                (
+                    source_timestamp,
+                    target,
+                    text,
+                    not configured_target or target == configured_target,
+                )
+            )
+
+        observed.sort(key=lambda item: item[0])
+        ledger = self._ensure_query_ledger()
+        accepted = 0
+        for source_timestamp, target, text, target_allowed in observed:
+            signature = ledger.signature(text, target)
+            with self._ownership_lock:
+                watermark = float(
+                    getattr(self, "_last_user_context_timestamp", 0.0) or 0.0
+                )
+                watermark_signatures = set(
+                    getattr(self, "_last_user_context_signatures", set()) or set()
+                )
+                if source_timestamp < watermark or (
+                    source_timestamp == watermark
+                    and signature in watermark_signatures
+                ):
+                    is_new = False
+                else:
+                    is_new = True
+                    if source_timestamp > watermark:
+                        watermark_signatures = {signature}
+                    else:
+                        watermark_signatures.add(signature)
+                    self._last_user_context_timestamp = source_timestamp
+                    self._last_user_context_signatures = watermark_signatures
+                if is_new and target_allowed:
+                    self._session_target = target
+                    self._last_user_chat_at = max(
+                        float(getattr(self, "_last_user_chat_at", 0.0) or 0.0),
+                        source_timestamp,
+                    )
+            if not is_new or not target_allowed:
+                continue
+            accepted += 1
+            if classify_live_query(text) is not None:
+                ledger.observe(
+                    text,
+                    target=target,
+                    source_timestamp=source_timestamp,
+                )
+        return accepted
+
+    @staticmethod
+    def _live_query_key(target: str, signature: str) -> str:
+        owner = hashlib.sha256(target.encode("utf-8")).hexdigest()[:16]
+        return f"hearthstone:query:{owner}:{signature[:16]}"
+
+    async def _dispatch_live_query_fallback(self, claim: Any) -> bool:
+        ledger = self._ensure_query_ledger()
+        acquired = ledger.claim(
+            owner="fallback",
+            text=claim.text,
+            target=claim.target,
+        )
+        if acquired is None:
+            return False
+
+        try:
+            access_reason, transition_revision = _live_state_access(self)
+            with self._ownership_lock:
+                lifecycle_generation = int(
+                    getattr(self, "_lifecycle_generation", 0) or 0
+                )
+                expected_monitor = getattr(self, "_monitor", None)
+                blocked = bool(
+                    access_reason
+                    or not getattr(self, "_started", False)
+                    or not getattr(self, "_monitor_dispatch_enabled", False)
+                    or (
+                        self._stable_target()
+                        and self._stable_target() != acquired.target
+                    )
+                )
+            if blocked or not acquired.target:
+                ledger.release(acquired, owner="fallback")
+                return False
+
+            intent = classify_live_query(acquired.text)
+            if intent is None:
+                ledger.release(acquired, owner="fallback")
+                return False
+            selected_mode, payload = await self._resolve_live_query_payload(
+                mode=intent.mode_hint,
+                topic="current_strategy",
+            )
+            selected_focus = intent.focus
+            if (
+                selected_mode == "constructed"
+                and selected_focus not in _CONSTRUCTED_TOOL_FOCUSES
+            ):
+                selected_focus = "strategy"
+            if (
+                selected_mode == "battlegrounds"
+                and selected_focus not in _BATTLEGROUNDS_TOOL_FOCUSES
+            ):
+                selected_focus = "strategy"
+            focused = _focused_llm_tool_result(
+                payload,
+                mode=selected_mode,
+                focus=selected_focus,
+                opponent_relation=intent.opponent_relation,
+            )
+            encoded = json.dumps(
+                focused,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            prefix = (
+                f"{HEARTHSTONE_CONTEXT_INSTRUCTIONS}\n\n"
+                "# 当前炉石问题\n"
+                f"{{MASTER_NAME}}刚刚问：{acquired.text}\n"
+                "请直接依据下面这一刻的公开状态回答；不要说正在查询或提到插件。"
+                "若 available=false 或证据不完整，明确说明缺什么，不得用旧局势补猜。\n"
+                "当前聚焦状态 JSON："
+            )
+            if len(prefix) + len(encoded) > _LIVE_QUERY_FALLBACK_MAX_CHARS:
+                reduced = {
+                    "format": focused.get("format"),
+                    "mode": focused.get("mode"),
+                    "focus": focused.get("focus"),
+                    "available": focused.get("available"),
+                    "reason": focused.get("reason"),
+                    "views": list(focused.get("views") or ())[:1],
+                    "truncated": True,
+                }
+                encoded = json.dumps(
+                    reduced,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            kwargs: dict[str, Any] = {
+                "visibility": [],
+                "ai_behavior": "respond",
+                "parts": [{"type": "text", "text": prefix + encoded}],
+                "source": "hearthstone_companion",
+                "metadata": {
+                    "kind": "live_query_fallback",
+                    "context_type": "hearthstone_companion_live_query",
+                    "privacy_scope": "filtered_player_visible_live_state",
+                    "query_signature": acquired.signature[:16],
+                    "focus": selected_focus,
+                    "mode": selected_mode,
+                },
+                "priority": 7,
+                "coalesce_key": self._live_query_key(
+                    acquired.target,
+                    acquired.signature,
+                ),
+                "target_lanlan": acquired.target,
+            }
+            with self._delivery_guard():
+                current_reason, _current_revision = _live_state_access(
+                    self,
+                    expected_transition_revision=transition_revision,
+                )
+                with self._ownership_lock:
+                    delivery_still_valid = not bool(
+                        current_reason
+                        or not ledger.owns(acquired, owner="fallback")
+                        or not getattr(self, "_started", False)
+                        or not getattr(self, "_monitor_dispatch_enabled", False)
+                        or int(getattr(self, "_lifecycle_generation", 0) or 0)
+                        != lifecycle_generation
+                        or getattr(self, "_monitor", None) is not expected_monitor
+                        or (
+                            self._stable_target()
+                            and self._stable_target() != acquired.target
+                        )
+                    )
+                if not delivery_still_valid:
+                    ledger.release(acquired, owner="fallback")
+                    return False
+                submitted = _submitted(self.push_message(**kwargs))
+            if not submitted:
+                ledger.release(acquired, owner="fallback")
+            return submitted
+        except asyncio.CancelledError:
+            ledger.release(acquired, owner="fallback")
+            raise
+        except Exception as exc:
+            ledger.release(acquired, owner="fallback")
+            self.logger.warning(
+                "Hearthstone live-query fallback failed code=%s",
+                type(exc).__name__,
+            )
+            return False
+
+    @timer_interval(id="live_query_watch", seconds=1, auto_start=True)
+    async def live_query_watch(self, **_: Any):
+        access_reason, _transition_revision = _live_state_access(self)
+        if access_reason:
+            self._ensure_query_ledger().clear()
+            return Ok(
+                {
+                    "observed": 0,
+                    "pending_queries": 0,
+                    "fallback_submitted": False,
+                }
+            )
+        try:
+            records = await self._read_recent_user_context()
+            observed = self._observe_user_context(records)
+        except Exception as exc:
+            self.logger.debug(
+                "Hearthstone user-context read unavailable code=%s",
+                type(exc).__name__,
+            )
+            return Ok({"observed": 0, "fallback_submitted": False})
+
+        now = time.time()
+        pending = self._ensure_query_ledger().pending(
+            now=now,
+            min_age=_LIVE_QUERY_FALLBACK_DELAY_SECONDS,
+        )
+        submitted = False
+        for claim in reversed(pending):
+            age = now - claim.source_timestamp
+            if age > _LIVE_QUERY_FALLBACK_MAX_AGE_SECONDS:
+                self._ensure_query_ledger().claim(
+                    owner="expired",
+                    text=claim.text,
+                    target=claim.target,
+                    now=now,
+                )
+                continue
+            submitted = await self._dispatch_live_query_fallback(claim)
+            break
+        return Ok(
+            {
+                "observed": observed,
+                "pending_queries": len(pending),
+                "fallback_submitted": submitted,
+            }
+        )
 
     def _sync_active_game_context(self) -> None:
         access_reason, transition_revision = _live_state_access(self)
@@ -3648,6 +3944,8 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 ):
                     return False
             target = self._delivery_target()
+            if not target:
+                return False
             terminal = event.kind in {"battlegrounds_game_ended", "game_ended"}
             heading = "# 本次终局事件" if terminal else "# 本次公开事件"
             prompt_budget = (
@@ -4401,12 +4699,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 },
                 "topic": {
                     "type": "string",
-                    "enum": [
-                        "current_strategy",
-                        "season_meta",
-                        "hero_performance",
-                        "post_game",
-                    ],
+                    "enum": ["current_strategy", "season_meta", "hero_performance", "post_game"],
                     "default": "current_strategy",
                 },
                 "opponent_relation": {
@@ -4437,6 +4730,31 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             query or context.get("latest_user_request"),
             limit=240,
         )
+        context_target = str(context.get("lanlan_name") or "").strip()[:80]
+        if context_target:
+            with self._ownership_lock:
+                self._session_target = context_target
+        ledger = getattr(self, "_query_ledger", None)
+        claim_query = getattr(ledger, "claim", None)
+        acquired_claim = None
+        if callable(claim_query):
+            target = context_target
+            resolve_target = getattr(self, "_delivery_target", None)
+            if not target and callable(resolve_target):
+                target = resolve_target()
+            acquired_claim = claim_query(owner="agent", text=query_text, target=target)
+        if query_text and callable(claim_query) and acquired_claim is None:
+            return await self.finish(
+                data={"reply": "", "status": "query_already_handled"},
+                delivery="silent",
+                meta={"agent": {"result_kind": "event", "delivery": "silent"}},
+            )
+        if not query_text and callable(claim_query) and acquired_claim is None:
+            return await self.finish(
+                data={"reply": "", "status": "query_correlation_required"},
+                delivery="silent",
+                meta={"agent": {"result_kind": "event", "delivery": "silent"}},
+            )
         intent = classify_live_query(query_text)
         if intent is not None:
             if focus == "auto":
@@ -4446,42 +4764,49 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             if opponent_relation == "auto":
                 opponent_relation = intent.opponent_relation
 
-        selected_mode, payload = await self._resolve_live_query_payload(
-            mode=mode,
-            topic=topic,
-        )
-        reply = _agent_query_reply(
-            payload,
-            mode=selected_mode,
-            focus=focus,
-            opponent_relation=opponent_relation,
-        )
-        return await self.finish(
-            data={"reply": reply, "payload": payload},
-            delivery="proactive",
-            meta={
-                "agent": {
-                    "result_kind": "event",
-                    "expires_in_s": 8.0,
-                    "delivery": "proactive",
-                }
-            },
-        )
+        try:
+            selected_mode, payload = await self._resolve_live_query_payload(
+                mode=mode,
+                topic=topic,
+            )
+            reply = _agent_query_reply(
+                payload,
+                mode=selected_mode,
+                focus=focus,
+                opponent_relation=opponent_relation,
+            )
+            return await self.finish(
+                data={"reply": reply, "payload": payload},
+                delivery="proactive",
+                meta={
+                    "agent": {
+                        "result_kind": "event",
+                        "expires_in_s": 8.0,
+                        "delivery": "proactive",
+                    }
+                },
+            )
+        except BaseException:
+            release_claim = getattr(ledger, "release", None)
+            if acquired_claim is not None and callable(release_claim):
+                release_claim(acquired_claim, owner="agent")
+            raise
 
     @llm_tool(
         name="hearthstone_live_state",
         description=(
             "回答任何当前炉石传说或酒馆战棋问题前必须调用。适用于第几回合、轮到谁、"
             "双方场面、手牌、Choice、商店、酒馆法术、战团、金币、实际费用、升本、刷新、"
-            "冻结、对手、买什么、怎么出牌或怎么站位。无需参数也会自动识别当前游戏模式；"
-            "能取得用户原问题时请原样传入 query，以便自动聚焦。"
+            "冻结、对手、买什么、怎么出牌或怎么站位。无需传 mode/focus 也会自动识别当前游戏模式；"
+            "必须把用户原问题原样传入 query，以便自动聚焦并与兜底链路去重。"
         ),
         parameters={
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "可选；用户当前关于炉石的原问题，不要改写。",
+                    "minLength": 1,
+                    "description": "必填；用户当前关于炉石的原问题，不要改写。",
                 },
                 "focus": {
                     "type": "string",
@@ -4506,7 +4831,12 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 },
                 "topic": {
                     "type": "string",
-                    "enum": ["current_strategy", "season_meta", "hero_performance", "post_game"],
+                    "enum": [
+                        "current_strategy",
+                        "season_meta",
+                        "hero_performance",
+                        "post_game",
+                    ],
                     "default": "current_strategy",
                 },
                 "opponent_relation": {
@@ -4515,6 +4845,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     "default": "auto",
                 },
             },
+            "required": ["query"],
             "additionalProperties": False,
         },
         timeout=5.0,
@@ -4534,6 +4865,35 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             query or context.get("latest_user_request"),
             limit=240,
         )
+        ledger = getattr(self, "_query_ledger", None)
+        claim_query = getattr(ledger, "claim", None)
+        acquired_claim = None
+        if callable(claim_query):
+            target = str(
+                getattr(getattr(self, "cfg", None), "target_lanlan", "") or ""
+            ).strip()[:80]
+            acquired_claim = claim_query(owner="tool", text=query_text, target=target)
+        if query_text and callable(claim_query) and acquired_claim is None:
+            return {
+                "format": "hearthstone_compact_v1",
+                "available": False,
+                "status": "query_already_handled",
+                "reason": "query_already_handled",
+                "reply": "HS_QUERY available=0;reason=query_already_handled",
+                "answer_contract": {"do_not_reply": True},
+            }
+        if not query_text and callable(claim_query) and acquired_claim is None:
+            return {
+                "format": "hearthstone_compact_v1",
+                "available": False,
+                "status": "query_correlation_required",
+                "reason": "query_correlation_required",
+                "reply": "HS_QUERY available=0;reason=query_correlation_required",
+                "answer_contract": {
+                    "do_not_reply": True,
+                    "retry_with_query": True,
+                },
+            }
         intent = classify_live_query(query_text)
         if intent is not None:
             if focus == "auto":
@@ -4542,18 +4902,33 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 mode = intent.mode_hint
             if opponent_relation == "auto":
                 opponent_relation = intent.opponent_relation
-        selected_mode, payload = await self._resolve_live_query_payload(mode=mode, topic=topic)
-        selected_focus = focus if focus != "auto" else "strategy"
-        if selected_mode == "constructed" and selected_focus not in _CONSTRUCTED_TOOL_FOCUSES:
-            selected_focus = "strategy"
-        if selected_mode == "battlegrounds" and selected_focus not in _BATTLEGROUNDS_TOOL_FOCUSES:
-            selected_focus = "strategy"
-        return _focused_llm_tool_result(
-            payload,
-            mode=selected_mode,
-            focus=selected_focus,
-            opponent_relation=opponent_relation,
-        )
+        try:
+            selected_mode, payload = await self._resolve_live_query_payload(
+                mode=mode,
+                topic=topic,
+            )
+            selected_focus = focus if focus != "auto" else "strategy"
+            if (
+                selected_mode == "constructed"
+                and selected_focus not in _CONSTRUCTED_TOOL_FOCUSES
+            ):
+                selected_focus = "strategy"
+            if (
+                selected_mode == "battlegrounds"
+                and selected_focus not in _BATTLEGROUNDS_TOOL_FOCUSES
+            ):
+                selected_focus = "strategy"
+            return _focused_llm_tool_result(
+                payload,
+                mode=selected_mode,
+                focus=selected_focus,
+                opponent_relation=opponent_relation,
+            )
+        except BaseException:
+            release_claim = getattr(ledger, "release", None)
+            if acquired_claim is not None and callable(release_claim):
+                release_claim(acquired_claim, owner="tool")
+            raise
 
     async def hearthstone_current_state(
         self, focus: str | None = None, **_: Any
@@ -4578,6 +4953,18 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             battlegrounds_choice = (
                 getattr(battlegrounds, "current_choice", None) if battlegrounds is not None else None
             )
+            player_board_complete = bool(
+                constructed is not None
+                and snapshot is not None
+                and constructed.player.board_identities_complete
+                and snapshot.player.board_count == len(constructed.player.board)
+            )
+            opponent_board_complete = bool(
+                constructed is not None
+                and snapshot is not None
+                and constructed.opponent.board_identities_complete
+                and snapshot.opponent.board_count == len(constructed.opponent.board)
+            )
             return {
                 "turn_tracking": bool(
                     snapshot is not None and int(getattr(snapshot, "turn", 0)) > 0
@@ -4594,6 +4981,8 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     constructed is not None
                     and constructed.player.hand_identities_complete
                 ),
+                "player_board_identities_complete": player_board_complete,
+                "opponent_board_identities_complete": opponent_board_complete,
                 "specific_card_play_analysis": bool(
                     snapshot is not None
                     and snapshot.mode == "constructed"
@@ -4645,7 +5034,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         result = {
             "available": bool(has_state and live and not battlegrounds_redirect),
             "state": (
-                snapshot.to_public_dict()
+                _sanitize_constructed_tool_state(snapshot.to_public_dict())
                 if has_state and live and not battlegrounds_redirect
                 else {}
             ),

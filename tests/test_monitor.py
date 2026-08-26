@@ -10,6 +10,7 @@ import pytest
 from hearthstone_companion_under_test.config import CompanionConfig
 from hearthstone_companion_under_test.models import (
     BattlegroundsAreaSnapshot,
+    BattlegroundsCardSnapshot,
     BattlegroundsSnapshot,
     GameEvent,
     GameSnapshot,
@@ -265,6 +266,193 @@ def test_monitor_publishes_live_snapshot_only_when_state_changes() -> None:
     assert all(snapshot.mode == "battlegrounds" for snapshot in published)
     assert all(snapshot.phase == "hero_select" for snapshot in published)
     assert monitor.status().events_seen == 0
+
+
+def test_battlegrounds_shop_requires_an_unchanged_trailing_window_before_complete() -> None:
+    monitor = CompanionMonitor(
+        CompanionConfig(),
+        _logger(),
+        on_llm=lambda *_args: False,
+    )
+
+    def recruit_snapshot(*card_ids: str) -> GameSnapshot:
+        cards = tuple(
+            BattlegroundsCardSnapshot(
+                card_id=card_id,
+                card_type="MINION",
+                position=position,
+            )
+            for position, card_id in enumerate(card_ids, start=1)
+        )
+        return GameSnapshot(
+            mode="battlegrounds",
+            phase="recruit",
+            game_number=3,
+            battlegrounds=BattlegroundsSnapshot(
+                round=4,
+                phase="recruit",
+                shop=cards,
+                areas={
+                    "shop": BattlegroundsAreaSnapshot(
+                        complete=True,
+                        revision=9,
+                        observed_at=100.0,
+                        round=4,
+                        phase="recruit",
+                    )
+                },
+            ),
+        )
+
+    first_prefix = monitor._settle_live_snapshot(
+        recruit_snapshot("BG_FIRST"),
+        now=10.0,
+    )
+    second_prefix = monitor._settle_live_snapshot(
+        recruit_snapshot("BG_FIRST", "BG_SECOND"),
+        now=10.1,
+    )
+    still_settling = monitor._settle_live_snapshot(
+        recruit_snapshot("BG_FIRST", "BG_SECOND"),
+        now=10.2,
+    )
+    settled = monitor._settle_live_snapshot(
+        recruit_snapshot("BG_FIRST", "BG_SECOND"),
+        now=10.61,
+    )
+
+    assert first_prefix.battlegrounds is not None
+    assert first_prefix.battlegrounds.areas["shop"].complete is False
+    assert [card.card_id for card in first_prefix.battlegrounds.shop] == ["BG_FIRST"]
+    assert second_prefix.battlegrounds is not None
+    assert second_prefix.battlegrounds.areas["shop"].complete is False
+    assert still_settling.battlegrounds is not None
+    assert still_settling.battlegrounds.areas["shop"].complete is False
+    assert settled.battlegrounds is not None
+    assert settled.battlegrounds.areas["shop"].complete is True
+
+
+def test_battlegrounds_shop_settle_state_resets_across_source_generation() -> None:
+    monitor = CompanionMonitor(
+        CompanionConfig(),
+        _logger(),
+        on_llm=lambda *_args: False,
+    )
+    snapshot = GameSnapshot(
+        mode="battlegrounds",
+        phase="recruit",
+        game_number=3,
+        battlegrounds=BattlegroundsSnapshot(
+            round=4,
+            phase="recruit",
+            shop=(BattlegroundsCardSnapshot(card_id="BG_FIRST", card_type="MINION"),),
+            areas={
+                "shop": BattlegroundsAreaSnapshot(
+                    complete=True,
+                    revision=9,
+                    observed_at=100.0,
+                    round=4,
+                    phase="recruit",
+                )
+            },
+        ),
+    )
+
+    first = monitor._settle_live_snapshot(snapshot, now=10.0)
+    settled = monitor._settle_live_snapshot(snapshot, now=10.6)
+    assert first.battlegrounds is not None
+    assert first.battlegrounds.areas["shop"].complete is False
+    assert settled.battlegrounds is not None
+    assert settled.battlegrounds.areas["shop"].complete is True
+
+    monitor._begin_source_generation_locked()
+
+    reset = monitor._settle_live_snapshot(snapshot, now=11.0)
+    assert reset.battlegrounds is not None
+    assert reset.battlegrounds.areas["shop"].complete is False
+
+
+def test_battlegrounds_recruit_event_uses_matching_settled_batch_snapshot() -> None:
+    event = GameEvent(
+        "battlegrounds_recruit_started",
+        7,
+        "招募开始",
+        100.0,
+        {"round": 4},
+    )
+    early = GameSnapshot(
+        mode="battlegrounds",
+        phase="recruit",
+        game_number=3,
+        battlegrounds=BattlegroundsSnapshot(round=4, phase="recruit"),
+    )
+    settled = GameSnapshot(
+        mode="battlegrounds",
+        phase="recruit",
+        game_number=3,
+        battlegrounds=BattlegroundsSnapshot(
+            round=4,
+            phase="recruit",
+            shop=(BattlegroundsCardSnapshot(card_id="BG_SETTLED"),),
+            areas={
+                "shop": BattlegroundsAreaSnapshot(
+                    complete=True,
+                    revision=10,
+                    observed_at=100.0,
+                    round=4,
+                    phase="recruit",
+                )
+            },
+        ),
+    )
+
+    selected = CompanionMonitor._settled_batch_event_snapshot(event, early, settled)
+
+    assert selected is settled
+    assert CompanionMonitor._event_snapshot_ready_for_llm(event, early) is False
+    assert CompanionMonitor._event_snapshot_ready_for_llm(event, settled) is True
+
+
+def test_battlegrounds_recruit_event_is_released_once_after_shop_settles() -> None:
+    monitor = CompanionMonitor(
+        CompanionConfig(),
+        _logger(),
+        on_llm=lambda *_args: False,
+    )
+    event = GameEvent(
+        "battlegrounds_recruit_started",
+        7,
+        "招募开始",
+        100.0,
+        {"round": 4},
+    )
+    raw = GameSnapshot(
+        mode="battlegrounds",
+        phase="recruit",
+        game_number=3,
+        battlegrounds=BattlegroundsSnapshot(
+            round=4,
+            phase="recruit",
+            shop=(BattlegroundsCardSnapshot(card_id="BG_SETTLED"),),
+            areas={
+                "shop": BattlegroundsAreaSnapshot(
+                    complete=True,
+                    revision=10,
+                    observed_at=100.0,
+                    round=4,
+                    phase="recruit",
+                )
+            },
+        ),
+    )
+    settling = monitor._settle_live_snapshot(raw, now=10.0)
+
+    assert monitor._settle_recruit_emissions([(event, settling)], settling) == []
+
+    settled = monitor._settle_live_snapshot(raw, now=10.6)
+    released = monitor._settle_recruit_emissions([], settled)
+    assert released == [(event, settled)]
+    assert monitor._settle_recruit_emissions([], settled) == []
 
 
 def test_stale_active_bootstrap_does_not_notify_state_ready() -> None:

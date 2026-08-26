@@ -433,6 +433,9 @@ class PowerLogParser:
         self._combat_damage_dealt = 0
         self._combat_bob_stale_entity_ids: set[int] = set()
         self._recruit_bob_stale_entity_ids: set[int] = set()
+        self._shop_membership_key: tuple[int, int, str] | None = None
+        self._shop_visible_entity_ids: frozenset[int] = frozenset()
+        self._empty_shop_observation = BattlegroundsAreaSnapshot()
         self._last_recruit_warband: tuple[BattlegroundsCardSnapshot, ...] = ()
         self._last_recruit_warband_area = BattlegroundsAreaSnapshot()
         self._last_recruit_warband_observed_at = 0.0
@@ -496,6 +499,9 @@ class PowerLogParser:
         self._combat_damage_dealt = 0
         self._combat_bob_stale_entity_ids.clear()
         self._recruit_bob_stale_entity_ids.clear()
+        self._shop_membership_key = None
+        self._shop_visible_entity_ids = frozenset()
+        self._empty_shop_observation = BattlegroundsAreaSnapshot()
         self._last_recruit_warband = ()
         self._last_recruit_warband_area = BattlegroundsAreaSnapshot()
         self._last_recruit_warband_observed_at = 0.0
@@ -516,6 +522,12 @@ class PowerLogParser:
         return events
 
     def feed_line(self, line: str, *, now: float | None = None) -> list[GameEvent]:
+        timestamp = time.time() if now is None else float(now)
+        events = self._feed_line(line, now=timestamp)
+        self._observe_battlegrounds_shop_membership(timestamp)
+        return events
+
+    def _feed_line(self, line: str, *, now: float | None = None) -> list[GameEvent]:
         if not isinstance(line, str) or not line or len(line) > 256 * 1024:
             return []
         timestamp = time.time() if now is None else float(now)
@@ -1247,6 +1259,31 @@ class PowerLogParser:
             return
         entity.battlegrounds_game_state_boolean_baseline_complete = True
         self._touch_entity(entity, timestamp)
+
+    def finalize_quiet_packet_baselines(
+        self,
+        *,
+        now: float,
+        quiet_seconds: float,
+    ) -> bool:
+        """Close a tail packet only after no further log line arrived for a while."""
+        current_time = float(now)
+        threshold = max(0.0, float(quiet_seconds))
+        pending = tuple(
+            entity
+            for entity in (
+                self._pending_realtime_baseline_entity,
+                self._pending_game_state_baseline_entity,
+            )
+            if entity is not None
+        )
+        if not pending or any(
+            current_time - entity.last_seen_at < threshold for entity in pending
+        ):
+            return False
+        self._finalize_pending_realtime_baseline(current_time)
+        self._finalize_pending_game_state_baseline(current_time)
+        return True
 
     def _touch_choice(self, frame: _ChoiceFrame | None, timestamp: float) -> None:
         if frame is None:
@@ -2454,6 +2491,7 @@ class PowerLogParser:
             ),
             secret_count=sum(entity.zone == "SECRET" for entity in entities),
             board=board,
+            board_identities_complete=len(board) == len(board_entities),
             weapon=weapon,
             hero_power=hero_power,
             locations=locations,
@@ -2648,13 +2686,22 @@ class PowerLogParser:
             for item in economy_observations
             if item.observed_at is not None and item.observed_at > 0
         ]
+        shop_area = self._battlegrounds_area(
+            shop_entities,
+            shop_cards,
+            allow_empty=False,
+            require_current_observation=True,
+        )
+        if (
+            not shop_entities
+            and self._empty_shop_observation.complete
+            and self._empty_shop_observation.round == self.battlegrounds_round
+            and self._empty_shop_observation.phase == self.phase
+        ):
+            shop_area = self._empty_shop_observation
+
         areas = {
-            "shop": self._battlegrounds_area(
-                shop_entities,
-                shop_cards,
-                allow_empty=False,
-                require_current_observation=True,
-            ),
+            "shop": shop_area,
             "hand": self._battlegrounds_area(
                 hand_entities,
                 hand_cards,
@@ -2793,6 +2840,76 @@ class PowerLogParser:
             return [positioned[position] for position in sorted(positioned)]
         return sorted(unpositioned, key=lambda item: item.entity_id)
 
+    def _observe_battlegrounds_shop_membership(self, timestamp: float) -> None:
+        key = (self.game_number, self.battlegrounds_round, self.phase)
+        if (
+            self.mode != "battlegrounds"
+            or self.phase != "recruit"
+            or self.bob_controller is None
+        ):
+            self._shop_membership_key = None
+            self._shop_visible_entity_ids = frozenset()
+            self._empty_shop_observation = BattlegroundsAreaSnapshot()
+            return
+
+        visible_ids = frozenset(
+            entity.entity_id for entity in self._battlegrounds_shop_entities()
+        )
+        if key != self._shop_membership_key:
+            self._shop_membership_key = key
+            self._shop_visible_entity_ids = visible_ids
+            self._empty_shop_observation = BattlegroundsAreaSnapshot()
+            return
+        if visible_ids:
+            self._shop_visible_entity_ids = visible_ids
+            self._empty_shop_observation = BattlegroundsAreaSnapshot()
+            return
+        if self._shop_visible_entity_ids:
+            self._empty_shop_observation = BattlegroundsAreaSnapshot(
+                complete=True,
+                revision=max(1, self._public_revision),
+                observed_at=timestamp if timestamp > 0 else None,
+                round=self.battlegrounds_round,
+                phase=self.phase,
+            )
+        self._shop_visible_entity_ids = visible_ids
+
+    def _battlegrounds_card_cost(self, entity: Entity) -> int | None:
+        for tag in (
+            "BACON_OVERRIDE_BG_COST",
+            "INTERACTABLE_OBJECT_COST",
+            "COST",
+        ):
+            value = _int(entity.tags.get(tag))
+            if value is None:
+                continue
+            observation = self._battlegrounds_tag_observation(
+                entity,
+                tag,
+                value_observed=True,
+            )
+            if observation.complete:
+                return max(0, value)
+            if (
+                tag == "COST"
+                and entity.battlegrounds_game_state_boolean_baseline_complete
+                and entity.last_revision > 0
+                and entity.last_seen_at > 0
+                and entity.last_battlegrounds_round == self.battlegrounds_round
+                and entity.last_battlegrounds_phase == self.phase
+            ):
+                return max(0, value)
+        return None
+
+    def _battlegrounds_boolean_baseline_complete(self, entity: Entity) -> bool:
+        return bool(
+            entity.battlegrounds_realtime_boolean_baseline_complete
+            or (
+                entity.battlegrounds_game_state_boolean_baseline_complete
+                and self._pending_realtime_baseline_entity is not entity
+            )
+        )
+
     def _battlegrounds_cards(
         self,
         entities: Iterable[Entity],
@@ -2808,21 +2925,10 @@ class PowerLogParser:
             label = self._visible_card_label(entity)
             if not label and not entity.card_id:
                 continue
-            if "BACON_OVERRIDE_BG_COST" in entity.tags:
-                current_cost = _int(entity.tags.get("BACON_OVERRIDE_BG_COST"))
-            elif "INTERACTABLE_OBJECT_COST" in entity.tags:
-                current_cost = _int(entity.tags.get("INTERACTABLE_OBJECT_COST"))
-            else:
-                current_cost = _int(entity.tags.get("COST"))
+            current_cost = self._battlegrounds_card_cost(entity)
             if observed_costs is not None and entity.entity_id in observed_costs:
                 current_cost = observed_costs[entity.entity_id]
-            baseline_complete = bool(
-                entity.battlegrounds_realtime_boolean_baseline_complete
-                or (
-                    entity.battlegrounds_game_state_boolean_baseline_complete
-                    and self._pending_realtime_baseline_entity is not entity
-                )
-            )
+            baseline_complete = self._battlegrounds_boolean_baseline_complete(entity)
             missing_boolean = False if baseline_complete else None
             premium = (
                 entity.tag_int("PREMIUM") > 0
@@ -2866,34 +2972,60 @@ class PowerLogParser:
         shop_ids = {entity.entity_id for entity in shop_entities}
         observed: dict[int, tuple[int, int]] = {}
         for entity in self.entities.values():
-            if not entity.card_id.lower().startswith("tb_baconshop_dragbuy"):
+            if (
+                not entity.card_id.lower().startswith("tb_baconshop_dragbuy")
+                or entity.hidden
+                or entity.zone != "PLAY"
+                or self._controller(entity) != self.local_controller
+            ):
                 continue
-            target_id = next(
-                (
-                    value
-                    for tag in ("CARD_TARGET", "2442")
-                    if (value := _int(entity.tags.get(tag))) is not None
-                    and value in shop_ids
-                ),
-                None,
+            target_candidates = [
+                (value, observation)
+                for tag in ("CARD_TARGET", "2442")
+                if (value := _int(entity.tags.get(tag))) is not None
+                and (
+                    observation := self._battlegrounds_tag_observation(
+                        entity,
+                        tag,
+                        value_observed=True,
+                    )
+                ).complete
+            ]
+            target = max(
+                target_candidates,
+                key=lambda item: item[1].revision,
+                default=None,
             )
-            if target_id is None:
+            if target is None or target[0] not in shop_ids:
                 continue
-            current_cost = next(
+            target_id, target_observation = target
+            cost = next(
                 (
-                    value
+                    (value, observation)
                     for tag in (
                         "BACON_OVERRIDE_BG_COST",
                         "INTERACTABLE_OBJECT_COST",
                         "COST",
                     )
                     if (value := _int(entity.tags.get(tag))) is not None
+                    and (
+                        observation := self._battlegrounds_tag_observation(
+                            entity,
+                            tag,
+                            value_observed=True,
+                        )
+                    ).complete
+                    and observation.revision >= target_observation.revision
                 ),
                 None,
             )
-            if current_cost is None:
+            if cost is None:
                 continue
-            candidate = (entity.last_revision, max(0, current_cost))
+            current_cost, cost_observation = cost
+            candidate = (
+                max(target_observation.revision, cost_observation.revision),
+                max(0, current_cost),
+            )
             if target_id not in observed or candidate[0] > observed[target_id][0]:
                 observed[target_id] = candidate
         return {target_id: cost for target_id, (_revision, cost) in observed.items()}
@@ -3157,6 +3289,7 @@ class PowerLogParser:
                 entity.card_type != "GAME_MODE_BUTTON"
                 or entity.zone != "PLAY"
                 or entity.hidden
+                or self._controller(entity) != self.local_controller
             ):
                 continue
             identifier = f"{entity.card_id} {entity.public_name()}".casefold()
@@ -3169,14 +3302,71 @@ class PowerLogParser:
                 continue
             for tag in ("BACON_OVERRIDE_BG_COST", "COST"):
                 if tag in entity.tags and (value := _int(entity.tags.get(tag))) is not None:
+                    cost_observation = self._battlegrounds_tag_observation(
+                        entity,
+                        tag,
+                        value_observed=True,
+                    )
+                    if tag == "COST" and not cost_observation.complete:
+                        current_tags = tuple(
+                            observed_tag
+                            for observed_tag in entity.tag_revisions
+                            if entity.tag_battlegrounds_rounds.get(observed_tag)
+                            == self.battlegrounds_round
+                            and entity.tag_battlegrounds_phases.get(observed_tag)
+                            == self.phase
+                            and entity.tag_observed_at.get(observed_tag, 0.0) > 0
+                        )
+                        current_tag_revision = max(
+                            (
+                                entity.tag_revisions[observed_tag]
+                                for observed_tag in current_tags
+                            ),
+                            default=0,
+                        )
+                        current_tag_observed_at = max(
+                            (
+                                entity.tag_observed_at[observed_tag]
+                                for observed_tag in current_tags
+                            ),
+                            default=0.0,
+                        )
+                        entity_is_current = bool(
+                            entity.last_revision > 0
+                            and entity.last_seen_at > 0
+                            and entity.last_battlegrounds_round
+                            == self.battlegrounds_round
+                            and entity.last_battlegrounds_phase == self.phase
+                        )
+                        current_game_state_baseline = bool(
+                            entity.battlegrounds_game_state_boolean_baseline_complete
+                            and entity_is_current
+                        )
+                        if current_tags or current_game_state_baseline:
+                            cost_observation = BattlegroundsAreaSnapshot(
+                                complete=True,
+                                revision=max(
+                                    cost_observation.revision,
+                                    current_tag_revision,
+                                    entity.last_revision
+                                    if current_game_state_baseline
+                                    else 0,
+                                ),
+                                observed_at=max(
+                                    cost_observation.observed_at or 0.0,
+                                    current_tag_observed_at,
+                                    entity.last_seen_at
+                                    if current_game_state_baseline
+                                    else 0.0,
+                                )
+                                or None,
+                                round=self.battlegrounds_round,
+                                phase=self.phase,
+                            )
                     candidates.append(
                         (
                             max(0, value),
-                            self._battlegrounds_tag_observation(
-                                entity,
-                                tag,
-                                value_observed=True,
-                            ),
+                            cost_observation,
                         )
                     )
         return self._select_economy_observation(candidates)
@@ -3203,6 +3393,10 @@ class PowerLogParser:
             bool(entity.card_id or entity.public_name()) and bool(entity.card_type)
             for entity in visible_entities
         )
+        boolean_baselines_complete = all(
+            self._battlegrounds_boolean_baseline_complete(entity)
+            for entity in visible_entities
+        )
         observation_current = bool(
             not require_current_observation
             or (
@@ -3219,6 +3413,7 @@ class PowerLogParser:
             and len(cards) == len(visible_entities)
             and positioned_complete
             and identities_complete
+            and boolean_baselines_complete
             and observation_current
         )
         revisions = [entity.last_revision for entity in observed_entities]

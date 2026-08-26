@@ -78,7 +78,7 @@ hsbg.cards public API --> fixed-origin background GET --> atomic cache --> obser
 
 ## 统一实时查询
 
-`hearthstone_live_state` 是唯一模型可见的同轮只读工具。每次询问回合、行动方、公开场面、具体手牌、Choice、商店、战团、经济或决策都应重新查询，不能依赖主动短评或更早聊天历史。工具无需参数也能从快照识别构筑/酒馆模式；传入用户原始 `query` 时会自动选择模式、焦点和对手关系。
+`hearthstone_live_state` 是唯一模型可见的同轮只读工具。每次询问回合、行动方、公开场面、具体手牌、Choice、商店、战团、经济或决策都应重新查询，不能依赖主动短评或更早聊天历史。工具必须收到用户原始 `query` 以便和兜底链路关联；`mode`、`focus`、`topic` 和 `opponent_relation` 可省略，插件会从快照和问题自动选择。宿主若违反 schema 传入空问题，工具 fail-closed，不读取局势，由定向 memory 兜底处理。
 
 普通对战支持 `overview/board/hand/opponent/choice/strategy`，酒馆额外支持 `shop/economy`；对手查询可声明 `current/next/last`。插件先在本机建立完整事实和 capability，再只把所问视图、对应 evidence gate 与相关卡牌规则编码为 `hearthstone_compact_v1`。聚焦 JSON 限制为 4096 bytes，超限时明确标记 `truncated` 并进一步收敛。`complete_legal_actions` 固定为 `false`，防止把局势分析说成完整求解器结论。
 
@@ -102,11 +102,11 @@ hsbg.cards public API --> fixed-origin background GET --> atomic cache --> obser
 
 `current_strategy` 在新鲜的英雄选择阶段可以依据实际观测候选和带来源的英雄规则回答“这几个英雄选哪个”，但必须说明没有授权的全局胜率。只有新鲜招募阶段和当前完整商店才允许定性比较“哪张更值得考虑”；精确可负担性与购买顺序还要检查当前金币和当前商店所有卡牌的实际费用，冻结、刷新和升本则继续检查各自经济 capability。战斗阶段没有当前商店决策，缓存状态也只能用于说明最近观察，均不得输出成可执行的即时购买建议。赛季规则、本机英雄聚合表现和对局复盘使用各自独立的可用性条件，不能用其他历史样本冒充当前英雄或刚结束的一局。
 
-酒馆卡牌快照保存日志实际观测的 `card_type`、`current_cost`、`premium`、当前位置、冻结和当前关键词；刷新/升本费用优先读取对应 `GAME_MODE_BUTTON_SLOT` 按钮实体。完整实体包中的 boolean 标签缺失按默认 false，包尚未收尾时保持 `null`，防止截断包伪装成完整状态，也防止旧冻结/金色/关键词续命。商店、手牌、战团、经济和 Choice 分别携带完整度、revision、回合、阶段与观测时间；金币、刷新费用和升本费用还分别保存自己的 observation。每项费用只有来源回合和阶段都等于当前招募状态时才可用于 capability，不能借用玩家实体或另一项经济字段的较新时间续命。金币以当前 `RESOURCES` 建立基线；历史 `RESOURCES_USED/TEMP_RESOURCES` 会过期并按未发生处理，只有同回合同阶段重报后才加入当前值。未观测或已过期的动态值保持 `null`，不使用公共目录或默认规则补猜。`CHANGE_ENTITY` 真正换 CardID 时先撤销旧类型、费用、攻血、星级、金色和关键词，直到新身份重新提供证据。购买拆为 `shop_card_priority_advice`、`purchase_affordability` 和 `specific_purchase_advice`：费用缺失不污染已经具备完整实时商店与规则证据的定性选牌，但会让可负担性与精确购买顺序降为 `partial`。工具结果最前面的 `current_recruit_decision` 按卡标记 `known_affordable`、`known_unaffordable` 或 `unknown_cost_may_be_zero`，并将整店可负担性保持为 `unknown`；`decision_guardrails` 再提供完整证据边界，禁止模型因金币为 0 就把未知费用卡牌判为买不起。升本可负担性、升本策略、刷新、Choice 与站位也有独立 capability，角色必须按被问事项检查对应状态，不能因一个子能力不可用而覆盖另一个已可用能力。
+酒馆卡牌快照保存日志实际观测的 `card_type`、`current_cost`、`premium`、当前位置、冻结和当前关键词；刷新/升本费用优先读取对应 `GAME_MODE_BUTTON_SLOT` 按钮实体。客户端不会在每个招募阶段重发恒定按钮费用，因此当前可见 `PLAY` 按钮只要同一实体在本轮本阶段有明确 tag observation，或完成了当前 GameState 基线，就可沿用其持久 `COST`；该规则不放宽玩家经济 tag、隐藏按钮或已移出场按钮。完整实体包中的 boolean 标签缺失按默认 false，包尚未收尾时保持 `null`，防止截断包伪装成完整状态，也防止旧冻结/金色/关键词续命。商店、手牌、战团、经济和 Choice 分别携带完整度、revision、回合、阶段与观测时间；金币、刷新费用和升本费用还分别保存自己的 observation。金币以当前 `RESOURCES` 建立基线；历史 `RESOURCES_USED/TEMP_RESOURCES` 会过期并按未发生处理，只有同回合同阶段重报后才加入当前值。未观测或已过期的动态值保持 `null`，不使用公共目录或默认规则补猜。`CHANGE_ENTITY` 真正换 CardID 时先撤销旧类型、费用、攻血、星级、金色和关键词，直到新身份重新提供证据。购买拆为 `shop_card_priority_advice`、`purchase_affordability` 和 `specific_purchase_advice`：费用缺失不污染已经具备完整实时商店与规则证据的定性选牌，但会让可负担性与精确购买顺序降为 `partial`。工具结果最前面的 `current_recruit_decision` 按卡标记 `known_affordable`、`known_unaffordable` 或 `unknown_cost_may_be_zero`，并将整店可负担性保持为 `unknown`；`decision_guardrails` 再提供完整证据边界，禁止模型因金币为 0 就把未知费用卡牌判为买不起。升本可负担性、升本策略、刷新、Choice 与站位也有独立 capability，角色必须按被问事项检查对应状态，不能因一个子能力不可用而覆盖另一个已可用能力。
 
-唯一 `@llm_tool` 由公开 SDK 在插件构造时自动注册并排队提交给宿主，可在生成首答的同一轮调用。`plugin.toml` 使用 `passive=false`，让用户插件 Agent 在模型未选择工具时仍能发现唯一查询入口。设置、监听、浮层和清空统计入口继续以 `metadata.agent_auto=false` 隐藏。分段 `read` 使用同键覆盖并每秒重新确认新鲜快照，修复“对局先建立、角色会话后连接”时首次投递被宿主安全丢弃后不再重试的问题；显式目标为空时只使用宿主的唯一连接会话兜底，不广播。三条查询链路互补，不假设模型必然调用某个工具，也不把 Agent 的后置结果冒充首答工具结果。
+唯一 `@llm_tool` 由公开 SDK 在插件构造时自动注册并排队提交给宿主，可在生成首答的同一轮调用。`plugin.toml` 使用 `passive=false`，让用户插件 Agent 在模型未选择工具时仍能发现唯一查询入口。设置、监听、浮层和清空统计入口继续以 `metadata.agent_auto=false` 隐藏。分段 `read` 使用同键覆盖，语义变化立即更新、完全相同的状态每 30 秒续租；目标只能来自显式配置或官方近期话语记录，无法解析目标时 fail-closed。三条查询链路互补，不假设模型必然调用某个工具，也不把 Agent 的后置结果冒充首答工具结果。
 
-官方工具文档明确说明 `/api/tools` 注册只存在于当前角色的 `LLMSessionManager` 内，主服务重启、首启竞态或会话管理器重建后不会由 `@llm_tool` 自动回灌。插件因此使用官方 `@timer_interval` 在独立定时线程里读取公开的 `GET /api/tools`：只有某个当前角色缺少本插件的远程工具，或 source、loopback callback、remote 标志不一致时，才通过公开 `unregister_llm_tool()` / `register_llm_tool()` 恢复并再次确认；健康注册不做任何变更，失败使用有界退避且只记录脱敏错误码。这能自动收敛运行期注册丢失，但定时检查仍存在最多一个检查间隔的窗口，不能冒充宿主提供的逐 turn 前同步保证。
+官方工具文档明确说明 `/api/tools` 注册只存在于当前角色的 `LLMSessionManager` 内，主服务重启、首启竞态或会话管理器重建后不会由 `@llm_tool` 自动回灌。插件因此使用官方 `@timer_interval` 在独立定时线程里读取公开的 `GET /api/tools`：只有某个当前角色缺少本插件的远程工具，或 source、loopback callback、remote 标志不一致时，才通过公开 `unregister_llm_tool()` / `register_llm_tool()` 原子持锁恢复并再次确认；健康注册不做任何变更。官方 SDK 会拒绝同名重复注册，因此不能省略本地注销步骤。失败使用有界退避且只记录脱敏错误码，缓存的本地 schema 允许后续定时器再次恢复。这能自动收敛运行期注册丢失，但定时检查仍存在最多一个检查间隔的窗口，不能冒充宿主提供的逐 turn 前同步保证。
 
 卡牌目录不做流派评分、胜率排序或本地推荐。远端 `rules_text` 经过 HTML 清洗和长度限制，仍被标记为不可信参考数据；角色必须核对 provider、patch、checked_at、stale 和覆盖率。常规 `*_G` 金卡会映射到金色规则，少量旧式或不规则 CardID 会进入 `missing_ids`，角色不得猜测缺失元数据。目录不可用不会令实时局势整体不可用。
 

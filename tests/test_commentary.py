@@ -33,6 +33,54 @@ def event(*, priority: int = 5, suffix: str = "") -> GameEvent:
     return GameEvent("hero_damaged", priority, f"受到伤害{suffix}", 100.0, {"amount": 3, "side": "player"})
 
 
+def test_llm_prompt_omits_incomplete_battlegrounds_regions_and_economy() -> None:
+    hidden_id = "BG_INCOMPLETE_SHOP_PREFIX"
+    snapshot = GameSnapshot(
+        mode="battlegrounds",
+        phase="recruit",
+        game_number=3,
+        battlegrounds=BattlegroundsSnapshot(
+            round=4,
+            phase="recruit",
+            gold=5,
+            refresh_cost=1,
+            upgrade_cost=4,
+            frozen=True,
+            shop=(BattlegroundsCardSnapshot(card_id=hidden_id, position=1),),
+            areas={
+                "shop": BattlegroundsAreaSnapshot(
+                    complete=False,
+                    revision=9,
+                    observed_at=100.0,
+                    round=4,
+                    phase="recruit",
+                ),
+            },
+            economy=BattlegroundsEconomySnapshot(
+                refresh_cost=1,
+                upgrade_cost=4,
+            ),
+        ),
+    )
+
+    prompt = build_llm_prompt(
+        GameEvent(
+            "battlegrounds_recruit_started",
+            7,
+            "招募开始",
+            100.0,
+            {"round": 4},
+        ),
+        snapshot,
+        max_prompt_chars=10_000,
+    )
+
+    assert hidden_id not in prompt
+    assert '"gold":null' in prompt
+    assert '"refresh_cost":null' in prompt
+    assert '"upgrade_cost":null' in prompt
+
+
 def config(**overrides: object) -> CompanionConfig:
     values = CompanionConfig().to_dict()
     values.update(overrides)
@@ -126,6 +174,7 @@ def test_proactive_constructed_prompt_omits_specific_hand_identity() -> None:
                     ),
                 ),
                 hand_identities_complete=True,
+                board_identities_complete=True,
             ),
         ),
     )
@@ -501,10 +550,12 @@ def test_live_constructed_delivery_includes_turn_owner_and_public_boards() -> No
         turn=7,
         round=4,
         active_side="opponent",
+        player=SideSnapshot(board_count=1),
+        opponent=SideSnapshot(board_count=1),
         constructed=ConstructedSnapshot(
             variant="ranked",
             player=ConstructedSideSnapshot(
-                hand_count=3,
+                hand_count=1,
                 known_hand=(
                     ConstructedCardSnapshot(
                         card_id="PRIVATE_PLAYER_HAND",
@@ -512,6 +563,7 @@ def test_live_constructed_delivery_includes_turn_owner_and_public_boards() -> No
                         card_type="SPELL",
                     ),
                 ),
+                hand_identities_complete=True,
                 board=(
                     ConstructedCardSnapshot(
                         card_id="PLAYER_PUBLIC_MINION",
@@ -523,6 +575,7 @@ def test_live_constructed_delivery_includes_turn_owner_and_public_boards() -> No
                         keywords=("taunt", "divine_shield"),
                     ),
                 ),
+                board_identities_complete=True,
             ),
             opponent=ConstructedSideSnapshot(
                 hand_count=5,
@@ -544,6 +597,7 @@ def test_live_constructed_delivery_includes_turn_owner_and_public_boards() -> No
                         keywords=("reborn", "stealth"),
                     ),
                 ),
+                board_identities_complete=True,
             ),
         ),
         choice=ChoiceSnapshot(
@@ -603,6 +657,26 @@ def test_live_constructed_delivery_includes_turn_owner_and_public_boards() -> No
     assert "PRIVATE_CHOICE" not in serialized
 
 
+def test_live_constructed_delivery_does_not_mark_unknown_empty_sides_complete() -> None:
+    snapshot = GameSnapshot(
+        mode="constructed",
+        phase="playing",
+        game_number=1,
+        constructed=ConstructedSnapshot(),
+    )
+
+    prompts = build_live_state_contexts(snapshot, max_prompt_bytes=900)
+    payloads = [json.loads(prompt.split(":", 1)[1]) for prompt in prompts]
+    core = next(payload for payload in payloads if payload["segment"] == "core")
+
+    assert "player_board" not in core["complete_areas"]
+    assert "opponent_board" not in core["complete_areas"]
+    assert not any(
+        payload["segment"].startswith(("player_board_", "opponent_board_"))
+        for payload in payloads
+    )
+
+
 def test_live_constructed_delivery_keeps_full_public_board_under_byte_limit() -> None:
     oversized_name = "公开但超长的随从名称" * 50
     player_board = tuple(
@@ -637,9 +711,17 @@ def test_live_constructed_delivery_keeps_full_public_board_under_byte_limit() ->
         turn=19,
         round=10,
         active_side="player",
+        player=SideSnapshot(board_count=7),
+        opponent=SideSnapshot(board_count=7),
         constructed=ConstructedSnapshot(
-            player=ConstructedSideSnapshot(board=player_board),
-            opponent=ConstructedSideSnapshot(board=opponent_board),
+            player=ConstructedSideSnapshot(
+                board=player_board,
+                board_identities_complete=True,
+            ),
+            opponent=ConstructedSideSnapshot(
+                board=opponent_board,
+                board_identities_complete=True,
+            ),
         ),
     )
 
@@ -703,6 +785,16 @@ def test_live_state_context_is_valid_json_and_respects_host_safe_hard_limit() ->
                 source=cards[0],
                 options=cards[:8],
             ),
+            areas={
+                area: BattlegroundsAreaSnapshot(
+                    complete=True,
+                    revision=1,
+                    observed_at=1_770_000_000.0,
+                    round=6,
+                    phase="recruit",
+                )
+                for area in ("shop", "hand", "warband", "choice")
+            },
         ),
     )
 
@@ -756,6 +848,33 @@ def test_live_state_contexts_survive_packaged_host_byte_fallback_with_dynamic_st
             frozen=True,
             refresh_cost=0,
             upgrade_cost=6,
+            economy=BattlegroundsEconomySnapshot(
+                upgrade_cost=6,
+                refresh_cost=0,
+                revision=1,
+                observed_at=1_770_000_000.0,
+                gold_observation=BattlegroundsAreaSnapshot(
+                    complete=True,
+                    revision=1,
+                    observed_at=1_770_000_000.0,
+                    round=6,
+                    phase="recruit",
+                ),
+                upgrade_observation=BattlegroundsAreaSnapshot(
+                    complete=True,
+                    revision=1,
+                    observed_at=1_770_000_000.0,
+                    round=6,
+                    phase="recruit",
+                ),
+                refresh_observation=BattlegroundsAreaSnapshot(
+                    complete=True,
+                    revision=1,
+                    observed_at=1_770_000_000.0,
+                    round=6,
+                    phase="recruit",
+                ),
+            ),
             shop=cards[:7],
             hand=cards,
             warband=cards[:7],
@@ -766,6 +885,16 @@ def test_live_state_contexts_survive_packaged_host_byte_fallback_with_dynamic_st
                 source=cards[0],
                 options=cards[:8],
             ),
+            areas={
+                area: BattlegroundsAreaSnapshot(
+                    complete=True,
+                    revision=1,
+                    observed_at=1_770_000_000.0,
+                    round=6,
+                    phase="recruit",
+                )
+                for area in ("shop", "hand", "warband", "economy", "choice")
+            },
         ),
     )
 
@@ -822,6 +951,15 @@ def test_live_state_contexts_change_with_mode_and_observation_time() -> None:
                 refresh_cost=0,
                 upgrade_cost=1,
                 shop=(BattlegroundsCardSnapshot(card_id="PRIVATE_RUNTIME_CARD"),),
+                areas={
+                    "shop": BattlegroundsAreaSnapshot(
+                        complete=True,
+                        revision=1,
+                        observed_at=9999.0,
+                        round=12,
+                        phase="recruit",
+                    )
+                },
             ),
         ),
         observed_at=9999.0,
@@ -839,3 +977,94 @@ def test_live_state_contexts_change_with_mode_and_observation_time() -> None:
     }
     assert len(revisions) == 1
     assert next(iter(revisions)).startswith("g99:")
+
+
+def test_live_state_contexts_omit_stale_battlegrounds_areas() -> None:
+    snapshot = GameSnapshot(
+        mode="battlegrounds",
+        phase="recruit",
+        game_number=3,
+        battlegrounds=BattlegroundsSnapshot(
+            round=3,
+            phase="recruit",
+            shop=(
+                BattlegroundsCardSnapshot(
+                    card_id="STALE_SHOP_CARD",
+                    card_type="MINION",
+                    position=1,
+                ),
+            ),
+            areas={
+                "shop": BattlegroundsAreaSnapshot(
+                    complete=True,
+                    revision=10,
+                    observed_at=100.0,
+                    round=2,
+                    phase="recruit",
+                )
+            },
+        ),
+    )
+
+    contexts = build_live_state_contexts(
+        snapshot,
+        observed_at=102.0,
+        max_prompt_bytes=900,
+    )
+    payloads = [json.loads(text.split(":", 1)[1]) for text in contexts]
+
+    assert [payload["segment"] for payload in payloads] == ["core"]
+    assert payloads[0]["counts"]["shop"] is None
+    assert "shop" not in payloads[0]["complete_areas"]
+    assert "STALE_SHOP_CARD" not in json.dumps(payloads)
+
+
+def test_live_state_contexts_omit_stale_battlegrounds_economy() -> None:
+    stale = BattlegroundsAreaSnapshot(
+        complete=True,
+        revision=10,
+        observed_at=100.0,
+        round=3,
+        phase="recruit",
+    )
+    snapshot = GameSnapshot(
+        mode="battlegrounds",
+        phase="recruit",
+        game_number=3,
+        battlegrounds=BattlegroundsSnapshot(
+            round=3,
+            phase="recruit",
+            gold=8,
+            max_gold=10,
+            tavern_tier=4,
+            frozen=True,
+            refresh_cost=0,
+            upgrade_cost=3,
+            economy=BattlegroundsEconomySnapshot(
+                upgrade_cost=3,
+                refresh_cost=0,
+                revision=10,
+                observed_at=100.0,
+                gold_observation=stale,
+                upgrade_observation=stale,
+                refresh_observation=stale,
+            ),
+            areas={"shop": stale, "economy": stale},
+        ),
+    )
+
+    contexts = build_live_state_contexts(
+        snapshot,
+        observed_at=500.1,
+        max_prompt_bytes=900,
+    )
+    core = json.loads(contexts[0].split(":", 1)[1])
+
+    assert core["gold"] is None
+    assert core["max_gold"] is None
+    assert core["tavern_tier"] == 4
+    assert core["frozen"] is None
+    assert core["refresh_actual_cost"] is None
+    assert core["upgrade_actual_cost"] is None
+    assert "shop" not in core["complete_areas"]
+    assert "economy" not in core["complete_areas"]

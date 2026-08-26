@@ -1570,12 +1570,14 @@ def test_complete_game_state_true_survives_while_realtime_packet_is_incomplete()
     assert interleaved["premium"] is True
     assert interleaved["keywords"]["divine_shield"] is True
     assert interleaved["keywords"]["taunt"] is None
+    assert parser.snapshot().battlegrounds.areas["shop"].complete is False
 
     feed(parser, "TAG_CHANGE Entity=8 tag=CURRENT_PLAYER value=1")
     realtime_complete = parser.snapshot().battlegrounds.shop[0].to_public_dict()
     assert realtime_complete["premium"] is False
     assert realtime_complete["keywords"]["divine_shield"] is False
     assert realtime_complete["keywords"]["taunt"] is False
+    assert parser.snapshot().battlegrounds.areas["shop"].complete is True
 
 
 def test_game_state_missing_booleans_stay_unknown_during_realtime_packet() -> None:
@@ -1967,6 +1969,262 @@ def test_battlegrounds_shop_uses_slot_action_actual_cost(
     assert battlegrounds.shop[0].current_cost == actual_cost
 
 
+def test_battlegrounds_shop_ignores_stale_dragbuy_cost_from_previous_round() -> None:
+    parser = recruit_parser()
+    parser.battlegrounds_round = 2
+    add_entity(
+        parser,
+        300,
+        "BG_SHOP_CARD",
+        controller=11,
+        zone="PLAY",
+        card_type="MINION",
+    )
+    feed(parser, "    tag=ZONE_POSITION value=1", "    tag=COST value=3", now=101.0)
+    add_entity(
+        parser,
+        301,
+        "TB_BaconShop_DragBuy",
+        controller=3,
+        zone="PLAY",
+        card_type="SPELL",
+    )
+    feed(parser, "    tag=CARD_TARGET value=300", "    tag=COST value=0", now=101.0)
+
+    parser.battlegrounds_round = 3
+    feed(parser, "TAG_CHANGE Entity=300 tag=COST value=2", now=102.0)
+
+    battlegrounds = parser.snapshot().battlegrounds
+    assert battlegrounds is not None
+    assert battlegrounds.shop[0].current_cost == 2
+    assert battlegrounds.areas["shop"].complete is True
+
+
+def test_battlegrounds_card_cost_ignores_stale_override_from_previous_round() -> None:
+    parser = recruit_parser()
+    parser.battlegrounds_round = 2
+    add_entity(
+        parser,
+        300,
+        "BG_SHOP_CARD",
+        controller=11,
+        zone="PLAY",
+        card_type="MINION",
+    )
+    feed(
+        parser,
+        "    tag=ZONE_POSITION value=1",
+        "    tag=BACON_OVERRIDE_BG_COST value=1",
+        now=101.0,
+    )
+
+    parser.battlegrounds_round = 3
+    feed(parser, "TAG_CHANGE Entity=300 tag=COST value=3", now=102.0)
+
+    battlegrounds = parser.snapshot().battlegrounds
+    assert battlegrounds is not None
+    assert battlegrounds.shop[0].current_cost == 3
+
+
+def test_battlegrounds_dragbuy_waits_for_cost_after_target_change() -> None:
+    parser = recruit_parser()
+    for entity_id, card_id, position in (
+        (300, "BG_SHOP_A", 1),
+        (301, "BG_SHOP_B", 2),
+    ):
+        add_entity(
+            parser,
+            entity_id,
+            card_id,
+            controller=11,
+            zone="PLAY",
+            card_type="MINION",
+        )
+        feed(
+            parser,
+            f"    tag=ZONE_POSITION value={position}",
+            "    tag=COST value=3",
+            now=101.0,
+        )
+    add_entity(
+        parser,
+        302,
+        "TB_BaconShop_DragBuy",
+        controller=3,
+        zone="PLAY",
+        card_type="SPELL",
+    )
+    feed(
+        parser,
+        "    tag=CARD_TARGET value=300",
+        "    tag=COST value=0",
+        now=101.0,
+    )
+    assert [card.current_cost for card in parser.snapshot().battlegrounds.shop] == [0, 3]
+
+    feed(parser, "TAG_CHANGE Entity=302 tag=CARD_TARGET value=301", now=102.0)
+    assert [card.current_cost for card in parser.snapshot().battlegrounds.shop] == [3, 3]
+
+    feed(parser, "TAG_CHANGE Entity=302 tag=COST value=0", now=102.1)
+    assert [card.current_cost for card in parser.snapshot().battlegrounds.shop] == [3, 0]
+
+
+def test_battlegrounds_dragbuy_uses_newer_base_cost_after_same_round_target() -> None:
+    parser = recruit_parser()
+    add_entity(
+        parser,
+        300,
+        "BG_SHOP_CARD",
+        controller=11,
+        zone="PLAY",
+        card_type="MINION",
+    )
+    feed(parser, "    tag=ZONE_POSITION value=1", "    tag=COST value=3", now=101.0)
+    add_entity(
+        parser,
+        301,
+        "TB_BaconShop_DragBuy",
+        controller=3,
+        zone="PLAY",
+        card_type="SPELL",
+    )
+    feed(
+        parser,
+        "    tag=CARD_TARGET value=300",
+        "    tag=BACON_OVERRIDE_BG_COST value=0",
+        now=101.0,
+    )
+
+    feed(
+        parser,
+        "TAG_CHANGE Entity=301 tag=CARD_TARGET value=300",
+        "TAG_CHANGE Entity=301 tag=COST value=2",
+        now=102.0,
+    )
+
+    battlegrounds = parser.snapshot().battlegrounds
+    assert battlegrounds is not None
+    assert battlegrounds.shop[0].current_cost == 2
+
+
+def test_battlegrounds_dragbuy_does_not_fall_back_to_an_older_valid_target() -> None:
+    parser = recruit_parser()
+    add_entity(
+        parser,
+        300,
+        "BG_SHOP_CARD",
+        controller=11,
+        zone="PLAY",
+        card_type="MINION",
+    )
+    feed(parser, "    tag=ZONE_POSITION value=1", "    tag=COST value=3", now=101.0)
+    add_entity(
+        parser,
+        301,
+        "TB_BaconShop_DragBuy",
+        controller=3,
+        zone="PLAY",
+        card_type="SPELL",
+    )
+    feed(
+        parser,
+        "    tag=2442 value=300",
+        "    tag=COST value=0",
+        "    tag=CARD_TARGET value=999",
+        "    tag=COST value=2",
+        now=102.0,
+    )
+
+    battlegrounds = parser.snapshot().battlegrounds
+    assert battlegrounds is not None
+    assert battlegrounds.shop[0].current_cost == 3
+
+
+def test_battlegrounds_empty_shop_requires_an_observed_nonempty_transition() -> None:
+    parser = recruit_parser()
+    initial = parser.snapshot().battlegrounds
+    assert initial is not None
+    assert initial.shop == ()
+    assert initial.areas["shop"].complete is False
+
+    add_entity(
+        parser,
+        300,
+        "BG_LAST_SHOP_CARD",
+        controller=11,
+        zone="PLAY",
+        card_type="MINION",
+    )
+    feed(
+        parser,
+        "    tag=ZONE_POSITION value=1",
+        "    tag=COST value=3",
+        now=101.0,
+    )
+    parser.finalize_quiet_packet_baselines(now=101.1, quiet_seconds=0.0)
+    assert parser.snapshot().battlegrounds.areas["shop"].complete is True
+
+    feed(parser, "TAG_CHANGE Entity=300 tag=ZONE value=HAND", now=102.0)
+    emptied = parser.snapshot().battlegrounds
+    assert emptied is not None
+    assert emptied.shop == ()
+    assert emptied.areas["shop"].complete is True
+
+    add_entity(
+        parser,
+        301,
+        "BG_NEW_SHOP_CARD",
+        controller=11,
+        zone="PLAY",
+        card_type="MINION",
+    )
+    partial = parser.snapshot().battlegrounds
+    assert partial is not None
+    assert [card.card_id for card in partial.shop] == ["BG_NEW_SHOP_CARD"]
+    assert parser._empty_shop_observation.complete is False
+
+
+def test_battlegrounds_shop_helper_falls_back_from_stale_override_to_current_cost() -> None:
+    parser = recruit_parser()
+    parser.battlegrounds_round = 2
+    add_entity(
+        parser,
+        300,
+        "BG_SHOP_CARD",
+        controller=11,
+        zone="PLAY",
+        card_type="MINION",
+    )
+    feed(parser, "    tag=ZONE_POSITION value=1", "    tag=COST value=3", now=101.0)
+    add_entity(
+        parser,
+        301,
+        "TB_BaconShop_DragBuy",
+        controller=3,
+        zone="PLAY",
+        card_type="SPELL",
+    )
+    feed(
+        parser,
+        "    tag=CARD_TARGET value=300",
+        "    tag=BACON_OVERRIDE_BG_COST value=0",
+        now=101.0,
+    )
+
+    parser.battlegrounds_round = 3
+    feed(
+        parser,
+        "TAG_CHANGE Entity=300 tag=COST value=3",
+        "TAG_CHANGE Entity=301 tag=CARD_TARGET value=300",
+        "TAG_CHANGE Entity=301 tag=COST value=2",
+        now=102.0,
+    )
+
+    battlegrounds = parser.snapshot().battlegrounds
+    assert battlegrounds is not None
+    assert battlegrounds.shop[0].current_cost == 2
+
+
 def test_battlegrounds_shop_area_rejects_mixed_current_and_stale_entities() -> None:
     parser = recruit_parser()
     parser.battlegrounds_round = 3
@@ -1989,6 +2247,7 @@ def test_battlegrounds_shop_area_rejects_mixed_current_and_stale_entities() -> N
         card_type="MINION",
     )
     feed(parser, "    tag=ZONE_POSITION value=2", now=102.0)
+    parser.finalize_quiet_packet_baselines(now=102.1, quiet_seconds=0.0)
     stale = parser.entities[300]
     stale.last_battlegrounds_round = 2
     stale.last_battlegrounds_phase = "recruit"
@@ -2023,6 +2282,7 @@ def test_battlegrounds_shop_area_uses_oldest_entity_as_complete_observation() ->
         card_type="MINION",
     )
     feed(parser, "    tag=ZONE_POSITION value=2", now=102.0)
+    parser.finalize_quiet_packet_baselines(now=102.1, quiet_seconds=0.0)
 
     area = parser.snapshot().battlegrounds.areas["shop"]
 
@@ -2127,6 +2387,120 @@ def test_battlegrounds_economy_costs_expire_across_rounds_independently() -> Non
     assert next_round.economy.upgrade_observation.round == 1
     assert next_round.economy.upgrade_observation.complete is False
     assert next_round.areas["economy"].complete is False
+
+
+def test_battlegrounds_button_cost_carries_forward_when_button_reenters_play() -> None:
+    parser = recruit_parser()
+    parser.battlegrounds_round = 2
+    parser.phase = "combat"
+    add_entity(
+        parser,
+        50,
+        "TB_BaconShop_8p_Reroll_Button",
+        controller=3,
+        zone="REMOVEDFROMGAME",
+        card_type="GAME_MODE_BUTTON",
+    )
+    feed(
+        parser,
+        "    tag=GAME_MODE_BUTTON_SLOT value=2",
+        "    tag=COST value=1",
+        now=101.0,
+    )
+
+    parser.battlegrounds_round = 3
+    parser.phase = "recruit"
+    feed(parser, "TAG_CHANGE Entity=50 tag=ZONE value=PLAY", now=102.0)
+
+    battlegrounds = parser.snapshot().battlegrounds
+    assert battlegrounds is not None
+    assert battlegrounds.refresh_cost == 1
+    assert battlegrounds.economy.refresh_observation.complete is True
+    assert battlegrounds.economy.refresh_observation.round == 3
+    assert battlegrounds.economy.refresh_observation.phase == "recruit"
+
+
+def test_battlegrounds_button_cost_accepts_current_game_state_baseline() -> None:
+    parser = recruit_parser()
+    parser.battlegrounds_round = 3
+    parser.phase = "recruit"
+    parser.entities[50] = Entity(
+        entity_id=50,
+        card_id="TB_BaconShop_8p_Reroll_Button",
+        controller=3,
+        zone="PLAY",
+        card_type="GAME_MODE_BUTTON",
+        tags={"GAME_MODE_BUTTON_SLOT": "2", "COST": "1"},
+        last_seen_at=102.0,
+        last_revision=50,
+        last_battlegrounds_round=3,
+        last_battlegrounds_phase="recruit",
+        battlegrounds_game_state_boolean_baseline_complete=True,
+    )
+
+    battlegrounds = parser.snapshot().battlegrounds
+    assert battlegrounds is not None
+    assert battlegrounds.refresh_cost == 1
+    assert battlegrounds.economy.refresh_observation.complete is True
+
+
+def test_battlegrounds_button_cost_accepts_other_current_button_tag() -> None:
+    parser = recruit_parser()
+    parser.battlegrounds_round = 2
+    parser.phase = "combat"
+    add_entity(
+        parser,
+        50,
+        "TB_BaconShop_8p_Reroll_Button",
+        controller=3,
+        zone="PLAY",
+        card_type="GAME_MODE_BUTTON",
+    )
+    feed(
+        parser,
+        "    tag=GAME_MODE_BUTTON_SLOT value=2",
+        "    tag=COST value=1",
+        now=101.0,
+    )
+
+    parser.battlegrounds_round = 3
+    parser.phase = "recruit"
+    feed(parser, "TAG_CHANGE Entity=50 tag=NUM_TURNS_IN_PLAY value=1", now=102.0)
+
+    battlegrounds = parser.snapshot().battlegrounds
+    assert battlegrounds is not None
+    assert battlegrounds.refresh_cost == 1
+    assert battlegrounds.economy.refresh_observation.complete is True
+
+
+def test_battlegrounds_button_cost_does_not_carry_stale_override_forward() -> None:
+    parser = recruit_parser()
+    parser.battlegrounds_round = 2
+    parser.phase = "combat"
+    add_entity(
+        parser,
+        50,
+        "TB_BaconShop_8p_Reroll_Button",
+        controller=3,
+        zone="PLAY",
+        card_type="GAME_MODE_BUTTON",
+    )
+    feed(
+        parser,
+        "    tag=GAME_MODE_BUTTON_SLOT value=2",
+        "    tag=COST value=1",
+        "    tag=BACON_OVERRIDE_BG_COST value=0",
+        now=101.0,
+    )
+
+    parser.battlegrounds_round = 3
+    parser.phase = "recruit"
+    feed(parser, "TAG_CHANGE Entity=50 tag=NUM_TURNS_IN_PLAY value=1", now=102.0)
+
+    battlegrounds = parser.snapshot().battlegrounds
+    assert battlegrounds is not None
+    assert battlegrounds.refresh_cost == 1
+    assert battlegrounds.economy.refresh_observation.complete is True
 
 
 def test_battlegrounds_gold_cannot_borrow_unrelated_player_tag_freshness() -> None:

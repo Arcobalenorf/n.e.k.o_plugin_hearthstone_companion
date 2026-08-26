@@ -11,6 +11,8 @@ from typing import Any
 from .config import CompanionConfig
 from .models import GameEvent, GameSnapshot
 
+_LIVE_AREA_MAX_AGE_SECONDS = 300.0
+
 
 def build_emotion_cue(event: GameEvent, snapshot: GameSnapshot) -> dict[str, str | int]:
     health = snapshot.player.effective_health
@@ -246,6 +248,50 @@ def _compact_battlegrounds(value: Any) -> dict[str, Any] | None:
     }
 
 
+def _redact_incomplete_battlegrounds(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    result = copy.deepcopy(dict(value))
+    areas = result.get("areas") if isinstance(result.get("areas"), Mapping) else {}
+    current_round = result.get("round")
+    current_phase = result.get("phase")
+
+    def complete(observation: Any) -> bool:
+        return bool(
+            isinstance(observation, Mapping)
+            and observation.get("complete") is True
+            and observation.get("round") == current_round
+            and observation.get("phase") == current_phase
+            and observation.get("observed_at")
+        )
+
+    if not complete(areas.get("shop")):
+        result["shop"] = []
+        result["frozen"] = None
+    if not complete(areas.get("hand")):
+        result["hand"] = []
+    if not complete(areas.get("warband")):
+        result["warband"] = []
+    if not complete(areas.get("choice")):
+        result["current_choice"] = None
+
+    economy = result.get("economy") if isinstance(result.get("economy"), Mapping) else {}
+    economy = dict(economy)
+    for name, top_level_names in (
+        ("gold", ("gold", "max_gold")),
+        ("refresh", ("refresh_cost",)),
+        ("upgrade", ("upgrade_cost",)),
+    ):
+        if complete(economy.get(f"{name}_observation")):
+            continue
+        for field_name in top_level_names:
+            result[field_name] = None
+        if name != "gold":
+            economy[f"{name}_cost"] = None
+    result["economy"] = economy
+    return result
+
+
 def _compact_constructed(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, Mapping):
         return None
@@ -291,6 +337,45 @@ def _compact_constructed(value: Any) -> dict[str, Any] | None:
         "player": compact_side(value.get("player")),
         "opponent": compact_side(value.get("opponent")),
     }
+
+
+def _redact_incomplete_constructed(
+    public_state: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    constructed = public_state.get("constructed")
+    if not isinstance(constructed, Mapping):
+        return None
+    result = copy.deepcopy(dict(constructed))
+    for side_name in ("player", "opponent"):
+        side = result.get(side_name) if isinstance(result.get(side_name), Mapping) else {}
+        side = dict(side)
+        board = side.get("board") if isinstance(side.get("board"), Mapping) else {}
+        board = dict(board)
+        summary_side = (
+            public_state.get(side_name)
+            if isinstance(public_state.get(side_name), Mapping)
+            else {}
+        )
+        summary_board = (
+            summary_side.get("board")
+            if isinstance(summary_side.get("board"), Mapping)
+            else {}
+        )
+        expected_count = summary_board.get("count")
+        minions = list(board.get("minions") or [])
+        identities_complete = bool(
+            board.get("identities_complete") is True
+            and isinstance(expected_count, int)
+            and expected_count >= 0
+            and expected_count == len(minions)
+        )
+        board["count"] = expected_count
+        board["identities_complete"] = identities_complete
+        if not identities_complete:
+            board["minions"] = []
+        side["board"] = board
+        result[side_name] = side
+    return result
 
 
 def _compact_choice(value: Any, *, option_limit: int = 8) -> dict[str, Any] | None:
@@ -1232,15 +1317,50 @@ def _build_battlegrounds_live_state_contexts(
         if isinstance(battlegrounds.get("areas"), Mapping)
         else {}
     )
+    current_round = battlegrounds.get("round")
+    current_phase = battlegrounds.get("phase")
+
+    def evidence_is_current_complete(state: Any) -> bool:
+        if not isinstance(state, Mapping):
+            return False
+        try:
+            evidence_observed_at = float(state.get("observed_at") or 0.0)
+        except (TypeError, ValueError):
+            evidence_observed_at = 0.0
+        return bool(
+            state.get("complete") is True
+            and state.get("round") == current_round
+            and state.get("phase") == current_phase
+            and evidence_observed_at > 0
+            and max(0.0, observed_at - evidence_observed_at)
+            <= _LIVE_AREA_MAX_AGE_SECONDS
+        )
+
+    def area_is_current_complete(area: str) -> bool:
+        return evidence_is_current_complete(areas.get(area))
+
+    economy = (
+        battlegrounds.get("economy")
+        if isinstance(battlegrounds.get("economy"), Mapping)
+        else {}
+    )
+
+    def economy_value_is_current(name: str) -> bool:
+        return evidence_is_current_complete(economy.get(f"{name}_observation"))
+
+    gold_is_current = economy_value_is_current("gold")
+    refresh_is_current = economy_value_is_current("refresh")
+    upgrade_is_current = economy_value_is_current("upgrade")
+    shop_is_current = area_is_current_complete("shop")
+
     complete_areas = [
         area
         for area in ("shop", "hand", "warband", "economy", "choice")
-        if isinstance(areas.get(area), Mapping)
-        and areas[area].get("complete") is True
+        if area_is_current_complete(area)
     ]
     current_choice = battlegrounds.get("current_choice")
     choice = None
-    if isinstance(current_choice, Mapping):
+    if area_is_current_complete("choice") and isinstance(current_choice, Mapping):
         choice = {
             "type": current_choice.get("choice_type"),
             "min": current_choice.get("count_min"),
@@ -1253,15 +1373,23 @@ def _build_battlegrounds_live_state_contexts(
         "mode": "battlegrounds",
         "round": battlegrounds.get("round"),
         "phase": battlegrounds.get("phase"),
-        "gold": battlegrounds.get("gold"),
-        "max_gold": battlegrounds.get("max_gold"),
-        "tavern_tier": battlegrounds.get("tavern_tier"),
-        "frozen": battlegrounds.get("frozen"),
+        "gold": battlegrounds.get("gold") if gold_is_current else None,
+        "max_gold": battlegrounds.get("max_gold") if gold_is_current else None,
+        "tavern_tier": battlegrounds.get("tavern_tier") or None,
+        "frozen": battlegrounds.get("frozen") if shop_is_current else None,
         "placement": battlegrounds.get("placement"),
-        "refresh_actual_cost": battlegrounds.get("refresh_cost"),
-        "upgrade_actual_cost": battlegrounds.get("upgrade_cost"),
+        "refresh_actual_cost": (
+            battlegrounds.get("refresh_cost") if refresh_is_current else None
+        ),
+        "upgrade_actual_cost": (
+            battlegrounds.get("upgrade_cost") if upgrade_is_current else None
+        ),
         "counts": {
-            area: len(list(battlegrounds.get(area) or []))
+            area: (
+                len(list(battlegrounds.get(area) or []))
+                if area_is_current_complete(area)
+                else None
+            )
             for area in ("shop", "hand", "warband")
         },
         "complete_areas": complete_areas,
@@ -1297,6 +1425,8 @@ def _build_battlegrounds_live_state_contexts(
         segments.append(("choice", choice_prompt))
 
     def append_area(area: str, limit: int, cards_per_segment: int) -> None:
+        if not area_is_current_complete(area):
+            return
         area_state = areas.get(area) if isinstance(areas.get(area), Mapping) else {}
         complete = area_state.get("complete") if area_state else None
         segments.extend(
@@ -1428,6 +1558,27 @@ def _build_constructed_live_state_contexts(
     opponent_board = (
         opponent.get("board") if isinstance(opponent.get("board"), Mapping) else {}
     )
+    player_summary = (
+        public_state.get("player") if isinstance(public_state.get("player"), Mapping) else {}
+    )
+    opponent_summary = (
+        public_state.get("opponent")
+        if isinstance(public_state.get("opponent"), Mapping)
+        else {}
+    )
+
+    def board_evidence_complete(summary: Mapping[str, Any], board: Mapping[str, Any]) -> bool:
+        summary_board = summary.get("board") if isinstance(summary.get("board"), Mapping) else {}
+        expected = summary_board.get("count")
+        return bool(
+            board.get("identities_complete") is True
+            and isinstance(expected, int)
+            and expected >= 0
+            and expected == len(list(board.get("minions") or []))
+        )
+
+    player_board_complete = board_evidence_complete(player_summary, player_board)
+    opponent_board_complete = board_evidence_complete(opponent_summary, opponent_board)
     revision = _live_revision(public_state, observed_at)
     choice = _compact_choice(public_state.get("choice"))
     core_payload = {
@@ -1440,8 +1591,8 @@ def _build_constructed_live_state_contexts(
         "active_side": public_state.get("active_side"),
         "variant": constructed.get("variant"),
         "counts": {
-            "player_board": len(list(player_board.get("minions") or [])),
-            "opponent_board": len(list(opponent_board.get("minions") or [])),
+            "player_board": (player_summary.get("board") or {}).get("count"),
+            "opponent_board": (opponent_summary.get("board") or {}).get("count"),
             "player_hand": int(
                 (player.get("hand") or {}).get("count")
                 if isinstance(player.get("hand"), Mapping)
@@ -1449,8 +1600,8 @@ def _build_constructed_live_state_contexts(
             ),
         },
         "complete_areas": [
-            "player_board",
-            "opponent_board",
+            *(["player_board"] if player_board_complete else []),
+            *(["opponent_board"] if opponent_board_complete else []),
             *(
                 ["player_hand"]
                 if isinstance(player.get("hand"), Mapping)
@@ -1524,14 +1675,14 @@ def _build_constructed_live_state_contexts(
         (
             "opponent_board",
             opponent_board.get("minions"),
-            True,
+            opponent_board_complete,
             _live_constructed_board_card,
             7,
         ),
         (
             "player_board",
             player_board.get("minions"),
-            True,
+            player_board_complete,
             _live_constructed_board_card,
             7,
         ),
@@ -1548,6 +1699,8 @@ def _build_constructed_live_state_contexts(
         ),
     )
     for area, cards, complete, card_builder, cards_per_segment in areas:
+        if complete is not True:
+            continue
         segments.extend(
             _build_live_card_segments(
                 cards,
@@ -1702,7 +1855,12 @@ def build_llm_prompt(
         raise ValueError("max_prompt_chars is too small for the commentary contract")
 
     public_state = copy.deepcopy(snapshot.to_public_dict())
-    public_state["constructed"] = _compact_constructed(public_state.get("constructed"))
+    public_state["constructed"] = _compact_constructed(
+        _redact_incomplete_constructed(public_state)
+    )
+    public_state["battlegrounds"] = _redact_incomplete_battlegrounds(
+        public_state.get("battlegrounds")
+    )
     choice = public_state.get("choice")
     if isinstance(choice, Mapping):
         public_state["choice"] = {

@@ -98,6 +98,25 @@ def _snapshot_summary(snapshot: Any) -> dict[str, Any]:
     return result
 
 
+def _context_summary(snapshot: Any | None) -> dict[str, Any] | None:
+    if snapshot is None:
+        return None
+    segments = build_live_state_segments(
+        snapshot,
+        observed_at=1_780_000_000.0,
+        max_prompt_bytes=900,
+    )
+    encoded_lengths = [len(text.encode("utf-8")) for _name, text in segments]
+    return {
+        "mode": snapshot.mode,
+        "match_id": snapshot.game_number,
+        "segment_count": len(segments),
+        "segment_names": [name for name, _text in segments],
+        "max_segment_bytes": max(encoded_lengths, default=0),
+        "total_bytes": sum(encoded_lengths),
+    }
+
+
 def replay(path: Path, *, label: str) -> dict[str, Any]:
     parser = PowerLogParser()
     lines_seen = 0
@@ -105,7 +124,7 @@ def replay(path: Path, *, label: str) -> dict[str, Any]:
     last_revision = -1
     last_active = None
     richest_recruit = None
-    richest_recruit_score = -1
+    richest_recruit_score: tuple[int, int, int] | None = None
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
             lines_seen += 1
@@ -121,29 +140,30 @@ def replay(path: Path, *, label: str) -> dict[str, Any]:
                 last_active = snapshot
             if snapshot.battlegrounds is not None and snapshot.phase == "recruit":
                 bg = snapshot.battlegrounds
-                score = len(bg.shop) * 100 + len(bg.hand) * 10 + len(bg.warband)
-                score += sum(value is not None for value in (bg.gold, bg.refresh_cost, bg.upgrade_cost))
-                if score > richest_recruit_score:
+                shop_area = bg.areas.get("shop")
+                if (
+                    shop_area is None
+                    or not shop_area.complete
+                    or shop_area.round != bg.round
+                    or shop_area.phase != "recruit"
+                ):
+                    continue
+                evidence_score = (
+                    len(bg.shop) * 100
+                    + len(bg.hand) * 10
+                    + len(bg.warband)
+                    + sum(
+                        value is not None
+                        for value in (bg.gold, bg.refresh_cost, bg.upgrade_cost)
+                    )
+                )
+                score = (evidence_score, bg.round, shop_area.revision)
+                if richest_recruit_score is None or score > richest_recruit_score:
                     richest_recruit = snapshot
                     richest_recruit_score = score
     final = parser.snapshot()
-    selected = richest_recruit or last_active
-    context = None
-    if selected is not None:
-        segments = build_live_state_segments(
-            selected,
-            observed_at=1_780_000_000.0,
-            max_prompt_bytes=900,
-        )
-        encoded_lengths = [len(text.encode("utf-8")) for _name, text in segments]
-        context = {
-            "mode": selected.mode,
-            "match_id": selected.game_number,
-            "segment_count": len(segments),
-            "segment_names": [name for name, _text in segments],
-            "max_segment_bytes": max(encoded_lengths, default=0),
-            "total_bytes": sum(encoded_lengths),
-        }
+    selected = last_active or richest_recruit
+    context = _context_summary(selected)
     return {
         "label": label,
         "bytes_read": path.stat().st_size,
@@ -155,6 +175,8 @@ def replay(path: Path, *, label: str) -> dict[str, Any]:
             _snapshot_summary(richest_recruit) if richest_recruit is not None else None
         ),
         "live_context": context,
+        "last_active_context": _context_summary(last_active),
+        "richest_recruit_context": _context_summary(richest_recruit),
     }
 
 

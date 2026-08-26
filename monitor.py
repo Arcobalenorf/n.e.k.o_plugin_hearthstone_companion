@@ -18,6 +18,7 @@ EventCallback = Callable[[GameEvent, GameSnapshot], None]
 StateCallback = Callable[[GameSnapshot], None]
 LIVE_STATE_MAX_AGE_SECONDS = 300.0
 LIVE_CONTEXT_PUBLISH_INTERVAL_SECONDS = 0.5
+BATTLEGROUNDS_SHOP_SETTLE_SECONDS = 0.5
 
 
 class CompanionMonitor:
@@ -66,6 +67,9 @@ class CompanionMonitor:
         self._bootstrap_complete = False
         self._state_ready_notified = False
         self._state_stale_notified = False
+        self._shop_settle_signature: tuple[Any, ...] | None = None
+        self._shop_settle_started_at = 0.0
+        self._pending_recruit_emission: tuple[GameEvent, GameSnapshot] | None = None
 
     def _begin_source_generation_locked(self) -> None:
         self._source_generation += 1
@@ -73,6 +77,9 @@ class CompanionMonitor:
         self._bootstrap_complete = False
         self._state_ready_notified = False
         self._state_stale_notified = False
+        self._shop_settle_signature = None
+        self._shop_settle_started_at = 0.0
+        self._pending_recruit_emission = None
         self._status.source_state = (
             "waiting_for_log" if self._status.monitor_running else "waiting"
         )
@@ -243,7 +250,20 @@ class CompanionMonitor:
                         self._reset_reader_locked()
                         snapshot = self._snapshot
                     else:
-                        snapshot = self._parser.snapshot()
+                        finalize_packets = getattr(
+                            self._parser,
+                            "finalize_quiet_packet_baselines",
+                            None,
+                        )
+                        if callable(finalize_packets):
+                            finalize_packets(
+                                now=now,
+                                quiet_seconds=BATTLEGROUNDS_SHOP_SETTLE_SECONDS,
+                            )
+                        snapshot = self._settle_live_snapshot(
+                            self._parser.snapshot(),
+                            now=time.monotonic(),
+                        )
                         emissions = [
                             (
                                 event,
@@ -255,6 +275,13 @@ class CompanionMonitor:
                             )
                             for event, event_snapshot in emissions
                         ]
+                        if batch.bootstrap:
+                            self._pending_recruit_emission = None
+                        else:
+                            emissions = self._settle_recruit_emissions(
+                                emissions,
+                                snapshot,
+                            )
                         state_changed = snapshot != self._snapshot
                         previous_active_snapshot = bool(
                             self._snapshot.game_number > 0
@@ -460,6 +487,60 @@ class CompanionMonitor:
                 self._status.source_state = "stopped"
         self._report()
 
+    def _settle_live_snapshot(
+        self,
+        snapshot: GameSnapshot,
+        *,
+        now: float | None = None,
+    ) -> GameSnapshot:
+        """Require a short unchanged trailing window before a complete shop.
+
+        Power.log has no transaction marker around a shop refresh. A tail poll can
+        therefore end after the first new entity even though more slots are about
+        to arrive. The parser keeps the observed cards, while this monitor-level
+        gate prevents query and passive-context consumers from treating that
+        transient prefix as the complete shop.
+        """
+        battlegrounds = snapshot.battlegrounds
+        shop_area = (
+            battlegrounds.areas.get("shop")
+            if battlegrounds is not None
+            else None
+        )
+        if (
+            snapshot.mode != "battlegrounds"
+            or snapshot.phase != "recruit"
+            or battlegrounds is None
+            or shop_area is None
+            or not shop_area.complete
+        ):
+            self._shop_settle_signature = None
+            self._shop_settle_started_at = 0.0
+            return snapshot
+
+        signature = (
+            snapshot.game_number,
+            battlegrounds.round,
+            battlegrounds.phase,
+            battlegrounds.shop,
+            battlegrounds.frozen,
+            shop_area.revision,
+        )
+        current_time = time.monotonic() if now is None else float(now)
+        if (
+            signature == self._shop_settle_signature
+            and current_time - self._shop_settle_started_at
+            >= BATTLEGROUNDS_SHOP_SETTLE_SECONDS
+        ):
+            return snapshot
+
+        if signature != self._shop_settle_signature:
+            self._shop_settle_signature = signature
+            self._shop_settle_started_at = current_time
+        areas = dict(battlegrounds.areas)
+        areas["shop"] = replace(shop_area, complete=False)
+        return replace(snapshot, battlegrounds=replace(battlegrounds, areas=areas))
+
     def _handle_event(self, event: GameEvent, snapshot: GameSnapshot, now: float) -> None:
         self._handle_batch([(event, snapshot)], now)
 
@@ -511,7 +592,9 @@ class CompanionMonitor:
         candidates = [
             (event, snapshot)
             for event, snapshot in emissions
-            if snapshot.phase != "spectator" and self._arbiter.allow_llm(event, snapshot, now=now)
+            if snapshot.phase != "spectator"
+            and self._event_snapshot_ready_for_llm(event, snapshot)
+            and self._arbiter.allow_llm(event, snapshot, now=now)
         ]
         if candidates:
             _, (event, snapshot) = max(
@@ -548,19 +631,96 @@ class CompanionMonitor:
         event_snapshot: GameSnapshot,
         batch_snapshot: GameSnapshot,
     ) -> GameSnapshot:
-        if event.kind != "turn_started" or batch_snapshot.mode != "constructed":
+        if event.kind == "turn_started" and batch_snapshot.mode == "constructed":
+            event_turn = int(event.details.get("turn") or 0)
+            event_side = str(event.details.get("active_side") or "unknown")
+            if (
+                event_turn > 0
+                and batch_snapshot.game_number == event_snapshot.game_number
+                and batch_snapshot.turn == event_turn
+                and batch_snapshot.active_side == event_side
+                and batch_snapshot.phase == "playing"
+            ):
+                return batch_snapshot
             return event_snapshot
-        event_turn = int(event.details.get("turn") or 0)
-        event_side = str(event.details.get("active_side") or "unknown")
+
+        expected_phase = {
+            "battlegrounds_recruit_started": "recruit",
+            "battlegrounds_combat_started": "combat",
+        }.get(event.kind)
+        event_round = int(event.details.get("round") or 0)
+        battlegrounds = batch_snapshot.battlegrounds
         if (
-            event_turn <= 0
-            or batch_snapshot.game_number != event_snapshot.game_number
-            or batch_snapshot.turn != event_turn
-            or batch_snapshot.active_side != event_side
-            or batch_snapshot.phase != "playing"
+            expected_phase is not None
+            and event_round > 0
+            and batch_snapshot.mode == "battlegrounds"
+            and batch_snapshot.game_number == event_snapshot.game_number
+            and batch_snapshot.phase == expected_phase
+            and battlegrounds is not None
+            and battlegrounds.round == event_round
+            and battlegrounds.phase == expected_phase
         ):
-            return event_snapshot
-        return batch_snapshot
+            return batch_snapshot
+        return event_snapshot
+
+    @staticmethod
+    def _event_snapshot_ready_for_llm(
+        event: GameEvent,
+        snapshot: GameSnapshot,
+    ) -> bool:
+        if event.kind != "battlegrounds_recruit_started":
+            return True
+        battlegrounds = snapshot.battlegrounds
+        shop_area = (
+            battlegrounds.areas.get("shop")
+            if battlegrounds is not None
+            else None
+        )
+        return bool(
+            battlegrounds is not None
+            and snapshot.phase == "recruit"
+            and shop_area is not None
+            and shop_area.complete
+            and shop_area.round == battlegrounds.round
+            and shop_area.phase == "recruit"
+        )
+
+    def _settle_recruit_emissions(
+        self,
+        emissions: list[tuple[GameEvent, GameSnapshot]],
+        snapshot: GameSnapshot,
+    ) -> list[tuple[GameEvent, GameSnapshot]]:
+        ready: list[tuple[GameEvent, GameSnapshot]] = []
+        for event, event_snapshot in emissions:
+            if (
+                event.kind == "battlegrounds_recruit_started"
+                and not self._event_snapshot_ready_for_llm(event, event_snapshot)
+            ):
+                self._pending_recruit_emission = (event, event_snapshot)
+                continue
+            ready.append((event, event_snapshot))
+
+        pending = self._pending_recruit_emission
+        if pending is None:
+            return ready
+        event, event_snapshot = pending
+        battlegrounds = snapshot.battlegrounds
+        event_round = int(event.details.get("round") or 0)
+        still_same_recruit = bool(
+            snapshot.mode == "battlegrounds"
+            and snapshot.phase == "recruit"
+            and snapshot.game_number == event_snapshot.game_number
+            and battlegrounds is not None
+            and battlegrounds.round == event_round
+            and battlegrounds.phase == "recruit"
+        )
+        if not still_same_recruit:
+            self._pending_recruit_emission = None
+            return ready
+        if self._event_snapshot_ready_for_llm(event, snapshot):
+            ready.append((event, snapshot))
+            self._pending_recruit_emission = None
+        return ready
 
     def _notify_event(
         self,

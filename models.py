@@ -194,6 +194,7 @@ class ConstructedSideSnapshot:
     cards_played_this_turn: int = 0
     secret_count: int = 0
     board: tuple[ConstructedCardSnapshot, ...] = ()
+    board_identities_complete: bool = False
     weapon: ConstructedCardSnapshot | None = None
     hero_power: ConstructedCardSnapshot | None = None
     locations: tuple[ConstructedCardSnapshot, ...] = ()
@@ -223,6 +224,7 @@ class ConstructedSideSnapshot:
                 "attack": sum(card.attack or 0 for card in self.board),
                 "health": sum(card.health or 0 for card in self.board),
                 "minions": [card.to_public_dict() for card in self.board],
+                "identities_complete": self.board_identities_complete,
             },
             "weapon": self.weapon.to_public_dict() if self.weapon else None,
             "hero_power": self.hero_power.to_public_dict() if self.hero_power else None,

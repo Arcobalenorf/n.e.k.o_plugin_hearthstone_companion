@@ -149,7 +149,11 @@ class _HostContext:
         }
 
 
-def _install_stable_sdk(sdk_root: Path) -> tuple[type[Any], Any]:
+def _install_stable_sdk(
+    sdk_root: Path,
+    *,
+    allow_main_sdk: bool = False,
+) -> tuple[type[Any], Any]:
     plugin_path = sdk_root / "plugin"
     if not (plugin_path / "sdk" / "plugin" / "base.py").is_file():
         raise RuntimeError(f"N.E.K.O Plugin SDK not found under {sdk_root}")
@@ -169,7 +173,10 @@ def _install_stable_sdk(sdk_root: Path) -> tuple[type[Any], Any]:
 
     from plugin.sdk.plugin import NekoPluginBase, unwrap_or
 
-    if hasattr(NekoPluginBase, "plugin_dir") or hasattr(NekoPluginBase, "cache_path"):
+    if not allow_main_sdk and (
+        hasattr(NekoPluginBase, "plugin_dir")
+        or hasattr(NekoPluginBase, "cache_path")
+    ):
         raise RuntimeError("smoke test requires the stable SDK surface without main-only path APIs")
     if not hasattr(NekoPluginBase, "config_dir") or not hasattr(NekoPluginBase, "data_path"):
         raise RuntimeError("stable SDK path APIs are unavailable")
@@ -242,7 +249,14 @@ async def _exercise_lifecycle(plugin: Any, unwrap_or: Any, host_ctx: _HostContex
             raise RuntimeError("stable SDK smoke unexpectedly started the log monitor")
         if startup.get("card_catalog_started") is not False:
             raise RuntimeError("stable SDK smoke unexpectedly started the network catalog")
-        for result in (await plugin.query_hearthstone_live_state(),):
+        for result in (
+            await plugin.query_hearthstone_live_state(
+                _ctx={
+                    "latest_user_request": "现在炉石对局是什么状态？",
+                    "lanlan_name": "stable-sdk-smoke-role",
+                }
+            ),
+        ):
             agent_meta = result.get("meta", {}).get("agent", {})
             if agent_meta.get("result_kind") != "event":
                 raise RuntimeError(f"Agent query lost event result semantics: {result!r}")
@@ -292,6 +306,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sdk-root", type=Path, required=True)
     parser.add_argument("--plugin-root", type=Path, required=True)
+    parser.add_argument("--allow-main-sdk", action="store_true")
     args = parser.parse_args()
     sdk_root = args.sdk_root.resolve()
     plugin_root = args.plugin_root.resolve()
@@ -300,7 +315,10 @@ def main() -> int:
         previous_storage_root = os.environ.get("NEKO_STORAGE_SELECTED_ROOT")
         os.environ["NEKO_STORAGE_SELECTED_ROOT"] = temp_dir
         try:
-            stable_base, unwrap_or = _install_stable_sdk(sdk_root)
+            stable_base, unwrap_or = _install_stable_sdk(
+                sdk_root,
+                allow_main_sdk=args.allow_main_sdk,
+            )
             entry = _load_plugin(plugin_root)
             host_ctx = _HostContext(plugin_root, _Logger())
             plugin = entry.HearthstoneCompanionPlugin(host_ctx)
@@ -320,7 +338,8 @@ def main() -> int:
             else:
                 os.environ["NEKO_STORAGE_SELECTED_ROOT"] = previous_storage_root
 
-    print("N.E.K.O v0.8.3 SDK constructor, settings, and lifecycle smoke passed")
+    sdk_label = "main SDK" if args.allow_main_sdk else "v0.8.3 stable SDK"
+    print(f"N.E.K.O {sdk_label} constructor, settings, and lifecycle smoke passed")
     return 0
 
 
