@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 import types
 from dataclasses import replace
 from pathlib import Path
@@ -162,6 +163,9 @@ def _decorator(*args: Any, **kwargs: Any):
 
     def decorate(target: Any) -> Any:
         target.__neko_test_decorator_kwargs__ = dict(kwargs)
+        decorators = getattr(target, "__neko_test_decorators__", [])
+        decorators.append(dict(kwargs))
+        target.__neko_test_decorators__ = decorators
         return target
 
     return decorate
@@ -598,6 +602,18 @@ def test_agent_query_entries_are_visible_and_admin_entries_remain_hidden(monkeyp
         "seconds": 1,
         "auto_start": True,
     }
+
+
+def test_save_settings_action_schema_exposes_only_current_privacy_controls(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    decorators = entry.HearthstoneCompanionPlugin.save_settings.__neko_test_decorators__
+    action = next(item for item in decorators if "input_schema" in item)
+    properties = action["input_schema"]["properties"]
+
+    assert "llm_do_not_disturb" in properties
+    assert "llm_data_consent" in properties
+    assert "llm_commentary_enabled" not in properties
+    assert "llm_lifecycle_enabled" not in properties
 
 
 def _llm_tool_registry(
@@ -1765,7 +1781,7 @@ def test_legacy_none_push_receipt_accepts_targeted_event_responses(monkeypatch) 
     submitted: list[dict[str, Any]] = []
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
     plugin.cfg = CompanionConfig(
-        llm_commentary_enabled=True,
+        llm_do_not_disturb=False,
         llm_data_consent=True,
         target_lanlan="兰兰A",
     )
@@ -1784,16 +1800,16 @@ def test_legacy_none_push_receipt_accepts_targeted_event_responses(monkeypatch) 
         GameSnapshot(mode="battlegrounds", phase="playing"),
     )
     assert plugin._dispatch_llm(
-        "terminal prompt",
-        GameEvent("battlegrounds_game_ended", 10, "ended", 102.0, {"placement": 1}),
-        GameSnapshot(mode="battlegrounds", phase="ended"),
+        "second ordinary prompt",
+        GameEvent("hero_damaged", 9, "damaged", 102.0, {"amount": 5}),
+        GameSnapshot(mode="battlegrounds", phase="playing"),
     )
 
     assert [item["ai_behavior"] for item in submitted] == ["respond", "respond"]
     assert all(item["target_lanlan"] == "兰兰A" for item in submitted)
     assert [item["metadata"]["event_kind"] for item in submitted] == [
         "battlegrounds_triple",
-        "battlegrounds_game_ended",
+        "hero_damaged",
     ]
 
 
@@ -1802,7 +1818,7 @@ def _legacy_none_push_receipt_preserves_targeted_context_lifecycle(monkeypatch) 
     submitted: list[dict[str, Any]] = []
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
     plugin.cfg = CompanionConfig(
-        llm_commentary_enabled=True,
+        llm_do_not_disturb=False,
         llm_data_consent=True,
         target_lanlan="兰兰A",
     )
@@ -1843,7 +1859,7 @@ def test_proactive_commentary_uses_recent_user_context_role(
     submitted: list[dict[str, Any]] = []
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
     plugin.cfg = CompanionConfig(
-        llm_commentary_enabled=True,
+        llm_do_not_disturb=False,
         llm_data_consent=True,
     )
     plugin._context_target = None
@@ -2656,7 +2672,7 @@ def test_llm_state_tool_does_not_read_state_without_data_consent(monkeypatch) ->
         raise AssertionError("monitor must not be read without explicit LLM data consent")
 
     fake_plugin = types.SimpleNamespace(
-        cfg=CompanionConfig(llm_commentary_enabled=True, llm_data_consent=False),
+        cfg=CompanionConfig(llm_do_not_disturb=False, llm_data_consent=False),
         _ensure_monitor=fail_if_called,
     )
 
@@ -2739,7 +2755,7 @@ def test_llm_state_tool_returns_public_state_with_consent_even_when_proactive_is
         ),
     )
     fake_plugin = types.SimpleNamespace(
-        cfg=CompanionConfig(llm_commentary_enabled=False, llm_data_consent=True),
+        cfg=CompanionConfig(llm_do_not_disturb=True, llm_data_consent=True),
         _ensure_monitor=lambda: monitor,
     )
 
@@ -3010,12 +3026,587 @@ def test_unauthorized_battlegrounds_advice_keeps_battlegrounds_only_contract(mon
     assert result["answer_contract"]["if_unavailable_do_not_recommend_from_cached_state"] is True
 
 
+def _new_game_lifecycle_plugin(
+    entry: Any,
+    submitted: list[dict[str, Any]],
+    *,
+    target: str = "兰兰A",
+    do_not_disturb: bool = True,
+) -> Any:
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(
+        llm_do_not_disturb=do_not_disturb,
+        llm_data_consent=True,
+        target_lanlan=target,
+    )
+    plugin._monitor = None
+    plugin._ownership_lock = threading.RLock()
+    plugin._delivery_lock = threading.RLock()
+    plugin._started = True
+    plugin._monitor_dispatch_enabled = True
+    plugin._settings_transition = False
+    plugin._settings_transition_revision = 0
+    plugin._session_target = ""
+    plugin._game_lifecycle_epoch = 0
+    plugin._game_lifecycle_sent = {}
+    plugin._pending_game_lifecycle = None
+    plugin._query_ledger = entry.QueryLedger()
+    plugin._live_state_shared = False
+    plugin._live_state_target = ""
+    plugin._live_state_segments = ()
+    plugin._live_state_game_number = 0
+    plugin._live_state_snapshot = None
+    plugin._live_state_published_at = 0.0
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args, **_kwargs: None)
+    plugin.push_message = lambda **kwargs: submitted.append(kwargs) or {"submitted": True}
+    return plugin
+
+
+def test_game_lifecycle_start_and_resume_are_distinct_and_deduplicated(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    submitted: list[dict[str, Any]] = []
+    plugin = _new_game_lifecycle_plugin(entry, submitted)
+    snapshot = GameSnapshot(mode="constructed", phase="mulligan", game_number=4)
+
+    plugin._observe_game_event(
+        GameEvent("game_started", 5, "started", 100.0, {}),
+        snapshot,
+    )
+    plugin._observe_game_event(
+        GameEvent("game_started", 5, "started", 100.1, {}),
+        snapshot,
+    )
+    plugin._observe_game_event(
+        GameEvent("state_resumed", 0, "resumed", 101.0, {"game_number": 4}),
+        snapshot,
+    )
+    plugin._observe_game_event(
+        GameEvent("state_resumed", 0, "resumed", 101.1, {"game_number": 4}),
+        snapshot,
+    )
+
+    assert [item["metadata"]["lifecycle_stage"] for item in submitted] == [
+        "started",
+        "resumed",
+    ]
+    assert all(item["metadata"]["kind"] == "game_lifecycle_reaction" for item in submitted)
+    assert all(item["target_lanlan"] == "兰兰A" for item in submitted)
+    assert "重新接上" in submitted[-1]["parts"][0]["text"]
+    assert "确认一场新对局刚刚开始" not in submitted[-1]["parts"][0]["text"]
+
+
+@pytest.mark.parametrize(
+    ("event", "snapshot", "expected_fact"),
+    [
+        (
+            GameEvent("game_ended", 10, "won", 102.0, {"result": "won"}),
+            GameSnapshot(
+                mode="constructed",
+                phase="ended",
+                game_number=7,
+                result="won",
+            ),
+            '\"result\":\"won\"',
+        ),
+        (
+            GameEvent(
+                "battlegrounds_game_ended",
+                10,
+                "placed first",
+                102.0,
+                {"placement": 1, "variant": "solo"},
+            ),
+            GameSnapshot(mode="battlegrounds", phase="ended", game_number=7),
+            '\"placement\":1',
+        ),
+    ],
+)
+def test_terminal_lifecycle_submits_final_fact_before_context_invalidation(
+    monkeypatch,
+    event: GameEvent,
+    snapshot: GameSnapshot,
+    expected_fact: str,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    calls: list[Any] = []
+    plugin = _new_game_lifecycle_plugin(entry, [])
+
+    class Ledger:
+        def clear(self) -> None:
+            calls.append("ledger_clear")
+
+    class Publisher:
+        cursor = None
+
+        def expire(self, *, reason: str) -> bool:
+            calls.append(("expire", reason))
+            return True
+
+    plugin._query_ledger = Ledger()
+    plugin._state_publisher = Publisher()
+    plugin.push_message = lambda **kwargs: calls.append(("respond", kwargs)) or {
+        "submitted": True
+    }
+
+    plugin._observe_game_event(event, snapshot)
+    plugin._observe_game_event(event, snapshot)
+
+    responses = [item for item in calls if isinstance(item, tuple) and item[0] == "respond"]
+    assert len(responses) == 1
+    assert calls[0][0] == "respond"
+    assert calls[1] == "ledger_clear"
+    assert calls[2] == ("expire", event.kind)
+    assert expected_fact in responses[0][1]["parts"][0]["text"]
+
+
+def test_lifecycle_without_target_queues_then_retries_with_fresh_snapshot(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    submitted: list[dict[str, Any]] = []
+    plugin = _new_game_lifecycle_plugin(entry, submitted, target="")
+    initial = GameSnapshot(mode="constructed", phase="mulligan", game_number=4)
+    fresh = replace(initial, phase="playing", turn=1)
+
+    plugin._observe_game_event(
+        GameEvent("game_started", 5, "started", 100.0, {}),
+        initial,
+    )
+
+    assert submitted == []
+    assert plugin._pending_game_lifecycle is not None
+    queued_at = plugin._pending_game_lifecycle.created_at
+
+    plugin._session_target = "兰兰A"
+    plugin._monitor = types.SimpleNamespace(
+        try_capture=lambda **_kwargs: (
+            fresh,
+            types.SimpleNamespace(),
+            1,
+        )
+    )
+    assert plugin._retry_pending_game_lifecycle() is True
+
+    assert len(submitted) == 1
+    assert submitted[0]["metadata"]["lifecycle_stage"] == "started"
+    assert plugin._pending_game_lifecycle is None
+    assert queued_at > 0
+
+
+def test_lifecycle_pending_expires_and_clears_on_source_or_spectator(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    submitted: list[dict[str, Any]] = []
+    plugin = _new_game_lifecycle_plugin(entry, submitted, target="")
+    snapshot = GameSnapshot(mode="constructed", phase="playing", game_number=4)
+
+    plugin._observe_game_event(
+        GameEvent("state_ready", 0, "ready", 100.0, {"game_number": 4}),
+        snapshot,
+    )
+    plugin._pending_game_lifecycle = replace(
+        plugin._pending_game_lifecycle,
+        expires_at=time.time() - 1.0,
+    )
+    assert plugin._retry_pending_game_lifecycle() is False
+    assert plugin._pending_game_lifecycle is None
+
+    plugin._observe_game_event(
+        GameEvent("state_ready", 0, "ready", 101.0, {"game_number": 4}),
+        snapshot,
+    )
+    plugin._observe_game_event(
+        GameEvent("source_reset", 0, "reset", 102.0, {}),
+        GameSnapshot(),
+    )
+    assert plugin._pending_game_lifecycle is None
+    assert plugin._game_lifecycle_epoch == 1
+
+    plugin._observe_game_event(
+        GameEvent("state_ready", 0, "ready", 103.0, {"game_number": 5}),
+        replace(snapshot, game_number=5),
+    )
+    plugin._observe_game_event(
+        GameEvent("state_resumed", 0, "resumed", 104.0, {"game_number": 5}),
+        GameSnapshot(mode="constructed", phase="spectator", game_number=5),
+    )
+    assert plugin._pending_game_lifecycle is None
+    assert submitted == []
+
+
+def test_pending_lifecycle_cannot_cross_a_source_reset_during_refresh(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    submitted: list[dict[str, Any]] = []
+    plugin = _new_game_lifecycle_plugin(entry, submitted, target="")
+    snapshot = GameSnapshot(mode="constructed", phase="playing", game_number=4)
+
+    plugin._observe_game_event(
+        GameEvent("state_ready", 0, "ready", 100.0, {"game_number": 4}),
+        snapshot,
+    )
+    plugin._session_target = "兰兰A"
+
+    def reset_during_capture(**_kwargs: Any) -> tuple[GameSnapshot, Any, int]:
+        plugin._observe_game_event(
+            GameEvent("source_reset", 0, "reset", 101.0, {}),
+            GameSnapshot(),
+        )
+        return snapshot, types.SimpleNamespace(), 0
+
+    plugin._monitor = types.SimpleNamespace(try_capture=reset_during_capture)
+
+    assert plugin._retry_pending_game_lifecycle() is False
+    assert plugin._game_lifecycle_epoch == 1
+    assert plugin._pending_game_lifecycle is None
+    assert submitted == []
+
+
+def test_lifecycle_epoch_deduplicates_one_monitor_source_generation(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    plugin = _new_game_lifecycle_plugin(entry, [])
+    monitor = types.SimpleNamespace()
+    plugin._monitor = monitor
+
+    plugin._advance_game_lifecycle_epoch(
+        monitor=monitor,
+        source_generation=2,
+    )
+    plugin._observe_game_event(
+        GameEvent("source_reset", 0, "reset", 101.0, {}),
+        GameSnapshot(),
+        2,
+    )
+
+    assert plugin._game_lifecycle_epoch == 1
+
+
+def test_pending_lifecycle_cannot_cross_an_unannounced_source_generation(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    submitted: list[dict[str, Any]] = []
+    plugin = _new_game_lifecycle_plugin(entry, submitted, target="")
+    snapshot = GameSnapshot(mode="constructed", phase="playing", game_number=1)
+    generation = [1]
+    plugin._monitor = types.SimpleNamespace(
+        try_capture=lambda **_kwargs: (
+            snapshot,
+            types.SimpleNamespace(),
+            generation[0],
+        )
+    )
+
+    plugin._observe_game_event(
+        GameEvent("state_ready", 0, "ready", 100.0, {"game_number": 1}),
+        snapshot,
+    )
+    pending = plugin._pending_game_lifecycle
+    assert pending is not None
+    assert pending.source_generation == 1
+
+    # The monitor publishes the new generation before its source_reset callback.
+    generation[0] = 2
+    plugin._session_target = "兰兰A"
+
+    assert plugin._retry_pending_game_lifecycle() is False
+    assert plugin._pending_game_lifecycle is None
+    assert submitted == []
+
+
+@pytest.mark.parametrize("event_kind", ["game_started", "game_ended"])
+def test_configuration_transition_queues_lifecycle_until_reconciled(
+    monkeypatch,
+    event_kind: str,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    submitted: list[dict[str, Any]] = []
+    plugin = _new_game_lifecycle_plugin(entry, submitted)
+    ended = event_kind == "game_ended"
+    snapshot = GameSnapshot(
+        mode="constructed",
+        phase="ended" if ended else "playing",
+        game_number=4,
+        result="won" if ended else "",
+    )
+    event = GameEvent(
+        event_kind,
+        10 if ended else 5,
+        "won" if ended else "started",
+        100.0,
+        {"result": "won"} if ended else {},
+    )
+    plugin._settings_transition = True
+
+    plugin._observe_game_event(event, snapshot)
+
+    assert submitted == []
+    assert plugin._pending_game_lifecycle is not None
+    plugin._settings_transition = False
+
+    assert plugin._retry_pending_game_lifecycle() is True
+    assert len(submitted) == 1
+    assert submitted[0]["metadata"]["lifecycle_stage"] == (
+        "ended" if ended else "started"
+    )
+
+
+def test_terminal_lifecycle_prompt_failure_still_invalidates_live_context(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    calls: list[Any] = []
+    plugin = _new_game_lifecycle_plugin(entry, [])
+
+    class Ledger:
+        def clear(self) -> None:
+            calls.append("ledger_clear")
+
+    class Publisher:
+        cursor = None
+
+        def expire(self, *, reason: str) -> bool:
+            calls.append(("expire", reason))
+            return True
+
+    def fail_prompt(*_args: Any, **_kwargs: Any) -> str:
+        raise RuntimeError("prompt failed")
+
+    plugin._query_ledger = Ledger()
+    plugin._state_publisher = Publisher()
+    monkeypatch.setattr(entry, "build_llm_prompt", fail_prompt)
+
+    plugin._observe_game_event(
+        GameEvent("game_ended", 10, "won", 100.0, {"result": "won"}),
+        GameSnapshot(
+            mode="constructed",
+            phase="ended",
+            game_number=4,
+            result="won",
+        ),
+    )
+
+    assert calls == ["ledger_clear", ("expire", "game_ended")]
+    assert plugin._pending_game_lifecycle is not None
+
+
+def test_ended_pending_is_dropped_after_monitor_moves_to_the_next_game(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    submitted: list[dict[str, Any]] = []
+    plugin = _new_game_lifecycle_plugin(entry, submitted)
+    plugin.push_message = lambda **_kwargs: {"submitted": False}
+    ended = GameSnapshot(
+        mode="constructed",
+        phase="ended",
+        game_number=4,
+        result="won",
+    )
+
+    plugin._observe_game_event(
+        GameEvent("game_ended", 10, "won", 100.0, {"result": "won"}),
+        ended,
+    )
+    plugin._monitor = types.SimpleNamespace(
+        try_capture=lambda **_kwargs: (
+            GameSnapshot(mode="constructed", phase="mulligan", game_number=5),
+            types.SimpleNamespace(),
+            1,
+        )
+    )
+    plugin.push_message = lambda **kwargs: submitted.append(kwargs) or {"submitted": True}
+
+    assert plugin._retry_pending_game_lifecycle() is False
+    assert plugin._pending_game_lifecycle is None
+    assert submitted == []
+
+
+def test_successful_new_game_lifecycle_supersedes_an_old_ended_pending(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    submitted: list[dict[str, Any]] = []
+    plugin = _new_game_lifecycle_plugin(entry, submitted)
+    plugin.push_message = lambda **_kwargs: {"submitted": False}
+    plugin._observe_game_event(
+        GameEvent("game_ended", 10, "won", 100.0, {"result": "won"}),
+        GameSnapshot(mode="constructed", phase="ended", game_number=4, result="won"),
+    )
+    assert plugin._pending_game_lifecycle is not None
+
+    plugin.push_message = lambda **kwargs: submitted.append(kwargs) or {"submitted": True}
+    plugin._observe_game_event(
+        GameEvent("game_started", 5, "started", 101.0, {}),
+        GameSnapshot(mode="constructed", phase="mulligan", game_number=5),
+    )
+
+    assert [item["metadata"]["lifecycle_stage"] for item in submitted] == ["started"]
+    assert plugin._pending_game_lifecycle is None
+
+
+def test_rejected_lifecycle_keeps_original_deadline_and_consent_clears_it(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    submitted: list[dict[str, Any]] = []
+    plugin = _new_game_lifecycle_plugin(entry, submitted)
+    plugin.push_message = lambda **_kwargs: {"submitted": False}
+    snapshot = GameSnapshot(mode="constructed", phase="playing", game_number=4)
+    event = GameEvent("game_started", 5, "started", 100.0, {})
+
+    plugin._observe_game_event(event, snapshot)
+    first = plugin._pending_game_lifecycle
+    assert first is not None
+    plugin._monitor = types.SimpleNamespace(
+        try_capture=lambda **_kwargs: (snapshot, types.SimpleNamespace(), 1)
+    )
+    assert plugin._retry_pending_game_lifecycle() is False
+    assert plugin._pending_game_lifecycle.created_at == first.created_at
+    assert plugin._pending_game_lifecycle.expires_at == first.expires_at
+
+    plugin.cfg.llm_data_consent = False
+    plugin._restore_context()
+    assert plugin._pending_game_lifecycle is None
+    assert submitted == []
+
+
+def test_lifecycle_and_commentary_emit_only_one_terminal_response(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    submitted: list[dict[str, Any]] = []
+    plugin = _new_game_lifecycle_plugin(
+        entry,
+        submitted,
+        do_not_disturb=False,
+    )
+    event = GameEvent("game_ended", 10, "won", 102.0, {"result": "won"})
+    snapshot = GameSnapshot(
+        mode="constructed",
+        phase="ended",
+        game_number=7,
+        result="won",
+    )
+
+    plugin._observe_game_event(event, snapshot)
+    assert plugin._dispatch_llm("duplicate terminal", event, snapshot) is False
+
+    responses = [
+        item for item in submitted if item["metadata"]["kind"] == "game_lifecycle_reaction"
+    ]
+    assert len(responses) == 1
+
+
+def test_do_not_disturb_blocks_regular_commentary_but_not_lifecycle(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    submitted: list[dict[str, Any]] = []
+    plugin = _new_game_lifecycle_plugin(entry, submitted, do_not_disturb=True)
+    snapshot = GameSnapshot(mode="constructed", phase="playing", game_number=4)
+
+    plugin._observe_game_event(
+        GameEvent("game_started", 5, "started", 100.0, {}),
+        snapshot,
+    )
+    assert len(submitted) == 1
+    assert submitted[0]["metadata"]["kind"] == "game_lifecycle_reaction"
+    assert (
+        plugin._dispatch_llm(
+            "must stay silent",
+            GameEvent("game_started", 5, "started", 100.0, {}),
+            snapshot,
+        )
+        is False
+    )
+    assert not plugin._dispatch_llm(
+        "ordinary commentary",
+        GameEvent("hero_damaged", 9, "damaged", 101.0, {}),
+        snapshot,
+    )
+    assert len(submitted) == 1
+
+
+@pytest.mark.parametrize("transition", ["source_reset", "consent_revoked", "shutdown"])
+def test_lifecycle_submission_is_linearized_with_invalidating_transitions(
+    monkeypatch,
+    transition: str,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    submitted: list[dict[str, Any]] = []
+    plugin = _new_game_lifecycle_plugin(entry, submitted)
+    plugin._lifecycle_generation = 1
+    plugin._latest_lifecycle_request = 1
+    plugin._startup_task = None
+    plugin._config_reconcile_task = None
+    plugin._config_reconcile_accepting = False
+    plugin._config_revision = 0
+    plugin._settings_transition_revision = 0
+    plugin._consent_request_revision = 0
+    plugin._consent_revocation_pending = False
+    push_entered = threading.Event()
+    release_push = threading.Event()
+    transition_finished = threading.Event()
+
+    def push_message(**kwargs: Any) -> dict[str, bool]:
+        if kwargs.get("metadata", {}).get("kind") == "game_lifecycle_reaction":
+            push_entered.set()
+            assert release_push.wait(1.0)
+        submitted.append(kwargs)
+        return {"submitted": True}
+
+    plugin.push_message = push_message
+    snapshot = GameSnapshot(mode="constructed", phase="playing", game_number=4)
+    lifecycle_thread = threading.Thread(
+        target=lambda: plugin._observe_game_event(
+            GameEvent("game_started", 5, "started", 100.0, {}),
+            snapshot,
+        )
+    )
+
+    def invalidate() -> None:
+        if transition == "source_reset":
+            plugin._observe_game_event(
+                GameEvent("source_reset", 0, "reset", 101.0, {}),
+                GameSnapshot(),
+            )
+        elif transition == "consent_revoked":
+            updated = CompanionConfig(
+                llm_data_consent=False,
+                target_lanlan="兰兰A",
+            )
+            asyncio.run(
+                plugin.config_change(
+                    new_config={entry._CONFIG_SECTION: updated.to_dict()}
+                )
+            )
+        else:
+            async def shutdown() -> None:
+                plugin._begin_shutdown(expected_lifecycle_request=1)
+
+            asyncio.run(shutdown())
+        transition_finished.set()
+
+    lifecycle_thread.start()
+    assert push_entered.wait(1.0)
+    transition_thread = threading.Thread(target=invalidate)
+    transition_thread.start()
+    assert not transition_finished.wait(0.05)
+
+    release_push.set()
+    lifecycle_thread.join(1.0)
+    transition_thread.join(1.0)
+
+    assert not lifecycle_thread.is_alive()
+    assert not transition_thread.is_alive()
+    assert transition_finished.is_set()
+    lifecycle_responses = [
+        item
+        for item in submitted
+        if item.get("metadata", {}).get("kind") == "game_lifecycle_reaction"
+    ]
+    assert len(lifecycle_responses) == 1
+    if transition == "source_reset":
+        assert plugin._game_lifecycle_epoch == 1
+        assert plugin._game_lifecycle_sent == {}
+    elif transition == "consent_revoked":
+        assert plugin.cfg.llm_data_consent is False
+        assert plugin._pending_game_lifecycle is None
+    else:
+        assert plugin._started is False
+        assert plugin._monitor_dispatch_enabled is False
+        assert plugin._pending_game_lifecycle is None
+
+
 def test_game_context_is_read_silently_and_visible_words_use_respond(monkeypatch) -> None:
     entry = _load_sdk_entry(monkeypatch)
     submitted: list[dict[str, Any]] = []
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
     plugin.cfg = CompanionConfig(
-        llm_commentary_enabled=True,
+        llm_do_not_disturb=False,
         llm_data_consent=True,
         target_lanlan="兰兰A",
     )
@@ -3059,7 +3650,7 @@ def test_game_context_is_read_silently_and_visible_words_use_respond(monkeypatch
     assert plugin._live_state_segments == ()
 
 
-def test_bootstrap_state_ready_does_not_duplicate_monitor_snapshot_delivery(monkeypatch) -> None:
+def test_bootstrap_state_ready_sends_one_resumed_lifecycle_reaction(monkeypatch) -> None:
     entry = _load_sdk_entry(monkeypatch)
     submitted: list[dict[str, Any]] = []
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
@@ -3077,7 +3668,12 @@ def test_bootstrap_state_ready_does_not_duplicate_monitor_snapshot_delivery(monk
         GameSnapshot(mode="battlegrounds", phase="recruit", game_number=3),
     )
 
-    assert submitted == []
+    assert len(submitted) == 1
+    assert submitted[0]["metadata"]["kind"] == "game_lifecycle_reaction"
+    assert submitted[0]["metadata"]["lifecycle_stage"] == "resumed"
+    prompt = submitted[0]["parts"][0]["text"]
+    assert "重新接上" in prompt
+    assert "确认一场新对局刚刚开始" not in prompt
 
 
 def test_bootstrap_state_ready_respects_data_consent(monkeypatch) -> None:
@@ -3108,7 +3704,7 @@ def test_live_state_is_shared_silently_to_explicit_target(
     submitted: list[dict[str, Any]] = []
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
     plugin.cfg = CompanionConfig(
-        llm_commentary_enabled=False,
+        llm_do_not_disturb=True,
         llm_data_consent=True,
         target_lanlan="当前角色",
     )
@@ -3940,7 +4536,7 @@ def test_unresolved_current_role_refuses_background_state_without_querying_bus(
 
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
     plugin.cfg = CompanionConfig(
-        llm_commentary_enabled=True,
+        llm_do_not_disturb=False,
         llm_data_consent=True,
     )
     plugin._context_target = None
@@ -3979,7 +4575,10 @@ def test_user_context_ignores_other_roles_when_target_is_configured(
 ) -> None:
     entry = _load_sdk_entry(monkeypatch)
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
-    plugin.cfg = CompanionConfig(llm_data_consent=True, target_lanlan="role-a")
+    plugin.cfg = CompanionConfig(
+        llm_data_consent=True,
+        target_lanlan="role-a",
+    )
     plugin._ownership_lock = threading.RLock()
     plugin._query_ledger = entry.QueryLedger()
     plugin._session_target = ""
@@ -4429,7 +5028,10 @@ def test_live_query_fallback_does_not_submit_after_game_end_clears_claim(
     entry = _load_sdk_entry(monkeypatch)
     submitted: list[dict[str, Any]] = []
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
-    plugin.cfg = CompanionConfig(llm_data_consent=True, target_lanlan="role-a")
+    plugin.cfg = CompanionConfig(
+        llm_data_consent=True,
+        target_lanlan="role-a",
+    )
     plugin._ownership_lock = threading.RLock()
     plugin._delivery_lock = threading.RLock()
     plugin._settings_transition = False
@@ -4458,12 +5060,16 @@ def test_live_query_fallback_does_not_submit_after_game_end_clears_claim(
     plugin._resolve_live_query_payload = end_game_during_resolution
 
     assert asyncio.run(plugin._dispatch_live_query_fallback(claim)) is False
-    assert submitted == []
+    assert len(submitted) == 1
+    assert submitted[0]["metadata"]["kind"] == "game_lifecycle_reaction"
+    assert submitted[0]["metadata"]["lifecycle_stage"] == "ended"
 
 
 def test_game_end_clears_pending_live_queries(monkeypatch) -> None:
     entry = _load_sdk_entry(monkeypatch)
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig()
+    plugin._ownership_lock = threading.RLock()
     plugin._query_ledger = entry.QueryLedger()
     plugin._query_ledger.observe(
         "现在第几回合",
@@ -4865,7 +5471,7 @@ def test_shared_notice_requires_cleanup_for_privacy_and_routing_changes(
         CompanionConfig(
             log_path="old.log",
             llm_data_consent=True,
-            llm_commentary_enabled=True,
+            llm_do_not_disturb=False,
             target_lanlan="lanlan-a",
         ),
     ) is False
@@ -4875,7 +5481,10 @@ def test_stale_state_expires_live_segments_and_explicit_publish_resumes_them(mon
     entry = _load_sdk_entry(monkeypatch)
     submitted: list[dict[str, Any]] = []
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
-    plugin.cfg = CompanionConfig(llm_data_consent=True, target_lanlan="lanlan-a")
+    plugin.cfg = CompanionConfig(
+        llm_data_consent=True,
+        target_lanlan="lanlan-a",
+    )
     plugin._live_state_shared = True
     plugin._live_state_target = "lanlan-a"
     plugin._live_state_segments = ("core",)
@@ -4899,7 +5508,22 @@ def test_stale_state_expires_live_segments_and_explicit_publish_resumes_them(mon
     )
     assert plugin._publish_live_state(snapshot) is True
 
-    assert [item["metadata"]["context_expired"] for item in submitted] == [True, False]
+    context_updates = [
+        item
+        for item in submitted
+        if "context_expired" in item["metadata"]
+    ]
+    assert [item["metadata"]["context_expired"] for item in context_updates] == [
+        True,
+        False,
+    ]
+    lifecycle = [
+        item
+        for item in submitted
+        if item["metadata"].get("kind") == "game_lifecycle_reaction"
+    ]
+    assert len(lifecycle) == 1
+    assert lifecycle[0]["metadata"]["lifecycle_stage"] == "resumed"
     assert plugin._live_state_shared is True
     assert plugin._live_state_target == "lanlan-a"
 
@@ -4974,12 +5598,61 @@ def test_sync_active_context_returns_quickly_while_monitor_refreshes(monkeypatch
     assert plugin._context_target == "lanlan-a"
 
 
+def test_sync_active_context_rejects_a_snapshot_from_a_replaced_source_generation(
+    monkeypatch,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    submitted: list[dict[str, Any]] = []
+    old_snapshot = GameSnapshot(mode="constructed", phase="playing", game_number=3)
+    new_snapshot = GameSnapshot(mode="constructed", phase="mulligan", game_number=4)
+    now = time.time()
+    runtime = types.SimpleNamespace(
+        source_state="watching",
+        monitor_running=True,
+        last_line_at=now,
+        last_event_at=now,
+        source_modified_at=now,
+    )
+
+    class Monitor:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def try_capture(self, *, timeout_seconds: float) -> tuple[GameSnapshot, Any, int]:
+            self.calls += 1
+            if self.calls == 1:
+                return old_snapshot, runtime, 1
+            return new_snapshot, runtime, 2
+
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(llm_data_consent=True, target_lanlan="lanlan-a")
+    plugin._ownership_lock = threading.RLock()
+    plugin._delivery_lock = threading.RLock()
+    plugin._started = True
+    plugin._monitor_dispatch_enabled = True
+    plugin._settings_transition = False
+    plugin._live_state_shared = False
+    plugin._live_state_target = ""
+    plugin._live_state_segments = ()
+    plugin._live_state_game_number = 0
+    plugin._live_state_snapshot = None
+    plugin._live_state_published_at = 0.0
+    plugin._monitor = monitor = Monitor()
+    plugin.push_message = lambda **kwargs: submitted.append(kwargs) or {"submitted": True}
+
+    plugin._sync_active_game_context()
+
+    assert monitor.calls >= 2
+    assert submitted == []
+    assert plugin._live_state_shared is False
+
+
 def test_recent_user_chat_suppresses_noncritical_proactive_commentary(monkeypatch) -> None:
     entry = _load_sdk_entry(monkeypatch)
     submitted: list[dict[str, Any]] = []
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
     plugin.cfg = CompanionConfig(
-        llm_commentary_enabled=True,
+        llm_do_not_disturb=False,
         llm_data_consent=True,
         user_chat_quiet_window_seconds=30.0,
         target_lanlan="兰兰A",
@@ -5007,7 +5680,7 @@ def test_recent_user_chat_suppresses_priority_eight_but_not_nine(monkeypatch) ->
     submitted: list[dict[str, Any]] = []
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
     plugin.cfg = CompanionConfig(
-        llm_commentary_enabled=True,
+        llm_do_not_disturb=False,
         llm_data_consent=True,
         user_chat_quiet_window_seconds=30.0,
         target_lanlan="兰兰A",
@@ -5035,12 +5708,14 @@ def test_recent_user_chat_suppresses_priority_eight_but_not_nine(monkeypatch) ->
     assert [item["ai_behavior"] for item in submitted] == ["respond"]
 
 
-def test_critical_commentary_queues_same_key_tombstone_after_terminal_response(monkeypatch) -> None:
+def test_terminal_event_cannot_fall_back_to_commentary_when_lifecycle_is_disabled(
+    monkeypatch,
+) -> None:
     entry = _load_sdk_entry(monkeypatch)
     submitted: list[dict[str, Any]] = []
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
     plugin.cfg = CompanionConfig(
-        llm_commentary_enabled=True,
+        llm_do_not_disturb=False,
         llm_data_consent=True,
         target_lanlan="兰兰A",
     )
@@ -5065,14 +5740,9 @@ def test_critical_commentary_queues_same_key_tombstone_after_terminal_response(m
         terminal,
         GameSnapshot(mode="battlegrounds", phase="ended"),
     )
-    plugin._observe_game_event(terminal, GameSnapshot(mode="battlegrounds", phase="ended"))
-
-    assert accepted is True
-    assert [item["ai_behavior"] for item in submitted] == ["respond", "respond"]
-    assert "# 炉石当前局势查询" in submitted[1]["parts"][0]["text"]
-    assert "context_expired" not in submitted[1]["metadata"]
-    assert submitted[0]["coalesce_key"] == submitted[1]["coalesce_key"]
-    assert submitted[1]["target_lanlan"] == "兰兰A"
+    assert accepted is False
+    assert [item["ai_behavior"] for item in submitted] == ["respond"]
+    assert submitted[0]["metadata"]["event_kind"] == "battlegrounds_triple"
 
 
 def test_commentary_rejection_is_reported_without_hidden_context_injection(monkeypatch) -> None:
@@ -5080,7 +5750,7 @@ def test_commentary_rejection_is_reported_without_hidden_context_injection(monke
     submitted: list[dict[str, Any]] = []
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
     plugin.cfg = CompanionConfig(
-        llm_commentary_enabled=True,
+        llm_do_not_disturb=False,
         llm_data_consent=True,
         target_lanlan="兰兰A",
     )
@@ -5111,7 +5781,7 @@ def test_live_state_cleanup_rejection_keeps_segments_for_retry_after_consent_rac
     submitted: list[dict[str, Any]] = []
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
     plugin.cfg = CompanionConfig(
-        llm_commentary_enabled=True,
+        llm_do_not_disturb=False,
         llm_data_consent=True,
         target_lanlan="兰兰A",
     )
@@ -5131,7 +5801,7 @@ def test_live_state_cleanup_rejection_keeps_segments_for_retry_after_consent_rac
         if len(submitted) == 1:
             with plugin._ownership_lock:
                 plugin.cfg = CompanionConfig(
-                    llm_commentary_enabled=False,
+                    llm_do_not_disturb=True,
                     llm_data_consent=False,
                     target_lanlan="兰兰A",
                 )
@@ -5172,7 +5842,7 @@ def test_target_change_expires_old_live_state_before_publishing_to_new_role(monk
     submitted: list[dict[str, Any]] = []
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
     plugin.cfg = CompanionConfig(
-        llm_commentary_enabled=True,
+        llm_do_not_disturb=False,
         llm_data_consent=True,
         target_lanlan="兰兰A",
     )
@@ -5192,7 +5862,7 @@ def test_target_change_expires_old_live_state_before_publishing_to_new_role(monk
     first_count = len(submitted)
 
     plugin.cfg = CompanionConfig(
-        llm_commentary_enabled=True,
+        llm_do_not_disturb=False,
         llm_data_consent=True,
         target_lanlan="兰兰B",
     )
@@ -5217,7 +5887,7 @@ def test_empty_config_uses_chat_context_role_for_commentary(
     submitted: list[dict[str, Any]] = []
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
     plugin.cfg = CompanionConfig(
-        llm_commentary_enabled=True,
+        llm_do_not_disturb=False,
         llm_data_consent=True,
     )
     plugin._context_target = None
@@ -5507,7 +6177,7 @@ def test_live_state_publish_does_not_call_tool_registry_http(
     submitted: list[dict[str, Any]] = []
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
     plugin.cfg = CompanionConfig(
-        llm_commentary_enabled=True,
+        llm_do_not_disturb=False,
         llm_data_consent=True,
         target_lanlan="角色A",
     )
@@ -5553,7 +6223,7 @@ def test_sdk_routes_context_and_commentary_to_explicit_configured_role(monkeypat
     submitted: list[dict[str, Any]] = []
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
     plugin.cfg = CompanionConfig(
-        llm_commentary_enabled=True,
+        llm_do_not_disturb=False,
         llm_data_consent=True,
         llm_max_reply_chars=80,
         target_lanlan="当前角色",
@@ -5635,9 +6305,9 @@ def test_sdk_routes_context_and_commentary_to_explicit_configured_role(monkeypat
     assert "PRIVATE_CHOICE_SENTINEL" not in submitted[-1]["parts"][0]["text"]
     assert "只允许主动询问读取的发现选项" not in submitted[-1]["parts"][0]["text"]
     assert plugin._dispatch_llm(
-        "terminal prompt",
-        GameEvent("battlegrounds_game_ended", 10, "ended", 101.0, {"placement": 1}),
-        GameSnapshot(mode="battlegrounds", phase="ended"),
+        "third ordinary prompt",
+        GameEvent("card_played", 9, "played", 101.0, {"card_id": "PUBLIC_CARD"}),
+        GameSnapshot(mode="constructed", phase="playing"),
     )
 
     assert [item["ai_behavior"] for item in submitted] == ["respond"] * 3
@@ -5739,7 +6409,7 @@ def test_config_change_applies_host_effective_config_without_redumping(monkeypat
     plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
     updated = CompanionConfig(
         llm_data_consent=False,
-        llm_commentary_enabled=False,
+        llm_do_not_disturb=True,
         overlay_font_size=35,
     )
 
@@ -5768,7 +6438,7 @@ def test_config_change_does_not_wait_for_settings_lock_and_revokes_consent_immed
     monitor_updates: list[CompanionConfig] = []
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
     plugin.cfg = CompanionConfig(
-        llm_commentary_enabled=True,
+        llm_do_not_disturb=False,
         llm_data_consent=True,
     )
     plugin._context_target = None
@@ -5785,7 +6455,7 @@ def test_config_change_does_not_wait_for_settings_lock_and_revokes_consent_immed
     )
     plugin.logger = types.SimpleNamespace(warning=lambda *_args: None)
     updated = CompanionConfig(
-        llm_commentary_enabled=False,
+        llm_do_not_disturb=True,
         llm_data_consent=False,
     )
 
@@ -5799,7 +6469,7 @@ def test_config_change_does_not_wait_for_settings_lock_and_revokes_consent_immed
                 timeout=0.05,
             )
             assert plugin.cfg.llm_data_consent is False
-            assert plugin.cfg.llm_commentary_enabled is False
+            assert plugin.cfg.llm_do_not_disturb is True
             assert monitor_updates == []
         finally:
             plugin._settings_lock.release()
@@ -5811,7 +6481,7 @@ def test_config_change_does_not_wait_for_settings_lock_and_revokes_consent_immed
     assert result["status"] == "accepted"
     assert len(monitor_updates) == 1
     assert monitor_updates[0].llm_data_consent is False
-    assert monitor_updates[0].llm_commentary_enabled is False
+    assert monitor_updates[0].llm_do_not_disturb is True
 
 
 def test_older_settings_transaction_cannot_reopen_newer_consent_revocation(
@@ -5823,7 +6493,7 @@ def test_older_settings_transaction_cannot_reopen_newer_consent_revocation(
     monitor_consents: list[bool] = []
     sync_states: list[tuple[bool, bool]] = []
     base = CompanionConfig(
-        llm_commentary_enabled=True,
+        llm_do_not_disturb=False,
         llm_data_consent=True,
         overlay_font_size=24,
     )
@@ -5892,7 +6562,7 @@ def test_older_settings_transaction_cannot_reopen_newer_consent_revocation(
     assert sync_states
     assert all(consent is False for consent, _transition in sync_states)
     assert plugin.cfg.llm_data_consent is False
-    assert plugin.cfg.llm_commentary_enabled is False
+    assert plugin.cfg.llm_do_not_disturb is False
     assert plugin._settings_transition is False
 
 
@@ -6202,7 +6872,7 @@ def test_consent_revocation_updates_monitor_without_holding_ownership_lock(
     monkeypatch,
 ) -> None:
     entry = _load_sdk_entry(monkeypatch)
-    current = CompanionConfig(llm_commentary_enabled=True, llm_data_consent=True)
+    current = CompanionConfig(llm_do_not_disturb=False, llm_data_consent=True)
 
     class Monitor:
         def update_config(self, _config: CompanionConfig) -> None:
@@ -6250,6 +6920,7 @@ def test_consent_revocation_updates_monitor_without_holding_ownership_lock(
     result = asyncio.run(plugin.save_settings(llm_data_consent=False))
 
     assert result["llm_enabled"] is False
+    assert result["lifecycle_enabled"] is False
     assert plugin.cfg.llm_data_consent is False
     assert plugin._monitor_applied_config.llm_data_consent is False
 
@@ -6274,7 +6945,7 @@ def test_config_change_with_missing_effective_section_degrades_fail_closed(monke
     assert result["status"] == "degraded"
     assert result["restart_required"] is True
     assert plugin.cfg.llm_data_consent is False
-    assert plugin.cfg.llm_commentary_enabled is False
+    assert plugin.cfg.llm_do_not_disturb is True
     assert plugin._config_runtime_error_codes == ("config:invalid_effective_section",)
 
 
@@ -6317,7 +6988,7 @@ def test_config_change_revocation_stays_fail_closed_when_context_restore_is_reje
 
     assert result["status"] == "accepted"
     assert plugin.cfg.llm_data_consent is False
-    assert plugin.cfg.llm_commentary_enabled is False
+    assert plugin.cfg.llm_do_not_disturb is True
     assert monitor_updates
     assert all(config.llm_data_consent is False for config in monitor_updates)
     assert plugin._live_state_shared is True
@@ -6369,7 +7040,7 @@ def test_config_change_revocation_restores_context_and_resets_transition_when_mo
 
     assert result["status"] == "accepted"
     assert plugin.cfg.llm_data_consent is False
-    assert plugin.cfg.llm_commentary_enabled is False
+    assert plugin.cfg.llm_do_not_disturb is True
     assert plugin._settings_transition is False
     assert plugin._live_state_shared is False
     assert plugin._live_state_segments == ()
@@ -6527,7 +7198,7 @@ def test_save_settings_patches_only_explicit_fields(monkeypatch) -> None:
     patches: list[dict[str, Any]] = []
     current = CompanionConfig(
         log_path="custom.log",
-        llm_commentary_enabled=True,
+        llm_do_not_disturb=False,
         llm_data_consent=True,
         target_lanlan="兰兰A",
         overlay_height_percent=41,
@@ -6563,6 +7234,69 @@ def test_save_settings_patches_only_explicit_fields(monkeypatch) -> None:
     assert plugin.cfg.target_lanlan == "兰兰A"
     assert plugin.cfg.overlay_height_percent == 41
     assert plugin.cfg.overlay_font_size == 29
+
+
+def test_sparse_save_preserves_legacy_profile_commentary_preference(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    with (PROJECT_ROOT / "plugin.toml").open("rb") as handle:
+        manifest_section = dict(tomllib.load(handle)[entry._CONFIG_SECTION])
+    with (PROJECT_ROOT / "config.example.toml").open("rb") as handle:
+        runtime_section = dict(tomllib.load(handle)[entry._CONFIG_SECTION])
+    active_profile: dict[str, Any] = {"llm_commentary_enabled": True}
+    profile_patches: list[tuple[str, dict[str, Any]]] = []
+
+    def effective_section() -> dict[str, Any]:
+        return {**manifest_section, **runtime_section, **active_profile}
+
+    class Config:
+        async def profile_active(self, **_kwargs: Any) -> str:
+            return "legacy"
+
+        async def profile_update(
+            self,
+            profile_name: str,
+            patch: dict[str, Any],
+            **_kwargs: Any,
+        ) -> dict[str, Any]:
+            profile_patches.append((profile_name, patch))
+            active_profile.update(patch[entry._CONFIG_SECTION])
+            return {entry._CONFIG_SECTION: dict(active_profile)}
+
+        async def update(self, _patch: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+            raise AssertionError("active-profile settings must not be written to runtime config")
+
+        async def dump(self, **_kwargs: Any) -> dict[str, Any]:
+            return {entry._CONFIG_SECTION: effective_section()}
+
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig.from_mapping(effective_section())
+    plugin._context_target = None
+    plugin._ownership_lock = threading.RLock()
+    plugin._settings_lock = asyncio.Lock()
+    plugin._settings_transition = False
+    plugin._started = True
+    plugin.ctx = types.SimpleNamespace(_current_lanlan="")
+    plugin.config = Config()
+    plugin._monitor = types.SimpleNamespace(update_config=lambda _config: None)
+    plugin._catalog = types.SimpleNamespace(configure=lambda **_kwargs: None)
+    plugin._overlay = types.SimpleNamespace(
+        status=lambda: {"running": False},
+        configure=lambda _config: None,
+    )
+    plugin._ensure_monitor = lambda: plugin._monitor
+
+    result = asyncio.run(plugin.save_settings(log_path="new.log"))
+
+    assert result["llm_enabled"] is True
+    assert profile_patches == [
+        ("legacy", {entry._CONFIG_SECTION: {"log_path": "new.log"}})
+    ]
+    assert active_profile["log_path"] == "new.log"
+    assert active_profile["llm_commentary_enabled"] is True
+    assert runtime_section["llm_commentary_enabled"] is False
+    assert "log_path" not in runtime_section or runtime_section["log_path"] == ""
+    assert "llm_do_not_disturb" not in runtime_section
+    assert plugin.cfg.llm_do_not_disturb is False
 
 
 def test_save_settings_persist_failure_does_not_log_private_path(monkeypatch) -> None:
@@ -6747,7 +7481,7 @@ def test_save_settings_succeeds_without_hearthstone_or_power_log(monkeypatch) ->
     result = asyncio.run(
         plugin.save_settings(
             llm_data_consent=True,
-            llm_commentary_enabled=True,
+            llm_do_not_disturb=False,
         )
     )
 
@@ -6755,6 +7489,7 @@ def test_save_settings_succeeds_without_hearthstone_or_power_log(monkeypatch) ->
     assert persisted == [
         {
             entry._CONFIG_SECTION: {
+                "llm_do_not_disturb": False,
                 "llm_commentary_enabled": True,
                 "llm_data_consent": True,
             }
@@ -6998,7 +7733,7 @@ def test_consent_revocation_blocks_dispatch_before_config_write_finishes(monkeyp
                 entered.set()
                 await release.wait()
                 section = CompanionConfig(
-                    llm_commentary_enabled=False,
+                    llm_do_not_disturb=True,
                     llm_data_consent=False,
                     target_lanlan="兰兰A",
                 ).to_dict()
@@ -7011,7 +7746,7 @@ def test_consent_revocation_blocks_dispatch_before_config_write_finishes(monkeyp
         )
         plugin = object.__new__(entry.HearthstoneCompanionPlugin)
         plugin.cfg = CompanionConfig(
-            llm_commentary_enabled=True,
+            llm_do_not_disturb=False,
             llm_data_consent=True,
             target_lanlan="兰兰A",
         )
@@ -7036,7 +7771,7 @@ def test_consent_revocation_blocks_dispatch_before_config_write_finishes(monkeyp
 
         task = asyncio.create_task(
             plugin.save_settings(
-                llm_commentary_enabled=False,
+                llm_do_not_disturb=True,
                 llm_data_consent=False,
                 target_lanlan="兰兰A",
             )
@@ -7077,7 +7812,7 @@ def test_consent_revocation_fails_closed_before_waiting_for_settings_lock(
 
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
     plugin.cfg = CompanionConfig(
-        llm_commentary_enabled=True,
+        llm_do_not_disturb=False,
         llm_data_consent=True,
     )
     plugin._context_target = None
@@ -7102,7 +7837,7 @@ def test_consent_revocation_fails_closed_before_waiting_for_settings_lock(
         task = asyncio.create_task(plugin.save_settings(llm_data_consent=False))
         await asyncio.sleep(0)
         assert plugin.cfg.llm_data_consent is False
-        assert plugin.cfg.llm_commentary_enabled is False
+        assert plugin.cfg.llm_do_not_disturb is False
         assert plugin._settings_transition is True
         assert not update_entered.is_set()
         plugin._settings_lock.release()
@@ -7127,7 +7862,7 @@ def test_failed_live_state_expiration_still_persists_and_applies_consent_revocat
         async def update(self, patch: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
             persisted.append(patch)
             section = CompanionConfig(
-                llm_commentary_enabled=False,
+                llm_do_not_disturb=True,
                 llm_data_consent=False,
                 target_lanlan="兰兰A",
             ).to_dict()
@@ -7137,7 +7872,7 @@ def test_failed_live_state_expiration_still_persists_and_applies_consent_revocat
         monitor = types.SimpleNamespace(update_config=lambda _config: None)
         plugin = object.__new__(entry.HearthstoneCompanionPlugin)
         plugin.cfg = CompanionConfig(
-            llm_commentary_enabled=True,
+            llm_do_not_disturb=False,
             llm_data_consent=True,
             target_lanlan="兰兰A",
         )
@@ -7161,7 +7896,7 @@ def test_failed_live_state_expiration_still_persists_and_applies_consent_revocat
         plugin._ensure_monitor = lambda: monitor
         plugin.push_message = lambda **_kwargs: {"submitted": False}
         result = await plugin.save_settings(
-            llm_commentary_enabled=False,
+            llm_do_not_disturb=True,
             llm_data_consent=False,
             target_lanlan="兰兰A",
         )
@@ -7172,7 +7907,7 @@ def test_failed_live_state_expiration_still_persists_and_applies_consent_revocat
     assert isinstance(result, FakeErr)
     assert persisted[0][entry._CONFIG_SECTION]["llm_data_consent"] is False
     assert plugin.cfg.llm_data_consent is False
-    assert plugin.cfg.llm_commentary_enabled is False
+    assert plugin.cfg.llm_do_not_disturb is True
     assert plugin._settings_transition is False
     assert plugin._live_state_shared is True
     assert plugin._live_state_target == "兰兰A"
@@ -7199,7 +7934,7 @@ def test_reload_and_save_settings_are_serialized(monkeypatch) -> None:
                 await release_dump.wait()
                 return {
                     entry._CONFIG_SECTION: CompanionConfig(
-                        llm_commentary_enabled=True,
+                        llm_do_not_disturb=False,
                         llm_data_consent=True,
                     ).to_dict()
                 }
@@ -7207,7 +7942,7 @@ def test_reload_and_save_settings_are_serialized(monkeypatch) -> None:
             async def update(self, patch: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
                 update_entered.set()
                 merged = CompanionConfig(
-                    llm_commentary_enabled=True,
+                    llm_do_not_disturb=False,
                     llm_data_consent=True,
                 ).to_dict()
                 merged.update(patch[entry._CONFIG_SECTION])
@@ -7215,7 +7950,7 @@ def test_reload_and_save_settings_are_serialized(monkeypatch) -> None:
 
         monitor = types.SimpleNamespace(update_config=lambda _config: None)
         plugin = object.__new__(entry.HearthstoneCompanionPlugin)
-        plugin.cfg = CompanionConfig(llm_commentary_enabled=True, llm_data_consent=True)
+        plugin.cfg = CompanionConfig(llm_do_not_disturb=False, llm_data_consent=True)
         plugin._context_target = None
         plugin._ownership_lock = threading.RLock()
         plugin._settings_lock = asyncio.Lock()
@@ -7239,7 +7974,7 @@ def test_reload_and_save_settings_are_serialized(monkeypatch) -> None:
         await dump_entered.wait()
         save_task = asyncio.create_task(
             plugin.save_settings(
-                llm_commentary_enabled=False,
+                llm_do_not_disturb=True,
                 llm_data_consent=False,
                 card_catalog_network_enabled=False,
             )
@@ -7255,7 +7990,7 @@ def test_reload_and_save_settings_are_serialized(monkeypatch) -> None:
 
     assert result["llm_enabled"] is False
     assert plugin.cfg.llm_data_consent is False
-    assert plugin.cfg.llm_commentary_enabled is False
+    assert plugin.cfg.llm_do_not_disturb is True
     assert plugin.cfg.card_catalog_network_enabled is False
     assert catalog_configs[-1] == (False, 24.0)
     assert plugin._settings_transition is False
@@ -7615,7 +8350,7 @@ def test_settings_transition_resets_when_fail_closed_update_raises(monkeypatch) 
 
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
     plugin.cfg = CompanionConfig(
-        llm_commentary_enabled=True,
+        llm_do_not_disturb=False,
         llm_data_consent=True,
     )
     plugin._context_target = None
@@ -7639,7 +8374,7 @@ def test_settings_transition_resets_when_fail_closed_update_raises(monkeypatch) 
     assert persisted[0][entry._CONFIG_SECTION]["llm_data_consent"] is False
     assert plugin._settings_transition is False
     assert plugin.cfg.llm_data_consent is False
-    assert plugin.cfg.llm_commentary_enabled is False
+    assert plugin.cfg.llm_do_not_disturb is True
 
 
 def test_clear_stats_timeout_confirms_serial_compensation(monkeypatch) -> None:
@@ -8461,7 +9196,7 @@ def test_shutdown_cancels_config_reconcile_without_waiting_for_settings_lock(
 def test_commentary_reports_error_when_no_output_channel_accepts(monkeypatch) -> None:
     entry = _load_sdk_entry(monkeypatch)
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
-    plugin.cfg = CompanionConfig(llm_commentary_enabled=False, llm_data_consent=False)
+    plugin.cfg = CompanionConfig(llm_do_not_disturb=True, llm_data_consent=False)
     plugin._ownership_lock = threading.RLock()
     plugin._overlay = types.SimpleNamespace(push=lambda *_args, **_kwargs: False)
     plugin._ensure_monitor = lambda: types.SimpleNamespace(snapshot=GameSnapshot)
@@ -8475,7 +9210,7 @@ def test_commentary_reports_error_when_no_output_channel_accepts(monkeypatch) ->
 def test_commentary_reports_error_when_character_rejects_but_overlay_accepts(monkeypatch) -> None:
     entry = _load_sdk_entry(monkeypatch)
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
-    plugin.cfg = CompanionConfig(llm_commentary_enabled=True, llm_data_consent=True)
+    plugin.cfg = CompanionConfig(llm_do_not_disturb=False, llm_data_consent=True)
     plugin._ownership_lock = threading.RLock()
     plugin._context_target = None
     plugin._started = True
@@ -8621,9 +9356,12 @@ def test_start_monitoring_opens_dispatch_gate_before_state_ready(monkeypatch) ->
 
     assert result["started"] is True
     assert plugin._monitor_dispatch_enabled is True
-    assert len(submitted) == 1
-    assert submitted[0]["ai_behavior"] == "read"
-    assert submitted[0]["metadata"]["kind"] == "game_live_state"
+    assert len(submitted) == 2
+    assert submitted[0]["ai_behavior"] == "respond"
+    assert submitted[0]["metadata"]["kind"] == "game_lifecycle_reaction"
+    assert submitted[0]["metadata"]["lifecycle_stage"] == "resumed"
+    assert submitted[1]["ai_behavior"] == "read"
+    assert submitted[1]["metadata"]["kind"] == "game_live_state"
     assert plugin._live_state_shared is True
     assert plugin._live_state_target == "兰兰A"
 
@@ -8895,13 +9633,13 @@ def test_active_outputs_and_stats_require_monitor_applied_config(monkeypatch) ->
 
     old = CompanionConfig(
         log_path="old/Power.log",
-        llm_commentary_enabled=True,
+        llm_do_not_disturb=False,
         llm_data_consent=True,
         target_lanlan="兰兰A",
     )
     new = CompanionConfig(
         log_path="new/Power.log",
-        llm_commentary_enabled=True,
+        llm_do_not_disturb=False,
         llm_data_consent=True,
         target_lanlan="兰兰A",
     )
@@ -8965,7 +9703,7 @@ def test_active_outputs_and_stats_require_monitor_applied_config(monkeypatch) ->
     assert submitted[0]["metadata"]["kind"] == "game_live_state"
     assert submitted[1]["metadata"]["kind"] == "catgirl_commentary"
     assert len(recorded) == 1
-    assert monitor.capture_calls == 1
+    assert monitor.capture_calls >= 2
 
 
 @pytest.mark.parametrize("tool_name", ["current_state", "battlegrounds_advice"])
@@ -9101,7 +9839,7 @@ def test_battlegrounds_advice_separates_local_evidence_from_global_meta(monkeypa
         ),
     )
     plugin = types.SimpleNamespace(
-        cfg=CompanionConfig(llm_commentary_enabled=False, llm_data_consent=True),
+        cfg=CompanionConfig(llm_do_not_disturb=True, llm_data_consent=True),
         _season={"key": "season-14-36.2", "status": "bundled_static"},
         _stats=stats,
         _ensure_monitor=lambda: types.SimpleNamespace(

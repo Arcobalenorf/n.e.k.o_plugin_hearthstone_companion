@@ -5,6 +5,7 @@ import importlib
 import json
 import sys
 import types
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -125,10 +126,31 @@ def replay(path: Path, *, label: str) -> dict[str, Any]:
     last_active = None
     richest_recruit = None
     richest_recruit_score: tuple[int, int, int] | None = None
+    event_counts: Counter[str] = Counter()
+    lifecycle_events: list[dict[str, Any]] = []
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
             lines_seen += 1
-            parser.feed_line(line, now=1_780_000_000.0)
+            events = parser.feed_line(line, now=1_780_000_000.0)
+            event_counts.update(event.kind for event in events)
+            for event in events:
+                if event.kind not in {
+                    "game_started",
+                    "game_ended",
+                    "battlegrounds_game_ended",
+                }:
+                    continue
+                event_snapshot = parser.snapshot()
+                lifecycle_events.append(
+                    {
+                        "kind": event.kind,
+                        "match_id": event_snapshot.game_number,
+                        "mode": event_snapshot.mode,
+                        "phase": event_snapshot.phase,
+                        "result": event.details.get("result"),
+                        "placement": event.details.get("placement"),
+                    }
+                )
             revision = int(getattr(parser, "_public_revision", 0))
             if revision == last_revision:
                 continue
@@ -169,6 +191,8 @@ def replay(path: Path, *, label: str) -> dict[str, Any]:
         "bytes_read": path.stat().st_size,
         "lines_seen": lines_seen,
         "mode_transitions": modes,
+        "event_counts": dict(sorted(event_counts.items())),
+        "lifecycle_events": lifecycle_events,
         "final": _snapshot_summary(final),
         "last_active": _snapshot_summary(last_active) if last_active is not None else None,
         "richest_recruit": (

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -50,7 +51,7 @@ def _run_bootstrap_batches(
     monitor = CompanionMonitor(
         CompanionConfig(
             poll_interval_seconds=0.1,
-            llm_commentary_enabled=True,
+            llm_do_not_disturb=False,
             llm_data_consent=True,
         ),
         _logger(),
@@ -72,7 +73,7 @@ def test_monitor_never_generates_local_visible_commentary() -> None:
     llm_prompts: list[str] = []
     observed: list[str] = []
     monitor = CompanionMonitor(
-        CompanionConfig(llm_commentary_enabled=False, llm_data_consent=False),
+        CompanionConfig(llm_do_not_disturb=True, llm_data_consent=False),
         _logger(),
         on_llm=lambda prompt, event, snapshot: bool(llm_prompts.append(prompt)),
         on_event=lambda event, snapshot: observed.append(event.kind),
@@ -87,6 +88,108 @@ def test_monitor_never_generates_local_visible_commentary() -> None:
     assert llm_prompts == []
     assert observed == ["battlegrounds_triple"]
     assert monitor.status().llm_submissions == 0
+
+
+def test_event_callback_receives_the_validated_source_generation() -> None:
+    observed: list[tuple[str, int | None]] = []
+    monitor = CompanionMonitor(
+        CompanionConfig(),
+        _logger(),
+        on_llm=lambda _prompt, _event, _snapshot: False,
+        on_event=lambda event, _snapshot, generation: observed.append(
+            (event.kind, generation)
+        ),
+    )
+    generation = monitor.capture()[2]
+
+    monitor._notify_event(
+        GameEvent("game_started", 5, "started", 100.0, {}),
+        GameSnapshot(mode="constructed", phase="mulligan", game_number=1),
+        source_generation=generation,
+    )
+
+    assert observed == [("game_started", generation)]
+
+
+def test_game_started_uses_settled_same_match_snapshot() -> None:
+    event_snapshot = GameSnapshot(mode="unknown", phase="starting", game_number=3)
+    settled = GameSnapshot(mode="constructed", phase="mulligan", game_number=3)
+    event = GameEvent("game_started", 5, "started", 100.0, {})
+
+    assert (
+        CompanionMonitor._settled_batch_event_snapshot(
+            event,
+            event_snapshot,
+            settled,
+        )
+        is settled
+    )
+    assert (
+        CompanionMonitor._settled_batch_event_snapshot(
+            event,
+            event_snapshot,
+            replace(settled, game_number=4),
+        )
+        is event_snapshot
+    )
+
+
+def test_lifecycle_owned_batch_suppresses_all_regular_commentary_candidates() -> None:
+    llm_events: list[str] = []
+    observed: list[str] = []
+    monitor = CompanionMonitor(
+        CompanionConfig(
+            llm_do_not_disturb=False,
+            llm_data_consent=True,
+        ),
+        _logger(),
+        on_llm=lambda _prompt, event, _snapshot: not llm_events.append(event.kind),
+        on_event=lambda event, _snapshot: observed.append(event.kind),
+    )
+    snapshot = GameSnapshot(mode="battlegrounds", phase="recruit", game_number=3)
+
+    monitor._handle_batch_serial(
+        [
+            (GameEvent("game_started", 5, "started", 100.0, {}), snapshot),
+            (GameEvent("battlegrounds_triple", 10, "triple", 100.1, {}), snapshot),
+        ],
+        100.1,
+    )
+
+    assert observed == ["game_started", "battlegrounds_triple"]
+    assert llm_events == []
+
+
+def test_state_resumed_suppresses_same_tick_high_priority_commentary_only() -> None:
+    llm_events: list[str] = []
+    observed: list[str] = []
+    monitor = CompanionMonitor(
+        CompanionConfig(
+            llm_do_not_disturb=False,
+            llm_data_consent=True,
+        ),
+        _logger(),
+        on_llm=lambda _prompt, event, _snapshot: not llm_events.append(event.kind),
+        on_event=lambda event, _snapshot: observed.append(event.kind),
+    )
+    snapshot = GameSnapshot(mode="battlegrounds", phase="recruit", game_number=3)
+
+    monitor._handle_batch_serial(
+        [(GameEvent("battlegrounds_triple", 10, "triple", 100.1, {}), snapshot)],
+        100.1,
+        suppress_commentary=True,
+    )
+
+    assert llm_events == []
+    assert observed == ["battlegrounds_triple"]
+
+    monitor._handle_batch_serial(
+        [(GameEvent("battlegrounds_triple", 10, "triple", 101.0, {}), snapshot)],
+        101.0,
+    )
+
+    assert llm_events == ["battlegrounds_triple"]
+    assert observed == ["battlegrounds_triple", "battlegrounds_triple"]
 
 
 def test_active_constructed_bootstrap_notifies_state_ready_without_replaying_events() -> None:
@@ -113,6 +216,92 @@ def test_active_constructed_bootstrap_notifies_state_ready_without_replaying_eve
     assert results == []
     assert monitor.status().events_seen == 0
     assert monitor.status().llm_submissions == 0
+
+
+def test_live_terminal_event_replaces_state_unavailable_and_keeps_final_snapshot() -> None:
+    path = Path("constructed-terminal/Power.log")
+    active = (
+        _line("CREATE_GAME"),
+        _line("GameEntity EntityID=1"),
+        _line("Player EntityID=2 PlayerID=1 GameAccountId=[hi=0 lo=0]"),
+        _line("Player EntityID=3 PlayerID=3 GameAccountId=[hi=0 lo=0]"),
+        _line(
+            "SHOW_ENTITY - Updating Entity=[entityName=幸运币 id=4 zone=HAND zonePos=1 cardId= player=3] CardID=GAME_005"
+        ),
+        _line("TAG_CHANGE Entity=3 tag=CURRENT_PLAYER value=1"),
+        _line("TAG_CHANGE Entity=GameEntity tag=STEP value=MAIN_READY"),
+    )
+    ended = (
+        _line("TAG_CHANGE Entity=3 tag=PLAYSTATE value=WON"),
+        _line("TAG_CHANGE Entity=GameEntity tag=STATE value=COMPLETE"),
+    )
+    now = time.time()
+
+    _monitor, observed, _llm_events, _results = _run_bootstrap_batches(
+        [
+            TailBatch(
+                active,
+                path,
+                bootstrap=True,
+                source_reset=True,
+                bootstrap_complete=True,
+                modified_at=now,
+            ),
+            TailBatch(
+                ended,
+                path,
+                bootstrap_complete=True,
+                modified_at=now,
+            ),
+        ]
+    )
+
+    assert [kind for kind, _snapshot in observed] == [
+        "source_reset",
+        "state_ready",
+        "game_ended",
+    ]
+    assert observed[-1][1].phase == "ended"
+    assert observed[-1][1].result == "won"
+
+
+def test_new_game_after_stale_state_does_not_emit_state_resumed(monkeypatch) -> None:
+    times = iter((100.0, 401.0, 402.0, 403.0))
+    monkeypatch.setattr(monitor_module.time, "time", lambda: next(times, 403.0))
+    path = Path("constructed-new-game/Power.log")
+    first_game = (
+        _line("CREATE_GAME"),
+        _line("GameEntity EntityID=1"),
+        _line("Player EntityID=2 PlayerID=1 GameAccountId=[hi=0 lo=0]"),
+        _line("Player EntityID=3 PlayerID=2 GameAccountId=[hi=0 lo=0]"),
+        _line("TAG_CHANGE Entity=GameEntity tag=STEP value=MAIN_READY"),
+    )
+    next_game = (
+        _line("CREATE_GAME"),
+        _line("GameEntity EntityID=11"),
+        _line("Player EntityID=12 PlayerID=1 GameAccountId=[hi=0 lo=0]"),
+        _line("Player EntityID=13 PlayerID=2 GameAccountId=[hi=0 lo=0]"),
+    )
+
+    _monitor, observed, _llm_events, _results = _run_bootstrap_batches(
+        [
+            TailBatch(
+                first_game,
+                path,
+                bootstrap=True,
+                source_reset=True,
+                bootstrap_complete=True,
+                modified_at=100.0,
+            ),
+            TailBatch((), path, bootstrap_complete=True, modified_at=100.0),
+            TailBatch(next_game, path, bootstrap_complete=True, modified_at=402.0),
+        ]
+    )
+
+    kinds = [kind for kind, _snapshot in observed]
+    assert "state_stale" in kinds
+    assert "game_started" in kinds
+    assert "state_resumed" not in kinds
 
 
 def test_constructed_bootstrap_publishes_first_turn_state_in_the_same_poll_batch() -> None:
@@ -807,6 +996,108 @@ def test_reader_reset_clears_generation_scoped_runtime_activity() -> None:
     assert status.last_event_kind == ""
 
 
+def test_config_source_reset_and_first_bootstrap_share_one_generation() -> None:
+    observed: list[str] = []
+    monitor = CompanionMonitor(
+        CompanionConfig(log_path="old/Power.log"),
+        _logger(),
+        on_llm=lambda *_args: False,
+        on_event=lambda event, _snapshot: observed.append(event.kind),
+    )
+    monitor.update_config(CompanionConfig(log_path="new/Power.log"))
+    generation_after_update = monitor.capture()[2]
+    stop_event = threading.Event()
+
+    class FirstBootstrap:
+        polls = 0
+
+        def poll(self) -> TailBatch:
+            self.polls += 1
+            if self.polls < 3:
+                return TailBatch((), None, bootstrap_complete=False)
+            stop_event.set()
+            return TailBatch(
+                (),
+                Path("new/Power.log"),
+                bootstrap=True,
+                source_reset=True,
+                bootstrap_complete=True,
+            )
+
+    monitor._tailer = FirstBootstrap()
+    monitor._run(stop_event)
+
+    assert monitor.capture()[2] == generation_after_update
+    assert observed == ["source_reset"]
+
+
+def test_reader_reset_and_delayed_bootstrap_share_one_generation() -> None:
+    monitor = CompanionMonitor(
+        CompanionConfig(log_path="Power.log"),
+        _logger(),
+        on_llm=lambda *_args: False,
+    )
+    monitor._reset_reader_locked()
+    generation_after_reset = monitor.capture()[2]
+    stop_event = threading.Event()
+
+    class DelayedBootstrap:
+        polls = 0
+
+        def poll(self) -> TailBatch:
+            self.polls += 1
+            if self.polls == 1:
+                return TailBatch((), None, bootstrap_complete=False)
+            stop_event.set()
+            return TailBatch(
+                (),
+                Path("Power.log"),
+                bootstrap=True,
+                source_reset=True,
+                bootstrap_complete=True,
+            )
+
+    monitor._tailer = DelayedBootstrap()
+    monitor._run(stop_event)
+
+    assert monitor.capture()[2] == generation_after_reset
+
+
+def test_consecutive_config_source_changes_each_advance_once_before_delayed_bootstrap() -> None:
+    monitor = CompanionMonitor(
+        CompanionConfig(log_path="first/Power.log"),
+        _logger(),
+        on_llm=lambda *_args: False,
+    )
+    initial_generation = monitor.capture()[2]
+    monitor.update_config(CompanionConfig(log_path="second/Power.log"))
+    monitor.update_config(CompanionConfig(log_path="third/Power.log"))
+    generation_after_updates = monitor.capture()[2]
+    stop_event = threading.Event()
+
+    class DelayedBootstrap:
+        polls = 0
+
+        def poll(self) -> TailBatch:
+            self.polls += 1
+            if self.polls == 1:
+                return TailBatch((), None, bootstrap_complete=False)
+            stop_event.set()
+            return TailBatch(
+                (),
+                Path("third/Power.log"),
+                bootstrap=True,
+                source_reset=True,
+                bootstrap_complete=True,
+            )
+
+    monitor._tailer = DelayedBootstrap()
+    monitor._run(stop_event)
+
+    assert generation_after_updates == initial_generation + 2
+    assert monitor.capture()[2] == generation_after_updates
+
+
 def test_failed_source_config_staging_keeps_old_identity_and_retry_resets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -854,7 +1145,7 @@ def test_old_source_generation_drops_all_delayed_callbacks() -> None:
     results: list[str] = []
     llm_events: list[str] = []
     monitor = CompanionMonitor(
-        CompanionConfig(llm_commentary_enabled=True, llm_data_consent=True),
+        CompanionConfig(llm_do_not_disturb=False, llm_data_consent=True),
         _logger(),
         on_llm=lambda _prompt, event, _snapshot: not llm_events.append(event.kind),
         on_result=lambda event, _snapshot: results.append(event.kind),
@@ -1061,7 +1352,7 @@ def test_restart_bootstraps_current_log_without_replaying_stopped_backlog(
         CompanionConfig(
             log_path=str(log_path),
             poll_interval_seconds=0.1,
-            llm_commentary_enabled=True,
+            llm_do_not_disturb=False,
             llm_data_consent=True,
         ),
         _logger(),
@@ -1105,7 +1396,7 @@ def test_restart_bootstraps_current_log_without_replaying_stopped_backlog(
 def test_monitor_delegates_authorized_commentary_to_llm_callback() -> None:
     llm_prompts: list[str] = []
     monitor = CompanionMonitor(
-        CompanionConfig(llm_commentary_enabled=True, llm_data_consent=True),
+        CompanionConfig(llm_do_not_disturb=False, llm_data_consent=True),
         _logger(),
         on_llm=lambda prompt, event, snapshot: not llm_prompts.append(prompt),
     )
@@ -1125,7 +1416,7 @@ def test_monitor_batch_uses_highest_priority_event_with_its_own_snapshot() -> No
     submissions: list[tuple[str, str]] = []
     observed: list[str] = []
     monitor = CompanionMonitor(
-        CompanionConfig(llm_commentary_enabled=True, llm_data_consent=True),
+        CompanionConfig(llm_do_not_disturb=False, llm_data_consent=True),
         _logger(),
         on_llm=lambda prompt, event, snapshot: not submissions.append((event.kind, prompt)),
         on_event=lambda event, snapshot: observed.append(event.kind),
@@ -1149,7 +1440,7 @@ def test_monitor_batch_uses_highest_priority_event_with_its_own_snapshot() -> No
 def test_monitor_batch_prefers_later_composite_event_on_an_exact_tie() -> None:
     submitted: list[str] = []
     monitor = CompanionMonitor(
-        CompanionConfig(llm_commentary_enabled=True, llm_data_consent=True),
+        CompanionConfig(llm_do_not_disturb=False, llm_data_consent=True),
         _logger(),
         on_llm=lambda prompt, event, snapshot: not submitted.append(event.kind),
     )

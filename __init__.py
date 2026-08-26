@@ -10,7 +10,8 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from dataclasses import replace
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -60,6 +61,8 @@ _LLM_TOOL_FOCUSED_MAX_BYTES = 4096
 _LLM_TOOL_STATE_MAX_BYTES = 2048
 _LIVE_STATE_DELIVERY_MAX_BYTES = 900
 _LIVE_STATE_REFRESH_SECONDS = 30.0
+_LIFECYCLE_PENDING_SECONDS = 30.0
+_LIFECYCLE_SENT_LIMIT = 128
 _LIVE_QUERY_FALLBACK_DELAY_SECONDS = 1.25
 _LIVE_QUERY_FALLBACK_MAX_AGE_SECONDS = 12.0
 _LIVE_QUERY_FALLBACK_MAX_CHARS = 5200
@@ -101,6 +104,37 @@ _OVERLAY_RUNTIME_FIELDS = (
     "overlay_font_size",
     "overlay_speed_px_per_second",
 )
+
+_GAME_LIFECYCLE_STAGES = {
+    "game_started": "started",
+    "state_ready": "resumed",
+    "state_resumed": "resumed",
+    "battlegrounds_game_ended": "ended",
+    "game_ended": "ended",
+}
+
+_GAME_LIFECYCLE_INSTRUCTIONS = {
+    "started": "确认一场新对局刚刚开始；只自然打个招呼，不主动给策略或操作建议。",
+    "resumed": "明确表达已重新接上正在进行的对局；绝不能声称这场对局刚刚开始。",
+    "ended": "根据公开结果或酒馆名次自然回应，并明确收住本局陪伴语境。",
+}
+
+_TRANSIENT_LIVE_STATE_ACCESS_REASONS = {
+    "configuration_reconciling",
+    "monitor_configuration_not_applied",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingGameLifecycleReaction:
+    stage: str
+    identity: str
+    epoch: int
+    event: GameEvent
+    snapshot: GameSnapshot
+    source_generation: int | None
+    created_at: float
+    expires_at: float
 
 
 class _StartupSuperseded(RuntimeError):
@@ -2044,6 +2078,11 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         )
         self._query_ledger = QueryLedger()
         self._session_target = ""
+        self._game_lifecycle_epoch = 0
+        self._game_lifecycle_source_monitor: Any | None = None
+        self._game_lifecycle_source_generation: int | None = None
+        self._game_lifecycle_sent: dict[str, float] = {}
+        self._pending_game_lifecycle: _PendingGameLifecycleReaction | None = None
         self._last_user_context_timestamp = 0.0
         self._last_user_context_signatures: set[str] = set()
         self._ownership_lock = threading.RLock()
@@ -2414,7 +2453,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 "Hearthstone companion ready monitor=%s overlay=%s llm=%s consent=%s",
                 bool(self._monitor and self._monitor.status().monitor_running),
                 bool(overlay_result.get("running")),
-                self.cfg.llm_commentary_enabled,
+                not self.cfg.llm_do_not_disturb,
                 self.cfg.llm_data_consent,
             )
             return Ok(
@@ -2423,7 +2462,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     "monitor_started": monitor_started,
                     "overlay": overlay_result,
                     "card_catalog_started": catalog_started,
-                    "llm_enabled": self.cfg.llm_commentary_enabled
+                    "llm_enabled": not self.cfg.llm_do_not_disturb
                     and self.cfg.llm_data_consent,
                 }
             )
@@ -2617,18 +2656,14 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         """Accept the host's effective config without blocking its command loop."""
         section = new_config.get(_CONFIG_SECTION) if isinstance(new_config, Mapping) else None
         valid = isinstance(section, Mapping)
-        with self._ownership_lock:
+        with self._delivery_transition():
             previous = self.cfg
             if valid:
                 updated = CompanionConfig.from_mapping(section)
-                if updated.llm_commentary_enabled and not updated.llm_data_consent:
-                    updated.llm_commentary_enabled = False
                 base_errors: tuple[str, ...] = ()
             else:
                 fail_closed_values = previous.to_dict()
-                fail_closed_values.update(
-                    {"llm_commentary_enabled": False, "llm_data_consent": False}
-                )
+                fail_closed_values["llm_data_consent"] = False
                 updated = CompanionConfig.from_mapping(fail_closed_values)
                 base_errors = ("config:invalid_effective_section",)
 
@@ -2637,9 +2672,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 and updated.llm_data_consent
             ):
                 fail_closed_values = updated.to_dict()
-                fail_closed_values.update(
-                    {"llm_commentary_enabled": False, "llm_data_consent": False}
-                )
+                fail_closed_values["llm_data_consent"] = False
                 updated = CompanionConfig.from_mapping(fail_closed_values)
             if previous.llm_data_consent and not updated.llm_data_consent:
                 self._consent_request_revision = int(
@@ -2648,6 +2681,8 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
 
             restore_required = self._context_restore_required(previous, updated)
             self.cfg = updated
+            if not updated.llm_data_consent:
+                self._pending_game_lifecycle = None
             self._settings_transition = True
             self._settings_transition_revision = int(
                 getattr(self, "_settings_transition_revision", 0)
@@ -2686,8 +2721,6 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         if not isinstance(section, Mapping):
             raise RuntimeError("Hearthstone config load failed: InvalidSection")
         updated = CompanionConfig.from_mapping(section)
-        if updated.llm_commentary_enabled and not updated.llm_data_consent:
-            updated.llm_commentary_enabled = False
         return updated
 
     def _configure_startup_runtime(
@@ -2755,7 +2788,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             except Exception as exc:
                 self.logger.warning("Hearthstone config load failed code=%s", type(exc).__name__)
                 return False
-            with self._ownership_lock:
+            with self._delivery_transition():
                 if int(getattr(self, "_config_revision", 0)) != read_config_revision:
                     return True
                 if (
@@ -2763,13 +2796,13 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     and updated.llm_data_consent
                 ):
                     fail_closed_values = updated.to_dict()
-                    fail_closed_values.update(
-                        {"llm_commentary_enabled": False, "llm_data_consent": False}
-                    )
+                    fail_closed_values["llm_data_consent"] = False
                     updated = CompanionConfig.from_mapping(fail_closed_values)
                 previous = self.cfg
                 restore_required = self._context_restore_required(previous, updated)
                 self.cfg = updated
+                if not updated.llm_data_consent:
+                    self._pending_game_lifecycle = None
                 self._settings_transition = True
                 self._settings_transition_revision = int(
                     getattr(self, "_settings_transition_revision", 0)
@@ -3129,8 +3162,26 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         monitor: CompanionMonitor,
         config: CompanionConfig,
     ) -> None:
+        previous = getattr(monitor, "config", None)
+        source_changed = bool(
+            isinstance(previous, CompanionConfig)
+            and (
+                previous.log_path != config.log_path
+                or previous.initial_read_max_bytes != config.initial_read_max_bytes
+            )
+        )
         monitor.update_config(config)
-        self._mark_monitor_config_applied(monitor, config)
+        applied = self._mark_monitor_config_applied(monitor, config)
+        if applied and source_changed:
+            try:
+                _snapshot, _runtime, source_generation = _capture_monitor(monitor)
+            except (AttributeError, TimeoutError):
+                source_generation = None
+            self._advance_game_lifecycle_epoch(
+                monitor=monitor,
+                source_generation=source_generation,
+            )
+            self._ensure_query_ledger().clear()
 
     def _monitor_actions(self) -> asyncio.Lock:
         lock = getattr(self, "_monitor_action_lock", None)
@@ -3149,7 +3200,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
     def _begin_startup(self) -> int:
         task = asyncio.current_task()
         self._ensure_query_ledger().clear()
-        with self._ownership_lock:
+        with self._delivery_transition():
             generation = int(getattr(self, "_lifecycle_generation", 0)) + 1
             self._lifecycle_generation = generation
             self._startup_task = task
@@ -3212,7 +3263,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         expected_lifecycle_request: int | None = None,
     ) -> tuple[bool, asyncio.Task[None] | None]:
         current_task = asyncio.current_task()
-        with self._ownership_lock:
+        with self._delivery_transition():
             current_generation = int(getattr(self, "_lifecycle_generation", 0))
             if (
                 expected_startup_generation is not None
@@ -3230,6 +3281,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             self._monitor_dispatch_enabled = False
             self._settings_transition = True
             self._config_reconcile_accepting = False
+            self._pending_game_lifecycle = None
             startup_task = getattr(self, "_startup_task", None)
             reconcile_task = getattr(self, "_config_reconcile_task", None)
         self._ensure_query_ledger().clear()
@@ -3372,7 +3424,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         if isinstance(context, Mapping):
             target = str(context.get("lanlan_name") or "").strip()[:80]
             if target:
-                with self._ownership_lock:
+                with self._delivery_transition():
                     self._session_target = target
         with self._ownership_lock:
             self._last_user_chat_at = time.time()
@@ -3387,7 +3439,15 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         return (config or self.cfg).target_lanlan.strip()[:80]
 
     def _delivery_guard(self) -> threading.RLock:
-        return getattr(self, "_delivery_lock", self._ownership_lock)
+        lock = getattr(self, "_delivery_lock", None)
+        return lock if lock is not None else self._ownership_lock
+
+    @contextmanager
+    def _delivery_transition(self):
+        """Serialize delivery-invalidating state changes with final submission."""
+        with self._delivery_guard():
+            with self._ownership_lock:
+                yield
 
     def _delivery_target(self) -> str:
         with self._ownership_lock:
@@ -3448,7 +3508,10 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
     ) -> bool:
         previous_target = self._stable_target(previous)
         updated_target = self._stable_target(updated)
-        source_changed = updated.log_path != previous.log_path
+        source_changed = bool(
+            updated.log_path != previous.log_path
+            or updated.initial_read_max_bytes != previous.initial_read_max_bytes
+        )
         access_revoked = not updated.llm_data_consent
         configured_target_changed = previous_target != updated_target
         return bool(access_revoked or source_changed or configured_target_changed)
@@ -3465,11 +3528,42 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             base = f"hearthstone:live-state:{digest}"
         return f"{base}:{segment}"
 
-    def _publish_live_state(self, snapshot: GameSnapshot) -> bool:
-        return self._share_live_state(snapshot)
+    def _publish_live_state(
+        self,
+        snapshot: GameSnapshot,
+        *,
+        expected_monitor: Any | None = None,
+        expected_source_generation: int | None = None,
+    ) -> bool:
+        return self._share_live_state(
+            snapshot,
+            expected_monitor=expected_monitor,
+            expected_source_generation=expected_source_generation,
+        )
 
-    def _share_live_state(self, snapshot: GameSnapshot) -> bool:
+    def _share_live_state(
+        self,
+        snapshot: GameSnapshot,
+        *,
+        expected_monitor: Any | None = None,
+        expected_source_generation: int | None = None,
+    ) -> bool:
         with self._delivery_guard():
+            def source_generation_valid() -> bool:
+                if expected_monitor is None or expected_source_generation is None:
+                    return True
+                with self._ownership_lock:
+                    if getattr(self, "_monitor", None) is not expected_monitor:
+                        return False
+                try:
+                    _snapshot, _runtime, current_generation = _capture_monitor(
+                        expected_monitor,
+                        timeout_seconds=0.0,
+                    )
+                except Exception:
+                    return False
+                return current_generation == expected_source_generation
+
             access_reason, _revision = _live_state_access(self)
             target = self._delivery_target()
             with self._ownership_lock:
@@ -3481,7 +3575,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     or snapshot.game_number <= 0
                     or snapshot.phase in {"idle", "ended", "spectator"}
                 )
-            if blocked:
+            if blocked or not source_generation_valid():
                 return False
 
             cursor = self._ensure_state_publisher().cursor
@@ -3496,6 +3590,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                         or not self._started
                         or not self._monitor_dispatch_enabled
                         or self._delivery_target() != target
+                        or not source_generation_valid()
                     )
 
             published = self._ensure_state_publisher().publish(
@@ -3513,26 +3608,459 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             return expired
 
     def _restore_context(self) -> bool:
-        self._ensure_query_ledger().clear()
-        with self._ownership_lock:
-            self._session_target = ""
-        return self._expire_live_state(reason="context_invalidated")
-
-    def _observe_game_event(self, event: GameEvent, snapshot: GameSnapshot) -> None:
-        leaving = event.kind in {
-            "source_reset",
-            "state_stale",
-            "state_unavailable",
-            "battlegrounds_game_ended",
-            "game_ended",
-        }
-        if snapshot.phase == "spectator" or leaving:
+        with self._delivery_guard():
             self._ensure_query_ledger().clear()
-            self._expire_live_state(reason=event.kind)
+            with self._ownership_lock:
+                self._session_target = ""
+                self._pending_game_lifecycle = None
+            return self._expire_live_state(reason="context_invalidated")
+
+    def _advance_game_lifecycle_epoch(
+        self,
+        *,
+        monitor: Any | None = None,
+        source_generation: int | None = None,
+    ) -> bool:
+        with self._delivery_transition():
+            previous_monitor = getattr(self, "_game_lifecycle_source_monitor", None)
+            previous_generation = getattr(
+                self,
+                "_game_lifecycle_source_generation",
+                None,
+            )
+            if monitor is not None and source_generation is not None:
+                if (
+                    previous_monitor is monitor
+                    and previous_generation is not None
+                    and source_generation <= previous_generation
+                ):
+                    return False
+                self._game_lifecycle_source_monitor = monitor
+                self._game_lifecycle_source_generation = source_generation
+            else:
+                self._game_lifecycle_source_monitor = None
+                self._game_lifecycle_source_generation = None
+            self._game_lifecycle_epoch = int(
+                getattr(self, "_game_lifecycle_epoch", 0)
+            ) + 1
+            self._game_lifecycle_sent = {}
+            self._pending_game_lifecycle = None
+            return True
+
+    def _clear_pending_game_lifecycle(self) -> None:
+        with self._delivery_transition():
+            self._pending_game_lifecycle = None
+
+    @staticmethod
+    def _game_lifecycle_snapshot_ready(
+        stage: str,
+        snapshot: GameSnapshot,
+    ) -> bool:
+        if snapshot.game_number <= 0 or snapshot.phase == "spectator":
+            return False
+        if stage == "ended":
+            return snapshot.phase == "ended"
+        return bool(
+            snapshot.mode in {"constructed", "battlegrounds"}
+            and snapshot.phase not in {"idle", "ended"}
+        )
+
+    @staticmethod
+    def _game_lifecycle_key(target: str, identity: str) -> str:
+        target_digest = hashlib.sha256(target.encode("utf-8")).hexdigest()[:16]
+        return f"hearthstone:lifecycle:{target_digest}:{identity}"
+
+    def _queue_game_lifecycle(
+        self,
+        *,
+        stage: str,
+        identity: str,
+        epoch: int,
+        event: GameEvent,
+        snapshot: GameSnapshot,
+        source_generation: int | None,
+        seed: _PendingGameLifecycleReaction | None = None,
+    ) -> None:
+        now = time.time()
+        with self._ownership_lock:
+            if epoch != int(getattr(self, "_game_lifecycle_epoch", 0)):
+                return
+            sent = getattr(self, "_game_lifecycle_sent", {})
+            if identity in sent:
+                return
+            existing = getattr(self, "_pending_game_lifecycle", None)
+            basis = existing if existing is not None and existing.identity == identity else seed
+            if basis is not None and basis.identity == identity:
+                created_at = basis.created_at
+                expires_at = basis.expires_at
+                bound_source_generation = basis.source_generation
+                if bound_source_generation is None:
+                    bound_source_generation = source_generation
+            else:
+                created_at = now
+                expires_at = now + _LIFECYCLE_PENDING_SECONDS
+                bound_source_generation = source_generation
+            if expires_at <= now:
+                if existing is not None and existing.identity == identity:
+                    self._pending_game_lifecycle = None
+                return
+            self._pending_game_lifecycle = _PendingGameLifecycleReaction(
+                stage=stage,
+                identity=identity,
+                epoch=epoch,
+                event=event,
+                snapshot=snapshot,
+                source_generation=bound_source_generation,
+                created_at=created_at,
+                expires_at=expires_at,
+            )
+
+    def _current_game_lifecycle_source_generation(self) -> int | None:
+        with self._ownership_lock:
+            monitor = getattr(self, "_monitor", None)
+        if monitor is None:
+            return None
+        try:
+            _snapshot, _runtime, generation = _capture_monitor(
+                monitor,
+                timeout_seconds=0.0,
+            )
+        except Exception:
+            return None
+        return generation
+
+    def _game_lifecycle_source_is_current(
+        self,
+        source_generation: int | None,
+    ) -> bool:
+        if source_generation is None:
+            return True
+        return self._current_game_lifecycle_source_generation() == source_generation
+
+    def _submit_game_lifecycle(
+        self,
+        stage: str,
+        event: GameEvent,
+        snapshot: GameSnapshot,
+        *,
+        pending: _PendingGameLifecycleReaction | None = None,
+        source_generation: int | None = None,
+    ) -> bool:
+        with self._delivery_guard():
+            access_reason, _revision = _live_state_access(self)
+            with self._ownership_lock:
+                config = self.cfg
+                epoch = int(getattr(self, "_game_lifecycle_epoch", 0))
+                hard_disabled = bool(
+                    not config.llm_data_consent
+                    or not getattr(self, "_started", False)
+                    or not getattr(self, "_monitor_dispatch_enabled", False)
+                )
+
+            game_number = int(snapshot.game_number or event.details.get("game_number") or 0)
+            if game_number <= 0:
+                return False
+            identity = f"{epoch}:{game_number}:{stage}"
+
+            if hard_disabled or snapshot.phase == "spectator":
+                self._clear_pending_game_lifecycle()
+                return False
+            if access_reason:
+                if access_reason in _TRANSIENT_LIVE_STATE_ACCESS_REASONS:
+                    self._queue_game_lifecycle(
+                        stage=stage,
+                        identity=identity,
+                        epoch=epoch,
+                        event=event,
+                        snapshot=snapshot,
+                        source_generation=source_generation,
+                        seed=pending,
+                    )
+                else:
+                    self._clear_pending_game_lifecycle()
+                return False
+            if not self._game_lifecycle_source_is_current(source_generation):
+                self._clear_pending_game_lifecycle()
+                return False
+            with self._ownership_lock:
+                if pending is not None:
+                    current_pending = getattr(self, "_pending_game_lifecycle", None)
+                    if (
+                        current_pending is not pending
+                        or pending.epoch != epoch
+                        or pending.stage != stage
+                        or pending.identity != identity
+                        or pending.expires_at <= time.time()
+                    ):
+                        return False
+                pending_before_submit = getattr(self, "_pending_game_lifecycle", None)
+                if identity in getattr(self, "_game_lifecycle_sent", {}):
+                    if (
+                        getattr(self, "_pending_game_lifecycle", None) is not None
+                        and self._pending_game_lifecycle.identity == identity
+                    ):
+                        self._pending_game_lifecycle = None
+                    return False
+
+            target = self._delivery_target()
+            if not target or not self._game_lifecycle_snapshot_ready(stage, snapshot):
+                self._queue_game_lifecycle(
+                    stage=stage,
+                    identity=identity,
+                    epoch=epoch,
+                    event=event,
+                    snapshot=snapshot,
+                    source_generation=source_generation,
+                    seed=pending,
+                )
+                return False
+
+            instruction = _GAME_LIFECYCLE_INSTRUCTIONS[stage]
+            heading = "# 对局生命周期事件"
+            prompt_budget = (
+                _LLM_DELIVERY_MAX_CHARS
+                - len(HEARTHSTONE_CONTEXT_INSTRUCTIONS)
+                - len(heading)
+                - len(instruction)
+                - 8
+            )
+            try:
+                prompt = build_llm_prompt(
+                    event,
+                    snapshot,
+                    max_reply_chars=config.llm_max_reply_chars,
+                    max_prompt_chars=prompt_budget,
+                    context_already_included=True,
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "Hearthstone lifecycle prompt failed code=%s",
+                    type(exc).__name__,
+                )
+                self._queue_game_lifecycle(
+                    stage=stage,
+                    identity=identity,
+                    epoch=epoch,
+                    event=event,
+                    snapshot=snapshot,
+                    source_generation=source_generation,
+                    seed=pending,
+                )
+                return False
+            response_prompt = (
+                f"{HEARTHSTONE_CONTEXT_INSTRUCTIONS}\n\n"
+                f"{heading}\n"
+                f"{instruction}\n"
+                f"{prompt}"
+            )
+            kwargs: dict[str, Any] = {
+                "visibility": [],
+                "ai_behavior": "respond",
+                "parts": [{"type": "text", "text": response_prompt}],
+                "source": "hearthstone_companion",
+                "metadata": {
+                    "kind": "game_lifecycle_reaction",
+                    "lifecycle_stage": stage,
+                    "event_kind": event.kind,
+                    "match_id": game_number,
+                    "context_type": "hearthstone_companion",
+                    "privacy_scope": "player_visible_game_state",
+                    "reply_contract": "single_short_line",
+                    "max_reply_chars": config.llm_max_reply_chars,
+                },
+                "priority": event.priority,
+                "target_lanlan": target,
+                "coalesce_key": self._game_lifecycle_key(target, identity),
+            }
+            access_reason, _revision = _live_state_access(self)
+            with self._ownership_lock:
+                delivery_hard_invalid = bool(
+                    epoch != int(getattr(self, "_game_lifecycle_epoch", 0))
+                    or not self._started
+                    or not self._monitor_dispatch_enabled
+                    or not self.cfg.llm_data_consent
+                    or self._delivery_target() != target
+                )
+            source_is_current = self._game_lifecycle_source_is_current(source_generation)
+            if access_reason or delivery_hard_invalid or not source_is_current:
+                if (
+                    access_reason in _TRANSIENT_LIVE_STATE_ACCESS_REASONS
+                    and not delivery_hard_invalid
+                    and source_is_current
+                ):
+                    self._queue_game_lifecycle(
+                        stage=stage,
+                        identity=identity,
+                        epoch=epoch,
+                        event=event,
+                        snapshot=snapshot,
+                        source_generation=source_generation,
+                        seed=pending,
+                    )
+                    return False
+                self._clear_pending_game_lifecycle()
+                return False
+
+            def submit_message() -> bool:
+                try:
+                    return _submitted(self.push_message(**kwargs))
+                except Exception as exc:
+                    self.logger.warning(
+                        "Hearthstone lifecycle response failed code=%s",
+                        type(exc).__name__,
+                    )
+                    return False
+
+            monitor = getattr(self, "_monitor", None)
+            guarded_submit = getattr(monitor, "run_if_source_generation", None)
+            try:
+                if source_generation is not None and callable(guarded_submit):
+                    generation_current, submitted = guarded_submit(
+                        source_generation,
+                        submit_message,
+                    )
+                else:
+                    generation_current = self._game_lifecycle_source_is_current(
+                        source_generation
+                    )
+                    submitted = submit_message() if generation_current else False
+            except Exception as exc:
+                self.logger.warning(
+                    "Hearthstone lifecycle generation guard failed code=%s",
+                    type(exc).__name__,
+                )
+                generation_current = False
+                submitted = False
+            if not generation_current:
+                self._clear_pending_game_lifecycle()
+                return False
+            if not submitted:
+                self._queue_game_lifecycle(
+                    stage=stage,
+                    identity=identity,
+                    epoch=epoch,
+                    event=event,
+                    snapshot=snapshot,
+                    source_generation=source_generation,
+                    seed=pending,
+                )
+                return False
+
+            with self._ownership_lock:
+                sent = getattr(self, "_game_lifecycle_sent", None)
+                if sent is None:
+                    sent = {}
+                    self._game_lifecycle_sent = sent
+                sent[identity] = time.time()
+                while len(sent) > _LIFECYCLE_SENT_LIMIT:
+                    sent.pop(next(iter(sent)))
+                current_pending = getattr(self, "_pending_game_lifecycle", None)
+                if current_pending is pending_before_submit:
+                    self._pending_game_lifecycle = None
+            return True
+
+    def _retry_pending_game_lifecycle(self) -> bool:
+        now = time.time()
+        with self._ownership_lock:
+            pending = getattr(self, "_pending_game_lifecycle", None)
+            if pending is None:
+                return False
+            disabled = bool(
+                pending.epoch != int(getattr(self, "_game_lifecycle_epoch", 0))
+                or pending.expires_at <= now
+                or not self.cfg.llm_data_consent
+                or not self._started
+                or not self._monitor_dispatch_enabled
+            )
+            if disabled:
+                self._pending_game_lifecycle = None
+                return False
+
+        snapshot = pending.snapshot
+        monitor = getattr(self, "_monitor", None)
+        if monitor is not None:
+            try:
+                current, _runtime, current_generation = _capture_monitor(
+                    monitor,
+                    timeout_seconds=0.05,
+                )
+            except Exception:
+                current = None
+            if current is not None:
+                if (
+                    pending.source_generation is not None
+                    and current_generation != pending.source_generation
+                ):
+                    self._clear_pending_game_lifecycle()
+                    return False
+                if current.game_number != pending.snapshot.game_number:
+                    self._clear_pending_game_lifecycle()
+                    return False
+                if pending.stage != "ended":
+                    if current.phase in {"idle", "ended", "spectator"}:
+                        self._clear_pending_game_lifecycle()
+                        return False
+                    snapshot = current
+        return self._submit_game_lifecycle(
+            pending.stage,
+            pending.event,
+            snapshot,
+            pending=pending,
+            source_generation=pending.source_generation,
+        )
+
+    def _observe_game_event(
+        self,
+        event: GameEvent,
+        snapshot: GameSnapshot,
+        source_generation: int | None = None,
+    ) -> None:
+        with self._delivery_guard():
+            if event.kind == "source_reset":
+                with self._ownership_lock:
+                    monitor = getattr(self, "_monitor", None)
+                self._advance_game_lifecycle_epoch(
+                    monitor=monitor,
+                    source_generation=source_generation,
+                )
+            if snapshot.phase == "spectator":
+                self._clear_pending_game_lifecycle()
+            if event.kind in {"state_stale", "state_unavailable"}:
+                self._clear_pending_game_lifecycle()
+
+            stage = _GAME_LIFECYCLE_STAGES.get(event.kind)
+            if stage is not None and source_generation is None:
+                access_reason, _revision = _live_state_access(self)
+                if not access_reason:
+                    source_generation = (
+                        self._current_game_lifecycle_source_generation()
+                    )
+            leaving = event.kind in {
+                "source_reset",
+                "state_stale",
+                "state_unavailable",
+                "battlegrounds_game_ended",
+                "game_ended",
+            }
+            try:
+                if stage is not None and snapshot.phase != "spectator":
+                    self._submit_game_lifecycle(
+                        stage,
+                        event,
+                        snapshot,
+                        source_generation=source_generation,
+                    )
+            finally:
+                if snapshot.phase == "spectator" or leaving:
+                    try:
+                        self._ensure_query_ledger().clear()
+                    finally:
+                        self._expire_live_state(reason=event.kind)
 
     @timer_interval(id="live_state_context_refresh", seconds=1, auto_start=True)
     async def live_state_context_refresh(self, **_: Any):
         self._sync_active_game_context()
+        self._retry_pending_game_lifecycle()
         return Ok({"refreshed": True})
 
     @staticmethod
@@ -3642,7 +4170,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         accepted = 0
         for source_timestamp, target, text, target_allowed in observed:
             signature = ledger.signature(text, target)
-            with self._ownership_lock:
+            with self._delivery_transition():
                 watermark = float(
                     getattr(self, "_last_user_context_timestamp", 0.0) or 0.0
                 )
@@ -3883,7 +4411,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         if monitor is None:
             return
         try:
-            snapshot, runtime, _generation = _capture_monitor(
+            snapshot, runtime, generation = _capture_monitor(
                 monitor, timeout_seconds=0.05
             )
         except TimeoutError:
@@ -3910,7 +4438,11 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             self._expire_live_state(reason="no_fresh_active_game")
             return
         try:
-            self._publish_live_state(snapshot)
+            self._publish_live_state(
+                snapshot,
+                expected_monitor=monitor,
+                expected_source_generation=generation,
+            )
         except Exception as exc:
             logger = getattr(self, "logger", None)
             if logger is not None:
@@ -3934,7 +4466,8 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     access_reason
                     or not self._started
                     or not self._monitor_dispatch_enabled
-                    or not config.llm_commentary_enabled
+                    or config.llm_do_not_disturb
+                    or event.kind in _GAME_LIFECYCLE_STAGES
                 ):
                     return False
                 if (
@@ -3991,7 +4524,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     access_reason
                     or not self._started
                     or not self._monitor_dispatch_enabled
-                    or not self.cfg.llm_commentary_enabled
+                    or self.cfg.llm_do_not_disturb
                     or self._delivery_target() != target
                 )
             if delivery_invalid:
@@ -4040,6 +4573,8 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 "player_names_retained": False,
                 "hidden_opponent_cards_exposed": False,
                 "llm_public_state_sharing_enabled": self.cfg.llm_data_consent,
+                "llm_lifecycle_reactions_enabled": bool(self.cfg.llm_data_consent),
+                "llm_do_not_disturb": self.cfg.llm_do_not_disturb,
                 "card_catalog_network_enabled": self.cfg.card_catalog_network_enabled,
                 "card_catalog_sends_game_state": False,
             },
@@ -4094,7 +4629,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 if not self._worker_accepting(monitor, started):
                     raise RuntimeError("Hearthstone log monitor did not start")
             except BaseException:
-                with self._ownership_lock:
+                with self._delivery_transition():
                     self._monitor_dispatch_enabled = previous_dispatch
                 raise
             self._sync_active_game_context()
@@ -4115,8 +4650,9 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
     )
     async def stop_monitoring(self, **_: Any):
         async with self._monitor_actions():
-            with self._ownership_lock:
+            with self._delivery_transition():
                 self._monitor_dispatch_enabled = False
+                self._pending_game_lifecycle = None
             stopped = await asyncio.to_thread(self._ensure_monitor().stop)
             context_restored = self._restore_context()
         if not stopped:
@@ -4203,7 +4739,31 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         return Ok(result)
 
     async def _persist_settings_config(self, submitted: Mapping[str, Any]) -> Mapping[str, Any]:
-        patch = {_CONFIG_SECTION: dict(submitted)}
+        persisted_fields = dict(submitted)
+        if "llm_do_not_disturb" in persisted_fields:
+            persisted_fields["llm_commentary_enabled"] = not bool(
+                persisted_fields["llm_do_not_disturb"]
+            )
+        patch = {_CONFIG_SECTION: persisted_fields}
+
+        active_profile_getter = getattr(self.config, "profile_active", None)
+        if callable(active_profile_getter):
+            try:
+                active_profile = await active_profile_getter(timeout=5.0)
+            except Exception as exc:
+                if not _is_unavailable_context_method_error(
+                    exc,
+                    "get_own_profiles_state",
+                ):
+                    raise
+            else:
+                if active_profile:
+                    profile_updater = getattr(self.config, "profile_update", None)
+                    if not callable(profile_updater):
+                        raise RuntimeError("active profile config writer is unavailable")
+                    await profile_updater(active_profile, patch, timeout=5.0)
+                    return await self._confirmed_settings_config(None, submitted)
+
         try:
             persisted = await self.config.update(patch, timeout=5.0)
             return await self._confirmed_settings_config(persisted, submitted)
@@ -4281,7 +4841,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             "type": "object",
             "properties": {
                 "log_path": {"type": "string"},
-                "llm_commentary_enabled": {"type": "boolean"},
+                "llm_do_not_disturb": {"type": "boolean"},
                 "llm_data_consent": {"type": "boolean"},
                 "target_lanlan": {"type": "string"},
                 "card_catalog_network_enabled": {"type": "boolean"},
@@ -4296,7 +4856,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
     async def save_settings(
         self,
         log_path: str | None = None,
-        llm_commentary_enabled: bool | None = None,
+        llm_do_not_disturb: bool | None = None,
         llm_data_consent: bool | None = None,
         target_lanlan: str | None = None,
         card_catalog_network_enabled: bool | None = None,
@@ -4312,7 +4872,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             key: value
             for key, value in {
                 "log_path": log_path,
-                "llm_commentary_enabled": llm_commentary_enabled,
+                "llm_do_not_disturb": llm_do_not_disturb,
                 "llm_data_consent": llm_data_consent,
                 "target_lanlan": target_lanlan,
                 "card_catalog_network_enabled": card_catalog_network_enabled,
@@ -4323,9 +4883,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             }.items()
             if value is not None
         }
-        if llm_data_consent is False:
-            submitted["llm_commentary_enabled"] = False
-        with self._ownership_lock:
+        with self._delivery_transition():
             settings_privacy_revision = int(
                 getattr(self, "_consent_request_revision", 0)
             )
@@ -4338,9 +4896,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             )
             if llm_data_consent is False:
                 fail_closed_values = self.cfg.to_dict()
-                fail_closed_values.update(
-                    {"llm_commentary_enabled": False, "llm_data_consent": False}
-                )
+                fail_closed_values["llm_data_consent"] = False
                 self.cfg = CompanionConfig.from_mapping(fail_closed_values)
                 self._settings_transition = True
                 self._settings_transition_revision = int(
@@ -4354,12 +4910,6 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 merged = previous.to_dict()
                 merged.update(submitted)
                 requested = CompanionConfig.from_mapping(merged)
-                if requested.llm_commentary_enabled and not requested.llm_data_consent:
-                    return Err(
-                        SdkError(
-                            "enabling LLM commentary requires explicit public-state sharing consent"
-                        )
-                    )
                 normalized = requested.to_dict()
                 submitted = {key: normalized[key] for key in submitted}
                 revoking_consent = requested_consent_revocation or (
@@ -4385,12 +4935,10 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             try:
                 fail_closed_monitor: CompanionMonitor | None = None
                 fail_closed_monitor_config: CompanionConfig | None = None
-                with self._ownership_lock:
+                with self._delivery_transition():
                     if revoking_consent:
                         fail_closed = previous.to_dict()
-                        fail_closed.update(
-                            {"llm_commentary_enabled": False, "llm_data_consent": False}
-                        )
+                        fail_closed["llm_data_consent"] = False
                         self.cfg = CompanionConfig.from_mapping(fail_closed)
                         fail_closed_monitor = getattr(self, "_monitor", None)
                         fail_closed_monitor_config = self.cfg
@@ -4431,14 +4979,10 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 updated = CompanionConfig.from_mapping(section)
                 if llm_data_consent is False:
                     fail_closed = updated.to_dict()
-                    fail_closed.update(
-                        {"llm_commentary_enabled": False, "llm_data_consent": False}
-                    )
+                    fail_closed["llm_data_consent"] = False
                     updated = CompanionConfig.from_mapping(fail_closed)
-                elif updated.llm_commentary_enabled and not updated.llm_data_consent:
-                    updated.llm_commentary_enabled = False
 
-                with self._ownership_lock:
+                with self._delivery_transition():
                     config_superseded = int(
                         getattr(self, "_config_revision", 0)
                     ) != settings_config_revision
@@ -4451,14 +4995,11 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                             and not self.cfg.llm_data_consent
                         ):
                             fail_closed = updated.to_dict()
-                            fail_closed.update(
-                                {
-                                    "llm_commentary_enabled": False,
-                                    "llm_data_consent": False,
-                                }
-                            )
+                            fail_closed["llm_data_consent"] = False
                             updated = CompanionConfig.from_mapping(fail_closed)
                         self.cfg = updated
+                        if not updated.llm_data_consent:
+                            self._pending_game_lifecycle = None
                 if not config_superseded:
                     try:
                         self._update_monitor_config(self._ensure_monitor(), updated)
@@ -4539,7 +5080,13 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         return Ok(
             {
                 "summary": "炉石陪玩设置已保存。",
-                "llm_enabled": updated.llm_commentary_enabled and updated.llm_data_consent,
+                "llm_enabled": not updated.llm_do_not_disturb
+                and updated.llm_data_consent,
+                "lifecycle_enabled": bool(updated.llm_data_consent),
+                "do_not_disturb": updated.llm_do_not_disturb,
+                "commentary_enabled": bool(
+                    not updated.llm_do_not_disturb and updated.llm_data_consent
+                ),
             }
         )
 
@@ -4591,7 +5138,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         snapshot = self._ensure_monitor().snapshot()
         overlay_ok = self._overlay.push("独立浮层诊断成功", priority=event.priority, style="diagnostic")
         llm_ok = False
-        llm_expected = self.cfg.llm_commentary_enabled and self.cfg.llm_data_consent
+        llm_expected = not self.cfg.llm_do_not_disturb and self.cfg.llm_data_consent
         if llm_expected:
             prompt = (
                 "Hearthstone companion commentary boundary:\n"
@@ -4732,7 +5279,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         )
         context_target = str(context.get("lanlan_name") or "").strip()[:80]
         if context_target:
-            with self._ownership_lock:
+            with self._delivery_transition():
                 self._session_target = context_target
         ledger = getattr(self, "_query_ledger", None)
         claim_query = getattr(ledger, "claim", None)

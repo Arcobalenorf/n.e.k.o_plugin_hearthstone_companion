@@ -28,13 +28,24 @@ def _strict_bool(data: Mapping[str, Any], key: str, default: bool) -> bool:
     return value if isinstance(value, bool) else False
 
 
+def _do_not_disturb(data: Mapping[str, Any]) -> bool:
+    """Prefer the positive safety setting and migrate the former opt-in flag."""
+    if "llm_do_not_disturb" in data:
+        value = data["llm_do_not_disturb"]
+        return value if isinstance(value, bool) else True
+    if "llm_commentary_enabled" in data:
+        legacy = data["llm_commentary_enabled"]
+        return not legacy if isinstance(legacy, bool) else True
+    return True
+
+
 @dataclass(slots=True)
 class CompanionConfig:
     monitor_on_start: bool = True
     log_path: str = ""
     poll_interval_seconds: float = 0.1
     initial_read_max_bytes: int = 64 * 1024 * 1024
-    llm_commentary_enabled: bool = False
+    llm_do_not_disturb: bool = True
     llm_data_consent: bool = True
     llm_min_priority: int = 5
     llm_cooldown_seconds: float = 25.0
@@ -61,7 +72,7 @@ class CompanionConfig:
             initial_read_max_bytes=_bounded_int(
                 data.get("initial_read_max_bytes"), 64 * 1024 * 1024, 1024 * 1024, 64 * 1024 * 1024
             ),
-            llm_commentary_enabled=_strict_bool(data, "llm_commentary_enabled", False),
+            llm_do_not_disturb=_do_not_disturb(data),
             llm_data_consent=_strict_bool(data, "llm_data_consent", True),
             llm_min_priority=_bounded_int(data.get("llm_min_priority"), 5, 1, 10),
             llm_cooldown_seconds=_bounded_float(data.get("llm_cooldown_seconds"), 25.0, 5.0, 300.0),

@@ -22,9 +22,11 @@ Get-ChildItem "$env:LOCALAPPDATA\Blizzard\Hearthstone" -Filter Power.log -Recurs
 
 ## 有日志但没有角色主动说话
 
-依次检查：
+若缺少开场、重连或结算回应，先确认 `llm_data_consent=true`，并确认当前角色已通过固定目标或官方聊天上下文明确。生命周期没有独立开关。未知目标时插件不会广播；超过 30 秒的待投递生命周期也会丢弃。接入已经开始的对局应说“重新接上”，不会重放开场。
 
-1. `llm_data_consent` 与 `llm_commentary_enabled` 是否都开启；
+若希望获得中局主动陪伴，再依次检查：
+
+1. `llm_data_consent=true` 且 `llm_do_not_disturb=false`；
 2. N.E.K.O 当前角色是否配置了可用模型；
 3. 当前是否在旁观模式；
 4. 最近是否有用户聊天，普通事件会安静 30 秒；
@@ -32,11 +34,11 @@ Get-ChildItem "$env:LOCALAPPDATA\Blizzard\Hearthstone" -Filter Power.log -Recurs
 6. 事件优先级是否达到默认阈值 5；
 7. 点击“测试解说”检查 SDK 是否接受提交。
 
-插件不会为每个回合或商店变化都发言。稀疏、情绪相关的主动回应是设计行为。
+插件不会为每个回合或商店变化都发言。即使关闭免打扰，中局回应仍会保持稀疏并只选择有情绪价值的事件；开场/重连/结算回应随局势共享生效，不受免打扰影响。
 
-## 主动解说关闭后还能问酒馆问题吗
+## 开启免打扰后还能问酒馆问题吗
 
-可以。保持 `llm_data_consent=true`；模型可在首答同一轮调用 `hearthstone_live_state`，或由统一 Agent/明确问题兜底承接。主动解说开关只控制插件是否因游戏事件主动发起角色回复。
+可以。保持 `llm_data_consent=true`；模型可在首答同一轮调用 `hearthstone_live_state`，或由统一 Agent/明确问题兜底承接。`llm_do_not_disturb` 只抑制中局主动事件；开场、重连和结算始终随局势共享生效。
 
 若查询返回 `llm_data_sharing_not_authorized`，说明数据共享未开启。若状态为空，确认已经进入酒馆且日志正在增长。若面板已有商店/战团但角色仍声称没有炉石能力，依次确认目标角色的 `/api/tools` 已注册 `hearthstone_live_state`、模型请求携带该 schema、tool callback 返回 `hearthstone_compact_v1`；再检查 Agent 是否能发现 `query_hearthstone_live_state`，以及 `live_query_watch` 是否从 memory 识别查询并提交定向 `respond`。插件必须保持 `passive=false`，否则 Agent 会跳过查询入口，但同轮工具与 memory 兜底仍是独立链路。
 

@@ -12,6 +12,11 @@ from .config import CompanionConfig
 from .models import GameEvent, GameSnapshot
 
 _LIVE_AREA_MAX_AGE_SECONDS = 300.0
+_LIFECYCLE_COMMENTARY_KINDS = {
+    "game_started",
+    "battlegrounds_game_ended",
+    "game_ended",
+}
 
 
 def build_emotion_cue(event: GameEvent, snapshot: GameSnapshot) -> dict[str, str | int]:
@@ -60,8 +65,16 @@ class CommentaryArbiter:
     def update(self, config: CompanionConfig) -> None:
         self.config = config
 
+    def reset(self) -> None:
+        """Forget cooldown state when the monitored log source changes."""
+        self._last_llm_at = 0.0
+        self._recent_llm_keys.clear()
+        self._recent_llm_order.clear()
+
     def allow_llm(self, event: GameEvent, snapshot: GameSnapshot, *, now: float | None = None) -> bool:
-        if not self.config.llm_commentary_enabled or not self.config.llm_data_consent or snapshot.phase == "spectator":
+        if self.config.llm_do_not_disturb or not self.config.llm_data_consent or snapshot.phase == "spectator":
+            return False
+        if event.kind in _LIFECYCLE_COMMENTARY_KINDS:
             return False
         if event.priority < self.config.llm_min_priority:
             return False

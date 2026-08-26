@@ -51,6 +51,16 @@ def test_manifest_enables_game_state_questions_by_default() -> None:
 
     assert CompanionConfig.from_mapping({}).llm_data_consent is True
     assert manifest["hearthstone_companion"]["llm_data_consent"] is True
+    assert CompanionConfig.from_mapping({}).llm_do_not_disturb is True
+    assert manifest["hearthstone_companion"]["llm_commentary_enabled"] is False
+    assert "llm_lifecycle_enabled" not in CompanionConfig.from_mapping({}).to_dict()
+    assert "llm_lifecycle_enabled" not in manifest["hearthstone_companion"]
+    assert "llm_do_not_disturb" not in manifest["hearthstone_companion"]
+
+    with (ROOT / "config.example.toml").open("rb") as handle:
+        runtime_template = tomllib.load(handle)["hearthstone_companion"]
+    assert runtime_template["llm_commentary_enabled"] is False
+    assert "llm_do_not_disturb" not in runtime_template
 
 
 def test_panel_literal_translation_keys_exist() -> None:
@@ -94,10 +104,30 @@ def test_primary_setup_is_offline_first_and_keeps_log_details_in_diagnostics() -
     assert "monitorReady" not in setup_source
     assert "prepare_power_log" not in setup_source
     assert "settings.logPath" not in setup_source
-    assert "actions.enable_companion.questionsOnly" in panel_source
-    assert "actions.enable_companion.withCommentary" in panel_source
+    assert "actions.enable_companion.withDoNotDisturb" in panel_source
+    assert "actions.enable_companion.withoutDoNotDisturb" in panel_source
     assert "llm_data_consent: true" in panel_source
+    assert "llm_do_not_disturb: true" in panel_source
     assert "value?.llm_data_consent !== false" in panel_source
+    assert "llm_lifecycle_enabled" not in panel_source
+    assert "llm_commentary_enabled" not in panel_source
+
+
+def test_panel_consent_and_do_not_disturb_controls_are_independent() -> None:
+    panel_source = (ROOT / "ui" / "panel.tsx").read_text(encoding="utf-8")
+    consent_start = panel_source.index("function setConsent(enabled: boolean)")
+    do_not_disturb_start = panel_source.index("function setDoNotDisturb(enabled: boolean)")
+    consent_source = panel_source[consent_start:do_not_disturb_start]
+    do_not_disturb_end = panel_source.index("const sourceState", do_not_disturb_start)
+    do_not_disturb_source = panel_source[do_not_disturb_start:do_not_disturb_end]
+
+    assert "llm_data_consent: enabled" in consent_source
+    assert "llm_do_not_disturb" not in consent_source
+    assert "llm_do_not_disturb: enabled" in do_not_disturb_source
+    assert "llm_data_consent" not in do_not_disturb_source
+    assert '"llm_lifecycle_reactions_enabled": bool(self.cfg.llm_data_consent)' in (
+        ROOT / "__init__.py"
+    ).read_text(encoding="utf-8")
 
 
 def test_successful_action_is_not_reclassified_when_followup_refresh_fails() -> None:

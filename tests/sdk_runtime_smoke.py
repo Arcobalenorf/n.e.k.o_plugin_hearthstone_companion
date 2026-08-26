@@ -57,8 +57,8 @@ class _HostContext:
                 "overlay_auto_start": False,
             }
         }
-        self._profiles: dict[str, dict[str, Any]] = {}
-        self._active_profile: str | None = None
+        self._profiles: dict[str, dict[str, Any]] = {"smoke": {}}
+        self._active_profile: str | None = "smoke"
 
     async def get_own_config(self, timeout: float = 5.0) -> dict[str, Any]:
         del timeout
@@ -113,6 +113,20 @@ class _HostContext:
             "persisted": True,
             "config": effective["config"],
         }
+
+    async def upsert_own_profile_config(
+        self,
+        profile_name: str,
+        config: dict[str, Any],
+        *,
+        make_active: bool = False,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        del timeout
+        self._profiles[profile_name] = dict(config)
+        if make_active:
+            self._active_profile = profile_name
+        return {"data": {"config": dict(self._profiles[profile_name])}}
 
     def push_message(self, **_kwargs: Any) -> None:
         # N.E.K.O v0.8.3 accepted pushes successfully but returned no receipt.
@@ -224,6 +238,18 @@ async def _exercise_lifecycle(plugin: Any, unwrap_or: Any, host_ctx: _HostContex
             raise RuntimeError(f"stable SDK did not expose static Agent entry: {entry_id}")
         if item.get("kind") != "service" or item.get("llm_result_fields") != ["reply"]:
             raise RuntimeError(f"unexpected static Agent entry metadata: {item!r}")
+        settings_entry = entries.get("save_settings")
+        settings_schema = (settings_entry or {}).get("input_schema") or {}
+        settings_properties = settings_schema.get("properties") or {}
+        if (
+            "llm_do_not_disturb" not in settings_properties
+            or "llm_data_consent" not in settings_properties
+            or "llm_commentary_enabled" in settings_properties
+            or "llm_lifecycle_enabled" in settings_properties
+        ):
+            raise RuntimeError(
+                f"stable SDK exposed an unexpected settings action schema: {settings_schema!r}"
+            )
 
         entry_updates: dict[str, dict[str, Any]] = {}
         while True:
@@ -269,7 +295,7 @@ async def _exercise_lifecycle(plugin: Any, unwrap_or: Any, host_ctx: _HostContex
         saved = unwrap_or(
             await plugin.save_settings(
                 llm_data_consent=True,
-                llm_commentary_enabled=True,
+                llm_do_not_disturb=False,
                 target_lanlan="stable-sdk-smoke-role",
             ),
             {},
@@ -278,6 +304,11 @@ async def _exercise_lifecycle(plugin: Any, unwrap_or: Any, host_ctx: _HostContex
             raise RuntimeError(f"unexpected settings save result: {saved!r}")
         if plugin.cfg.llm_data_consent is not True:
             raise RuntimeError("stable SDK smoke did not persist LLM data consent")
+        active_settings = host_ctx._profiles["smoke"].get("hearthstone_companion", {})
+        if active_settings.get("llm_do_not_disturb") is not False:
+            raise RuntimeError("settings save did not update the active config profile")
+        if "llm_do_not_disturb" in host_ctx._base_config["hearthstone_companion"]:
+            raise RuntimeError("active-profile settings leaked into persistent runtime config")
         path_saved = unwrap_or(
             await plugin.save_settings(log_path=r"  C:\Games\Hearthstone\Logs  "),
             {},
@@ -286,7 +317,7 @@ async def _exercise_lifecycle(plugin: Any, unwrap_or: Any, host_ctx: _HostContex
             raise RuntimeError(f"partial log-path save reset companion settings: {path_saved!r}")
         if plugin.cfg.log_path != r"C:\Games\Hearthstone\Logs":
             raise RuntimeError(f"log path was not normalized and applied: {plugin.cfg.log_path!r}")
-        if not plugin.cfg.llm_data_consent or not plugin.cfg.llm_commentary_enabled:
+        if not plugin.cfg.llm_data_consent or plugin.cfg.llm_do_not_disturb:
             raise RuntimeError("partial log-path save did not preserve LLM settings")
         if plugin._monitor._tailer.locator.configured_path != plugin.cfg.log_path:
             raise RuntimeError("partial log-path save did not rebuild the monitor reader")

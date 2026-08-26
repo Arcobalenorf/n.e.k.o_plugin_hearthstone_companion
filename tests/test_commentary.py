@@ -91,21 +91,21 @@ def test_llm_defaults_to_data_sharing_but_respects_explicit_opt_out() -> None:
     snapshot = GameSnapshot(phase="playing")
 
     assert CommentaryArbiter(config()).allow_llm(event(), snapshot, now=100.0) is False
-    assert CommentaryArbiter(config(llm_commentary_enabled=True)).allow_llm(
+    assert CommentaryArbiter(config(llm_do_not_disturb=False)).allow_llm(
         event(), snapshot, now=100.0
     ) is True
     assert CommentaryArbiter(config(llm_data_consent=True)).allow_llm(
         event(), snapshot, now=100.0
     ) is False
     assert CommentaryArbiter(
-        config(llm_commentary_enabled=True, llm_data_consent=False)
+        config(llm_do_not_disturb=False, llm_data_consent=False)
     ).allow_llm(event(), snapshot, now=100.0) is False
 
 
 def test_llm_rate_limits_normal_and_critical_events() -> None:
     arbiter = CommentaryArbiter(
         config(
-            llm_commentary_enabled=True,
+            llm_do_not_disturb=False,
             llm_data_consent=True,
             llm_cooldown_seconds=25.0,
             llm_critical_cooldown_seconds=8.0,
@@ -125,7 +125,7 @@ def test_llm_rate_limits_normal_and_critical_events() -> None:
 
 def test_llm_rejects_low_priority_and_spectator_events() -> None:
     arbiter = CommentaryArbiter(
-        config(llm_commentary_enabled=True, llm_data_consent=True, llm_min_priority=5)
+        config(llm_do_not_disturb=False, llm_data_consent=True, llm_min_priority=5)
     )
 
     assert arbiter.allow_llm(event(priority=4), GameSnapshot(phase="playing"), now=100.0) is False
@@ -279,7 +279,7 @@ def test_battlegrounds_prompt_includes_hero_choices_and_observed_opponent_board(
 
 def test_rejected_delivery_does_not_burn_cooldown_or_semantic_key() -> None:
     arbiter = CommentaryArbiter(
-        config(llm_commentary_enabled=True, llm_data_consent=True, llm_cooldown_seconds=25.0)
+        config(llm_do_not_disturb=False, llm_data_consent=True, llm_cooldown_seconds=25.0)
     )
     snapshot = GameSnapshot(phase="playing", game_number=3)
     candidate = event(suffix="retry")
@@ -292,7 +292,7 @@ def test_rejected_delivery_does_not_burn_cooldown_or_semantic_key() -> None:
 
 
 def test_semantic_dedupe_is_scoped_to_game_number() -> None:
-    arbiter = CommentaryArbiter(config(llm_commentary_enabled=True, llm_data_consent=True))
+    arbiter = CommentaryArbiter(config(llm_do_not_disturb=False, llm_data_consent=True))
     candidate = event(priority=9, suffix="same")
     first_game = GameSnapshot(phase="playing", game_number=4)
     next_game = GameSnapshot(phase="playing", game_number=5)
@@ -303,15 +303,52 @@ def test_semantic_dedupe_is_scoped_to_game_number() -> None:
     assert arbiter.allow_llm(candidate, next_game, now=130.0) is True
 
 
-def test_confirmed_terminal_event_bypasses_prior_nonterminal_cooldown() -> None:
-    arbiter = CommentaryArbiter(config(llm_commentary_enabled=True, llm_data_consent=True))
+def test_source_reset_clears_commentary_cooldown_and_semantic_history() -> None:
+    arbiter = CommentaryArbiter(
+        config(
+            llm_do_not_disturb=False,
+            llm_data_consent=True,
+            llm_cooldown_seconds=25.0,
+        )
+    )
+    candidate = event(priority=9, suffix="same")
+    snapshot = GameSnapshot(phase="playing", game_number=4)
+    arbiter.mark_llm_submitted(candidate, snapshot, now=100.0)
+
+    assert arbiter.allow_llm(candidate, snapshot, now=101.0) is False
+    arbiter.reset()
+
+    assert arbiter.allow_llm(candidate, snapshot, now=101.0) is True
+
+
+def test_terminal_event_never_falls_back_to_midgame_commentary() -> None:
+    arbiter = CommentaryArbiter(
+        config(
+            llm_do_not_disturb=False,
+            llm_data_consent=True,
+        )
+    )
     snapshot = GameSnapshot(phase="playing", game_number=6)
     arbiter.mark_llm_submitted(event(priority=8, suffix="damage"), snapshot, now=100.0)
     terminal = GameEvent(
         "battlegrounds_game_ended", 10, "placement confirmed", 101.0, {"placement": 1}
     )
 
-    assert arbiter.allow_llm(terminal, snapshot, now=101.0) is True
+    assert arbiter.allow_llm(terminal, snapshot, now=101.0) is False
+
+
+def test_lifecycle_owned_events_do_not_enter_regular_commentary() -> None:
+    arbiter = CommentaryArbiter(config(llm_do_not_disturb=False))
+    snapshot = GameSnapshot(phase="ended", game_number=6)
+
+    assert (
+        arbiter.allow_llm(
+            GameEvent("game_ended", 10, "won", 101.0, {"result": "won"}),
+            snapshot,
+            now=101.0,
+        )
+        is False
+    )
 
 
 def test_duos_third_place_uses_comfort_not_top_finish_pride() -> None:

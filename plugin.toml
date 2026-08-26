@@ -50,6 +50,8 @@ monitor_on_start = true
 log_path = ""
 poll_interval_seconds = 0.1
 initial_read_max_bytes = 67108864
+# Keep the former storage key so existing profile overlays retain their preference.
+# The UI and runtime expose its inverse as the do-not-disturb setting.
 llm_commentary_enabled = false
 llm_data_consent = true
 llm_min_priority = 5

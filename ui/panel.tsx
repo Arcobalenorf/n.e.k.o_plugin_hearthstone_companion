@@ -213,7 +213,7 @@ type OverlayState = {
 
 type SettingsState = {
   log_path?: string
-  llm_commentary_enabled?: boolean
+  llm_do_not_disturb?: boolean
   llm_data_consent?: boolean
   target_lanlan?: string
   card_catalog_network_enabled?: boolean
@@ -228,6 +228,7 @@ type PrivacyState = {
   player_names_retained?: boolean
   hidden_opponent_cards_exposed?: boolean
   llm_public_state_sharing_enabled?: boolean
+  llm_lifecycle_reactions_enabled?: boolean
   card_catalog_network_enabled?: boolean
   card_catalog_sends_game_state?: boolean
 }
@@ -250,7 +251,7 @@ type DashboardState = {
 }
 
 type SettingsDraft = {
-  llm_commentary_enabled: boolean
+  llm_do_not_disturb: boolean
   llm_data_consent: boolean
   target_lanlan: string
   card_catalog_network_enabled: boolean
@@ -268,7 +269,7 @@ type ActionOutcome = {
 }
 
 const DEFAULT_SETTINGS: SettingsDraft = {
-  llm_commentary_enabled: false,
+  llm_do_not_disturb: true,
   llm_data_consent: true,
   target_lanlan: "",
   card_catalog_network_enabled: true,
@@ -281,7 +282,7 @@ const DEFAULT_SETTINGS: SettingsDraft = {
 function asSettingsDraft(value?: SettingsState): SettingsDraft {
   const dataSharingEnabled = value?.llm_data_consent !== false
   return {
-    llm_commentary_enabled: Boolean(value?.llm_commentary_enabled && dataSharingEnabled),
+    llm_do_not_disturb: value?.llm_do_not_disturb !== false,
     llm_data_consent: dataSharingEnabled,
     target_lanlan: String(value?.target_lanlan || ""),
     card_catalog_network_enabled: value?.card_catalog_network_enabled !== false,
@@ -651,17 +652,11 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
   }
 
   async function saveSettings() {
-    if (draft.llm_commentary_enabled && !draft.llm_data_consent) {
-      const message = t("errors.consentRequired")
-      setFailure(message)
-      toast.warning(message)
-      return
-    }
     const successKey = !draft.llm_data_consent
       ? "messages.savedLocalOnly"
-      : draft.llm_commentary_enabled
-        ? "messages.savedWithCommentary"
-        : "messages.savedQuestionsOnly"
+      : !draft.llm_do_not_disturb
+        ? "messages.savedWithoutDoNotDisturb"
+        : "messages.savedWithDoNotDisturb"
     const outcome = await runAction("save_settings", draft, successKey)
     if (outcome.ok) {
       preserveDraftOnCleanRef.current = !outcome.refreshed
@@ -689,20 +684,13 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
     setDraft((current) => ({
       ...current,
       llm_data_consent: enabled,
-      llm_commentary_enabled: enabled ? current.llm_commentary_enabled : false,
     }))
     setDraftDirty(true)
     setFailure("")
   }
 
-  function setCommentary(enabled: boolean) {
-    if (enabled && !draft.llm_data_consent) {
-      const message = t("errors.consentRequired")
-      setFailure(message)
-      toast.warning(message)
-      return
-    }
-    updateDraft({ llm_commentary_enabled: enabled })
+  function setDoNotDisturb(enabled: boolean) {
+    updateDraft({ llm_do_not_disturb: enabled })
     setFailure("")
   }
 
@@ -721,9 +709,9 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
           : "setup.connection.stopped"
   const enableActionKey = !draft.llm_data_consent
     ? "actions.enable_companion.localOnly"
-    : draft.llm_commentary_enabled
-      ? "actions.enable_companion.withCommentary"
-      : "actions.enable_companion.questionsOnly"
+    : !draft.llm_do_not_disturb
+      ? "actions.enable_companion.withoutDoNotDisturb"
+      : "actions.enable_companion.withDoNotDisturb"
   const shopArea = battlegrounds.areas?.shop
   const handArea = battlegrounds.areas?.hand
   const warbandArea = battlegrounds.areas?.warband
@@ -784,14 +772,13 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
               onChange={setConsent}
             />
             <Text>{t("setup.consent.help")}</Text>
-            <Heading as="h3">{t("setup.commentary.title")}</Heading>
+            <Heading as="h3">{t("setup.doNotDisturb.title")}</Heading>
             <Switch
-              checked={draft.llm_commentary_enabled}
-              disabled={!draft.llm_data_consent}
-              label={t("settings.llmCommentary")}
-              onChange={setCommentary}
+              checked={draft.llm_do_not_disturb}
+              label={t("settings.llmDoNotDisturb")}
+              onChange={setDoNotDisturb}
             />
-            <Text>{t(draft.llm_data_consent ? "setup.commentary.help" : "settings.llmDisabledHelp")}</Text>
+            <Text>{t("setup.doNotDisturb.help")}</Text>
             <Divider />
             <Inline align="center" wrap>
               {draftDirty ? <StatusBadge tone="warning" label={t("setup.pending")} /> : null}
@@ -1161,7 +1148,8 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
                 { key: "names", label: t("privacy.playerNamesRetained"), value: yesNo(privacy.player_names_retained) },
                 { key: "hidden", label: t("privacy.hiddenCardsExposed"), value: yesNo(privacy.hidden_opponent_cards_exposed) },
                 { key: "sharing", label: t("privacy.publicStateSharing"), value: yesNo(privacy.llm_public_state_sharing_enabled) },
-                { key: "commentary", label: t("privacy.proactiveCommentary"), value: yesNo(safeState.settings?.llm_commentary_enabled) },
+                { key: "lifecycle", label: t("privacy.lifecycleReactions"), value: yesNo(privacy.llm_lifecycle_reactions_enabled) },
+                { key: "doNotDisturb", label: t("privacy.doNotDisturb"), value: yesNo(safeState.settings?.llm_do_not_disturb) },
                 { key: "catalogNetwork", label: t("privacy.cardCatalogNetwork"), value: yesNo(privacy.card_catalog_network_enabled) },
                 { key: "catalogState", label: t("privacy.cardCatalogGameState"), value: yesNo(privacy.card_catalog_sends_game_state) },
               ]}

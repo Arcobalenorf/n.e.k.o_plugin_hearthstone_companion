@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import threading
 import time
 from dataclasses import replace
@@ -14,7 +15,7 @@ from .tailer import PowerLogLocator, PowerLogTailer
 OutputCallback = Callable[[str, GameEvent, GameSnapshot], bool]
 StatusCallback = Callable[[dict[str, Any]], None]
 ResultCallback = Callable[[GameEvent, GameSnapshot], None]
-EventCallback = Callable[[GameEvent, GameSnapshot], None]
+EventCallback = Callable[..., None]
 StateCallback = Callable[[GameSnapshot], None]
 LIVE_STATE_MAX_AGE_SECONDS = 300.0
 LIVE_CONTEXT_PUBLISH_INTERVAL_SECONDS = 0.5
@@ -46,6 +47,9 @@ class CompanionMonitor:
         self._on_status = on_status
         self._on_result = on_result
         self._on_event = on_event
+        self._on_event_accepts_source_generation = self._callback_accepts_source_generation(
+            on_event
+        )
         self._on_state = on_state
         self._parser = PowerLogParser()
         self._tailer = PowerLogTailer(
@@ -63,6 +67,7 @@ class CompanionMonitor:
         self._thread: threading.Thread | None = None
         self._start_count = 0
         self._source_generation = 0
+        self._source_reset_preapplied = False
         self._live_context_generation: int | None = None
         self._bootstrap_complete = False
         self._state_ready_notified = False
@@ -71,12 +76,25 @@ class CompanionMonitor:
         self._shop_settle_started_at = 0.0
         self._pending_recruit_emission: tuple[GameEvent, GameSnapshot] | None = None
 
+    @staticmethod
+    def _callback_accepts_source_generation(callback: EventCallback | None) -> bool:
+        if callback is None:
+            return False
+        try:
+            inspect.signature(callback).bind(None, None, None)
+        except (TypeError, ValueError):
+            return False
+        return True
+
     def _begin_source_generation_locked(self) -> None:
         self._source_generation += 1
         self._live_context_generation = None
         self._bootstrap_complete = False
         self._state_ready_notified = False
         self._state_stale_notified = False
+        self._last_notified_snapshot = GameSnapshot()
+        self._next_state_publish_at = 0.0
+        self._arbiter.reset()
         self._shop_settle_signature = None
         self._shop_settle_started_at = 0.0
         self._pending_recruit_emission = None
@@ -101,6 +119,7 @@ class CompanionMonitor:
         self._last_notified_snapshot = GameSnapshot()
         self._next_state_publish_at = 0.0
         self._begin_source_generation_locked()
+        self._source_reset_preapplied = True
 
     def start(self) -> bool:
         with self._lifecycle_lock:
@@ -175,6 +194,7 @@ class CompanionMonitor:
                     self._tailer = staged_tailer
                     self._snapshot = staged_snapshot
                     self._begin_source_generation_locked()
+                    self._source_reset_preapplied = True
 
     def snapshot(self) -> GameSnapshot:
         with self._lock:
@@ -188,6 +208,17 @@ class CompanionMonitor:
         """Return one immutable view of the current log-source generation."""
         with self._lock:
             return self._snapshot, replace(self._status), self._source_generation
+
+    def run_if_source_generation(
+        self,
+        expected_generation: int,
+        callback: Callable[[], Any],
+    ) -> tuple[bool, Any]:
+        """Linearize a short delivery with the currently active log source."""
+        with self._lock:
+            if expected_generation != self._source_generation:
+                return False, None
+            return True, callback()
 
     def try_capture(
         self, *, timeout_seconds: float = 0.05
@@ -218,8 +249,13 @@ class CompanionMonitor:
                     batch = self._tailer.poll()
                     self._status.last_error_code = ""
                     if batch.source_reset:
+                        # A rebuilt reader may wait through empty polls before
+                        # its first concrete log appears.
+                        source_reset_preapplied = self._source_reset_preapplied
+                        self._source_reset_preapplied = False
                         self._parser.reset_source()
-                        self._begin_source_generation_locked()
+                        if not source_reset_preapplied:
+                            self._begin_source_generation_locked()
                     if batch.bootstrap:
                         self._bootstrap_complete = batch.bootstrap_complete
                     was_stale = self._state_stale_notified
@@ -283,6 +319,7 @@ class CompanionMonitor:
                                 snapshot,
                             )
                         state_changed = snapshot != self._snapshot
+                        previous_game_number = self._snapshot.game_number
                         previous_active_snapshot = bool(
                             self._snapshot.game_number > 0
                             and self._snapshot.phase not in {"idle", "ended", "spectator"}
@@ -331,12 +368,23 @@ class CompanionMonitor:
                             and not batch.bootstrap
                             and was_stale
                             and live_active_snapshot
+                            and snapshot.game_number == previous_game_number
+                            and not any(
+                                event.kind == "game_started"
+                                for event, _event_snapshot in emissions
+                            )
                         )
                         if processed_lines and not batch.bootstrap and live_active_snapshot:
                             self._live_context_generation = self._source_generation
                         if not active_snapshot:
                             state_unavailable = bool(
-                                state_changed and previous_active_snapshot
+                                state_changed
+                                and previous_active_snapshot
+                                and not any(
+                                    event.kind
+                                    in {"battlegrounds_game_ended", "game_ended"}
+                                    for event, _event_snapshot in emissions
+                                )
                             )
                             self._live_context_generation = None
                             self._state_stale_notified = False
@@ -443,6 +491,7 @@ class CompanionMonitor:
                         emissions,
                         now,
                         source_generation=tick_generation,
+                        suppress_commentary=state_resumed,
                     )
                 if publish_state:
                     self._notify_state(
@@ -550,6 +599,7 @@ class CompanionMonitor:
         now: float,
         *,
         source_generation: int | None = None,
+        suppress_commentary: bool = False,
     ) -> None:
         with self._emission_lock:
             with self._lock:
@@ -558,12 +608,20 @@ class CompanionMonitor:
                     and source_generation != self._source_generation
                 ):
                     return
-            self._handle_batch_serial(emissions, now)
+            self._handle_batch_serial(
+                emissions,
+                now,
+                source_generation=source_generation,
+                suppress_commentary=suppress_commentary,
+            )
 
     def _handle_batch_serial(
         self,
         emissions: list[tuple[GameEvent, GameSnapshot]],
         now: float,
+        *,
+        source_generation: int | None = None,
+        suppress_commentary: bool = False,
     ) -> None:
         if not emissions:
             return
@@ -587,9 +645,18 @@ class CompanionMonitor:
         terminal_kinds = {"battlegrounds_game_ended", "game_ended"}
         for event, snapshot in emissions:
             if event.kind not in terminal_kinds:
-                self._notify_event(event, snapshot)
+                self._notify_event(
+                    event,
+                    snapshot,
+                    source_generation=source_generation,
+                )
 
-        candidates = [
+        lifecycle_owned_batch = suppress_commentary or any(
+            event.kind
+            in {"game_started", "battlegrounds_game_ended", "game_ended"}
+            for event, _snapshot in emissions
+        )
+        candidates = [] if lifecycle_owned_batch else [
             (event, snapshot)
             for event, snapshot in emissions
             if snapshot.phase != "spectator"
@@ -613,7 +680,11 @@ class CompanionMonitor:
 
         for event, snapshot in emissions:
             if event.kind in terminal_kinds:
-                self._notify_event(event, snapshot)
+                self._notify_event(
+                    event,
+                    snapshot,
+                    source_generation=source_generation,
+                )
 
     @staticmethod
     def _snapshot_for_event(event: GameEvent, snapshot: GameSnapshot) -> GameSnapshot:
@@ -631,6 +702,16 @@ class CompanionMonitor:
         event_snapshot: GameSnapshot,
         batch_snapshot: GameSnapshot,
     ) -> GameSnapshot:
+        if event.kind == "game_started":
+            if (
+                batch_snapshot.game_number == event_snapshot.game_number
+                and batch_snapshot.game_number > 0
+                and batch_snapshot.mode in {"constructed", "battlegrounds"}
+                and batch_snapshot.phase not in {"idle", "ended", "spectator"}
+            ):
+                return batch_snapshot
+            return event_snapshot
+
         if event.kind == "turn_started" and batch_snapshot.mode == "constructed":
             event_turn = int(event.details.get("turn") or 0)
             event_side = str(event.details.get("active_side") or "unknown")
@@ -739,7 +820,10 @@ class CompanionMonitor:
                 ):
                     return
             try:
-                self._on_event(event, snapshot)
+                if self._on_event_accepts_source_generation:
+                    self._on_event(event, snapshot, source_generation)
+                else:
+                    self._on_event(event, snapshot)
             except Exception as exc:
                 with self._lock:
                     self._status.last_error_code = f"event:{type(exc).__name__}"
