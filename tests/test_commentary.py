@@ -5,6 +5,7 @@ import json
 import pytest
 from hearthstone_companion_under_test.commentary import (
     CommentaryArbiter,
+    build_atomic_live_state_segment,
     build_emotion_cue,
     build_live_state_context,
     build_live_state_contexts,
@@ -31,6 +32,36 @@ from hearthstone_companion_under_test.models import (
 
 def event(*, priority: int = 5, suffix: str = "") -> GameEvent:
     return GameEvent("hero_damaged", priority, f"受到伤害{suffix}", 100.0, {"amount": 3, "side": "player"})
+
+
+def test_atomic_live_state_is_one_bounded_replaceable_context() -> None:
+    snapshot = GameSnapshot(
+        mode="constructed",
+        phase="playing",
+        game_number=4,
+        turn=21,
+        round=11,
+        active_side="player",
+        constructed=ConstructedSnapshot(
+            player=ConstructedSideSnapshot(board_identities_complete=True),
+            opponent=ConstructedSideSnapshot(board_identities_complete=True),
+        ),
+    )
+
+    segments = build_atomic_live_state_segment(
+        snapshot,
+        observed_at=1235.0,
+        max_prompt_bytes=900,
+    )
+
+    assert len(segments) == 1
+    assert segments[0][0] == "core"
+    assert len(segments[0][1].encode("utf-8")) <= 900
+    assert '"round":11' in segments[0][1]
+    assert '"turn":21' in segments[0][1]
+    assert "第几回合" in segments[0][1]
+    assert "只用round" in segments[0][1]
+    assert "禁用turn" in segments[0][1]
 
 
 def test_llm_prompt_omits_incomplete_battlegrounds_regions_and_economy() -> None:

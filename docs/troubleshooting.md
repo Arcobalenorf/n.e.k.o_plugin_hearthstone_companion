@@ -38,17 +38,17 @@ Get-ChildItem "$env:LOCALAPPDATA\Blizzard\Hearthstone" -Filter Power.log -Recurs
 
 ## 开启免打扰后还能问酒馆问题吗
 
-可以。保持 `llm_data_consent=true`；模型可在首答同一轮调用 `hearthstone_live_state`，或由统一 Agent/明确问题兜底承接。`llm_do_not_disturb` 只抑制中局主动事件；开场、重连和结算始终随局势共享生效。
+可以。保持 `llm_data_consent=true`；模型可在首答同一轮调用 `hearthstone_current_turn` 或 `hearthstone_live_state`，也可由统一 Agent/明确问题兜底承接。`llm_do_not_disturb` 只抑制中局主动事件；开场、重连和结算始终随局势共享生效。
 
-若查询返回 `llm_data_sharing_not_authorized`，说明数据共享未开启。若状态为空，确认已经进入酒馆且日志正在增长。若面板已有商店/战团但角色仍声称没有炉石能力，依次确认目标角色的 `/api/tools` 已注册 `hearthstone_live_state`、模型请求携带该 schema、tool callback 返回 `hearthstone_compact_v1`；再检查 Agent 是否能发现 `query_hearthstone_live_state`，以及 `live_query_watch` 是否从 memory 识别查询并提交定向 `respond`。插件必须保持 `passive=false`，否则 Agent 会跳过查询入口，但同轮工具与 memory 兜底仍是独立链路。
+若查询返回 `llm_data_sharing_not_authorized`，说明数据共享未开启。若状态为空，确认已经进入酒馆且日志正在增长。若面板已有商店/战团但角色仍声称没有炉石能力，依次确认目标角色的 `/api/tools` 已注册 `hearthstone_current_turn` 和 `hearthstone_live_state`、模型请求携带对应 schema、tool callback 返回 `hearthstone_current_turn_v1` 或 `hearthstone_compact_v1`；再检查 Agent 是否能发现 `query_hearthstone_live_state`，以及 `live_query_watch` 是否从 memory 识别查询并提交定向 `respond`。插件必须保持 `passive=false`，否则 Agent 会跳过查询入口，但同轮工具与 memory 兜底仍是独立链路。
 
 ## 为什么候选英雄不完整或不能给出具体出牌
 
 候选列表只显示 `Power.log` 明确归属于本地玩家、未隐藏且未锁定的英雄。日志尚未建立本地 controller、某个选项未公开或选择阶段已经结束时，列表可能为空；插件不会根据常见候选数或卡池补猜。列表可用时，统一工具可以结合公共英雄规则和本机样本供角色比较，但不会提供没有来源的全局胜率。“哪张更值得考虑”等定性酒馆建议要求工具当次读到招募阶段、正在更新的完整商店和规则证据；个别费用缺失不会关闭定性比较。若询问可负担性、剩余金币或购买顺序，当前金币和商店所有卡牌的实际费用也必须完整，角色不得用默认 3 费补算，也不得在金币为 0 时把未知费用卡牌直接判为买不起。战斗阶段或缓存状态只能解释已观察信息。
 
-普通对战可在用户主动提问时同轮调用 `hearthstone_live_state`，共享本地玩家当前可见的具体手牌。若角色仍答不出回合或手牌，先确认局势问答授权已开启、状态为实时，再核对 `/api/tools` 中的注册项、对应 tool call 和 callback；没有 tool call 时检查 memory 兜底是否向问题所属角色提交了 `respond`。这类当前问题应重新查询，不能沿用较早对话。工具不会提供完整合法操作与目标枚举；字段缺失时应如实说明。对手隐藏手牌、奥秘身份和牌序是永久边界，重新配置日志也不会开放。
+普通对战可在用户主动提问时同轮调用实时工具，共享当前轮次或本地玩家当前可见的具体手牌。若角色仍答不出回合或手牌，先确认局势问答授权已开启、状态为实时，再核对 `/api/tools` 中的两个注册项、对应 tool call 和 callback；没有 tool call 时检查 memory 兜底是否向问题所属角色提交了 `respond`。这类当前问题应重新查询，不能沿用较早对话。工具不会提供完整合法操作与目标枚举；字段缺失时应如实说明。对手隐藏手牌、奥秘身份和牌序是永久边界，重新配置日志也不会开放。
 
-排查模型链路时分别核对五项：`/api/tools` 中目标角色可见 `hearthstone_live_state`；模型请求实际携带工具 schema；模型产生 tool call；user-plugin-server callback 返回 `is_error=false` 且 `output.format=hearthstone_compact_v1`；没有调用工具时，明确问题能被 memory 兜底定向提交并生成最终角色回答。模型选择工具本身是概率行为，验收重点是链路可用、明确问题能正常取得对应视图，而不是要求所有自由表达都 100% 触发。
+排查模型链路时分别核对五项：`/api/tools` 中目标角色可见两个实时工具；模型请求实际携带工具 schema；模型产生对应 tool call；user-plugin-server callback 返回 `is_error=false` 和正确 format；没有调用工具时，明确问题能被 memory 兜底定向提交并生成最终角色回答。模型选择工具本身是概率行为，验收重点是链路可用、明确问题能正常取得对应视图，而不是要求所有自由表达都 100% 触发。
 
 ## 为什么没有全服胜率
 

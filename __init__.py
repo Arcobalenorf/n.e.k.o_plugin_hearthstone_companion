@@ -32,7 +32,7 @@ from plugin.sdk.plugin import (
 )
 
 from .card_catalog import BattlegroundsCardCatalog
-from .commentary import build_live_state_segments, build_llm_prompt
+from .commentary import build_atomic_live_state_segment, build_llm_prompt
 from .config import CompanionConfig
 from .delivery import LiveStatePublisher, QueryLedger
 from .instructions import HEARTHSTONE_CONTEXT_INSTRUCTIONS
@@ -59,13 +59,14 @@ _AGENT_REPLY_TARGET_TOKENS = 180
 _AGENT_REPLY_ESTIMATED_MAX_TOKENS = 170
 _LLM_TOOL_FOCUSED_MAX_BYTES = 4096
 _LLM_TOOL_STATE_MAX_BYTES = 2048
-_LIVE_STATE_DELIVERY_MAX_BYTES = 900
+_LIVE_STATE_DELIVERY_MAX_BYTES = 4096
 _LIVE_STATE_REFRESH_SECONDS = 30.0
 _LIFECYCLE_PENDING_SECONDS = 30.0
 _LIFECYCLE_SENT_LIMIT = 128
-_LIVE_QUERY_FALLBACK_DELAY_SECONDS = 1.25
+_LIVE_QUERY_FALLBACK_DELAY_SECONDS = 4.0
 _LIVE_QUERY_FALLBACK_MAX_AGE_SECONDS = 12.0
 _LIVE_QUERY_FALLBACK_MAX_CHARS = 5200
+_USER_CONTEXT_READ_TIMEOUT_SECONDS = 1.5
 _CONSTRUCTED_TOOL_FOCUSES = (
     "overview",
     "board",
@@ -95,6 +96,7 @@ _LLM_TOOL_HEALTH_RETRY_MAX_SECONDS = 15.0
 _LLM_TOOL_CONFIRM_DELAYS_SECONDS = (0.2, 0.4)
 _DEFAULT_USER_PLUGIN_SERVER_PORT = 48916
 _LLM_TOOL_HANDLER_NAMES = {
+    "hearthstone_current_turn": "hearthstone_current_turn",
     "hearthstone_live_state": "hearthstone_live_state",
 }
 _OVERLAY_RUNTIME_FIELDS = (
@@ -2002,6 +2004,57 @@ def _focused_llm_tool_result(
     return fallback
 
 
+def _current_turn_llm_tool_result(
+    payload: Mapping[str, Any],
+    *,
+    mode: str,
+) -> dict[str, Any]:
+    if mode == "battlegrounds":
+        state = (
+            payload.get("current_public_state")
+            if isinstance(payload.get("current_public_state"), Mapping)
+            else {}
+        )
+        action_turn = None
+    else:
+        state = payload.get("state") if isinstance(payload.get("state"), Mapping) else {}
+        action_turn = state.get("turn")
+
+    round_value = state.get("round")
+    try:
+        current_round = int(round_value)
+    except (TypeError, ValueError):
+        current_round = 0
+    try:
+        raw_action_turn = int(action_turn) if action_turn is not None else 0
+    except (TypeError, ValueError):
+        raw_action_turn = 0
+
+    result: dict[str, Any] = {
+        "format": "hearthstone_current_turn_v1",
+        "mode": mode,
+        # Strategy evidence can be incomplete while round/phase are still
+        # directly observed. Availability here describes this narrow view.
+        "available": bool(state),
+        "round_known": current_round > 0,
+        "round": current_round if current_round > 0 else None,
+        "action_turn": raw_action_turn if raw_action_turn > 0 else None,
+        "active_side": state.get("active_side") or "unknown",
+        "phase": state.get("phase") or "unknown",
+        "answer_contract": {
+            "current_round_field": "round",
+            "action_turn_is_raw_alternating_counter": True,
+            "never_answer_round_from_action_turn": True,
+            "if_round_unknown_say_so": True,
+        },
+    }
+    if not state:
+        reason = _agent_text(payload.get("reason"), limit=72)
+        if reason:
+            result["reason"] = reason
+    return result
+
+
 def _sanitize_constructed_tool_state(state: dict[str, Any]) -> dict[str, Any]:
     constructed = state.get("constructed")
     if not isinstance(constructed, Mapping):
@@ -2071,7 +2124,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         self._live_state_published_at = 0.0
         self._state_publisher = LiveStatePublisher(
             push_message=self._publish_sdk_message,
-            build_segments=build_live_state_segments,
+            build_segments=build_atomic_live_state_segment,
             logger=self.logger,
             max_prompt_bytes=_LIVE_STATE_DELIVERY_MAX_BYTES,
             refresh_seconds=_LIVE_STATE_REFRESH_SECONDS,
@@ -3421,13 +3474,18 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
     @message(id="chat_quiet_window", source="chat")
     async def on_chat_message(self, **kwargs: Any):
         context = kwargs.get("_ctx")
+        target = ""
+        configured_target = str(
+            getattr(getattr(self, "cfg", None), "target_lanlan", "") or ""
+        ).strip()[:80]
         if isinstance(context, Mapping):
             target = str(context.get("lanlan_name") or "").strip()[:80]
-            if target:
+            if target and (not configured_target or target == configured_target):
                 with self._delivery_transition():
                     self._session_target = target
-        with self._ownership_lock:
-            self._last_user_chat_at = time.time()
+        if target and (not configured_target or target == configured_target):
+            with self._ownership_lock:
+                self._last_user_chat_at = time.time()
         return Ok(
             {
                 "status": "observed",
@@ -3464,7 +3522,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         if publisher is None:
             publisher = LiveStatePublisher(
                 push_message=self._publish_sdk_message,
-                build_segments=build_live_state_segments,
+                build_segments=build_atomic_live_state_segment,
                 logger=getattr(self, "logger", None),
                 max_prompt_bytes=_LIVE_STATE_DELIVERY_MAX_BYTES,
                 refresh_seconds=_LIVE_STATE_REFRESH_SECONDS,
@@ -3531,10 +3589,16 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
     def _publish_live_state(
         self,
         snapshot: GameSnapshot,
+        source_generation: int | None = None,
         *,
         expected_monitor: Any | None = None,
         expected_source_generation: int | None = None,
     ) -> bool:
+        if expected_source_generation is None:
+            expected_source_generation = source_generation
+        if expected_monitor is None and expected_source_generation is not None:
+            with self._ownership_lock:
+                expected_monitor = getattr(self, "_monitor", None)
         return self._share_live_state(
             snapshot,
             expected_monitor=expected_monitor,
@@ -3549,33 +3613,35 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         expected_source_generation: int | None = None,
     ) -> bool:
         with self._delivery_guard():
-            def source_generation_valid() -> bool:
+            def source_snapshot_valid() -> bool:
                 if expected_monitor is None or expected_source_generation is None:
                     return True
                 with self._ownership_lock:
                     if getattr(self, "_monitor", None) is not expected_monitor:
                         return False
                 try:
-                    _snapshot, _runtime, current_generation = _capture_monitor(
+                    current_snapshot, _runtime, current_generation = _capture_monitor(
                         expected_monitor,
                         timeout_seconds=0.0,
                     )
                 except Exception:
                     return False
-                return current_generation == expected_source_generation
+                return bool(
+                    current_generation == expected_source_generation
+                    and current_snapshot == snapshot
+                )
 
             access_reason, _revision = _live_state_access(self)
             target = self._delivery_target()
             with self._ownership_lock:
                 blocked = bool(
                     access_reason
-                    or not target
                     or not self._started
                     or not self._monitor_dispatch_enabled
                     or snapshot.game_number <= 0
                     or snapshot.phase in {"idle", "ended", "spectator"}
                 )
-            if blocked or not source_generation_valid():
+            if blocked or not source_snapshot_valid():
                 return False
 
             cursor = self._ensure_state_publisher().cursor
@@ -3590,14 +3656,35 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                         or not self._started
                         or not self._monitor_dispatch_enabled
                         or self._delivery_target() != target
-                        or not source_generation_valid()
+                        or not source_snapshot_valid()
                     )
 
-            published = self._ensure_state_publisher().publish(
-                snapshot,
-                target=target,
-                valid=delivery_valid,
+            def publish_current_snapshot() -> bool:
+                return self._ensure_state_publisher().publish(
+                    snapshot,
+                    target=target,
+                    valid=delivery_valid,
+                )
+
+            guarded_publish = getattr(
+                expected_monitor,
+                "run_if_source_generation",
+                None,
             )
+            if (
+                expected_monitor is not None
+                and expected_source_generation is not None
+                and callable(guarded_publish)
+            ):
+                still_current, published = guarded_publish(
+                    expected_source_generation,
+                    snapshot.game_number,
+                    publish_current_snapshot,
+                    lambda current: current == snapshot,
+                )
+                published = bool(still_current and published)
+            else:
+                published = publish_current_snapshot()
             self._sync_live_state_compatibility()
             return published
 
@@ -3647,9 +3734,19 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             self._pending_game_lifecycle = None
             return True
 
-    def _clear_pending_game_lifecycle(self) -> None:
+    def _clear_pending_game_lifecycle(
+        self,
+        *,
+        expected: _PendingGameLifecycleReaction | None = None,
+    ) -> bool:
         with self._delivery_transition():
+            if (
+                expected is not None
+                and getattr(self, "_pending_game_lifecycle", None) is not expected
+            ):
+                return False
             self._pending_game_lifecycle = None
+            return True
 
     @staticmethod
     def _game_lifecycle_snapshot_ready(
@@ -3762,25 +3859,11 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 return False
             identity = f"{epoch}:{game_number}:{stage}"
 
-            if hard_disabled or snapshot.phase == "spectator":
+            if hard_disabled:
                 self._clear_pending_game_lifecycle()
                 return False
-            if access_reason:
-                if access_reason in _TRANSIENT_LIVE_STATE_ACCESS_REASONS:
-                    self._queue_game_lifecycle(
-                        stage=stage,
-                        identity=identity,
-                        epoch=epoch,
-                        event=event,
-                        snapshot=snapshot,
-                        source_generation=source_generation,
-                        seed=pending,
-                    )
-                else:
-                    self._clear_pending_game_lifecycle()
-                return False
-            if not self._game_lifecycle_source_is_current(source_generation):
-                self._clear_pending_game_lifecycle()
+            if snapshot.phase == "spectator":
+                self._clear_pending_game_lifecycle(expected=pending)
                 return False
             with self._ownership_lock:
                 if pending is not None:
@@ -3793,6 +3876,24 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                         or pending.expires_at <= time.time()
                     ):
                         return False
+            if access_reason:
+                if access_reason in _TRANSIENT_LIVE_STATE_ACCESS_REASONS:
+                    self._queue_game_lifecycle(
+                        stage=stage,
+                        identity=identity,
+                        epoch=epoch,
+                        event=event,
+                        snapshot=snapshot,
+                        source_generation=source_generation,
+                        seed=pending,
+                    )
+                else:
+                    self._clear_pending_game_lifecycle(expected=pending)
+                return False
+            if not self._game_lifecycle_source_is_current(source_generation):
+                self._clear_pending_game_lifecycle(expected=pending)
+                return False
+            with self._ownership_lock:
                 pending_before_submit = getattr(self, "_pending_game_lifecycle", None)
                 if identity in getattr(self, "_game_lifecycle_sent", {}):
                     if (
@@ -3917,7 +4018,12 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 if source_generation is not None and callable(guarded_submit):
                     generation_current, submitted = guarded_submit(
                         source_generation,
+                        game_number,
                         submit_message,
+                        lambda current: self._game_lifecycle_snapshot_ready(
+                            stage,
+                            current,
+                        ),
                     )
                 else:
                     generation_current = self._game_lifecycle_source_is_current(
@@ -3932,7 +4038,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 generation_current = False
                 submitted = False
             if not generation_current:
-                self._clear_pending_game_lifecycle()
+                self._clear_pending_game_lifecycle(expected=pending)
                 return False
             if not submitted:
                 self._queue_game_lifecycle(
@@ -3991,14 +4097,14 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     pending.source_generation is not None
                     and current_generation != pending.source_generation
                 ):
-                    self._clear_pending_game_lifecycle()
+                    self._clear_pending_game_lifecycle(expected=pending)
                     return False
                 if current.game_number != pending.snapshot.game_number:
-                    self._clear_pending_game_lifecycle()
+                    self._clear_pending_game_lifecycle(expected=pending)
                     return False
                 if pending.stage != "ended":
                     if current.phase in {"idle", "ended", "spectator"}:
-                        self._clear_pending_game_lifecycle()
+                        self._clear_pending_game_lifecycle(expected=pending)
                         return False
                     snapshot = current
         return self._submit_game_lifecycle(
@@ -4122,7 +4228,17 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         get_memory = getattr(memory, "get", None)
         if not callable(get_memory):
             return ()
-        result = get_memory(bucket_id="default", limit=8, timeout=0.25)
+        kwargs = {
+            "bucket_id": "default",
+            "limit": 8,
+            "timeout": _USER_CONTEXT_READ_TIMEOUT_SECONDS,
+        }
+        if inspect.iscoroutinefunction(get_memory):
+            result = await get_memory(**kwargs)
+        else:
+            # The packaged SDK exposes memory.get as blocking ZeroMQ IPC.
+            # Keep it off the plugin event loop so timers and callbacks remain live.
+            result = await asyncio.to_thread(get_memory, **kwargs)
         if inspect.isawaitable(result):
             result = await result
         is_err = getattr(result, "is_err", None)
@@ -4168,7 +4284,10 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         observed.sort(key=lambda item: item[0])
         ledger = self._ensure_query_ledger()
         accepted = 0
+        query_observations: list[tuple[float, str, str, str]] = []
         for source_timestamp, target, text, target_allowed in observed:
+            if not target_allowed:
+                continue
             signature = ledger.signature(text, target)
             with self._delivery_transition():
                 watermark = float(
@@ -4196,15 +4315,24 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                         float(getattr(self, "_last_user_chat_at", 0.0) or 0.0),
                         source_timestamp,
                     )
-            if not is_new or not target_allowed:
+            if not is_new:
                 continue
             accepted += 1
-            if classify_live_query(text) is not None:
-                ledger.observe(
-                    text,
-                    target=target,
-                    source_timestamp=source_timestamp,
+            intent = classify_live_query(text)
+            if intent is not None:
+                query_observations.append(
+                    (source_timestamp, target, text, intent.focus)
                 )
+        # A memory window may contain an older and the current identical
+        # utterance when a role-scoped Agent has already created a provisional
+        # claim. Bind the newest record first; older replay then cannot steal it.
+        for source_timestamp, target, text, intent in reversed(query_observations):
+            ledger.observe(
+                text,
+                target=target,
+                source_timestamp=source_timestamp,
+                intent=intent,
+            )
         return accepted
 
     @staticmethod
@@ -4339,7 +4467,11 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 if not delivery_still_valid:
                     ledger.release(acquired, owner="fallback")
                     return False
-                submitted = _submitted(self.push_message(**kwargs))
+                submitted = ledger.commit(
+                    acquired,
+                    owner="fallback",
+                    submit=lambda: _submitted(self.push_message(**kwargs)),
+                )
             if not submitted:
                 ledger.release(acquired, owner="fallback")
             return submitted
@@ -4393,7 +4525,8 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 )
                 continue
             submitted = await self._dispatch_live_query_fallback(claim)
-            break
+            if submitted:
+                break
         return Ok(
             {
                 "observed": observed,
@@ -5278,27 +5411,46 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             limit=240,
         )
         context_target = str(context.get("lanlan_name") or "").strip()[:80]
-        if context_target:
-            with self._delivery_transition():
-                self._session_target = context_target
-        ledger = getattr(self, "_query_ledger", None)
-        claim_query = getattr(ledger, "claim", None)
-        acquired_claim = None
-        if callable(claim_query):
-            target = context_target
-            resolve_target = getattr(self, "_delivery_target", None)
-            if not target and callable(resolve_target):
-                target = resolve_target()
-            acquired_claim = claim_query(owner="agent", text=query_text, target=target)
-        if query_text and callable(claim_query) and acquired_claim is None:
+        configured_target = str(
+            getattr(getattr(self, "cfg", None), "target_lanlan", "") or ""
+        ).strip()[:80]
+        if (
+            configured_target
+            and context_target != configured_target
+        ):
             return await self.finish(
-                data={"reply": "", "status": "query_already_handled"},
+                data={"reply": "", "status": "target_mismatch"},
                 delivery="silent",
                 meta={"agent": {"result_kind": "event", "delivery": "silent"}},
             )
-        if not query_text and callable(claim_query) and acquired_claim is None:
+        if context_target:
+            with self._delivery_transition():
+                self._session_target = context_target
+        explicit_selection = bool(
+            focus != "auto"
+            or mode != "auto"
+            or topic != "current_strategy"
+            or opponent_relation != "auto"
+        )
+        if not query_text and not explicit_selection:
             return await self.finish(
                 data={"reply": "", "status": "query_correlation_required"},
+                delivery="silent",
+                meta={"agent": {"result_kind": "event", "delivery": "silent"}},
+            )
+        ledger = self._ensure_query_ledger() if context_target else None
+        acquired_claim = None
+        if ledger is not None and query_text:
+            acquired_claim = ledger.claim(
+                owner="agent",
+                text=query_text,
+                target=context_target,
+                preempt_owners=("fallback",),
+                new_if_handled=True,
+            )
+        if ledger is not None and query_text and acquired_claim is None:
+            return await self.finish(
+                data={"reply": "", "status": "query_already_handled"},
                 delivery="silent",
                 meta={"agent": {"result_kind": "event", "delivery": "silent"}},
             )
@@ -5334,65 +5486,47 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 },
             )
         except BaseException:
-            release_claim = getattr(ledger, "release", None)
-            if acquired_claim is not None and callable(release_claim):
-                release_claim(acquired_claim, owner="agent")
+            if ledger is not None and acquired_claim is not None:
+                ledger.release(acquired_claim, owner="agent")
             raise
+
+    @llm_tool(
+        name="hearthstone_current_turn",
+        description=(
+            "用户询问当前/现在/第几回合、回合数、轮到谁或谁的回合时调用。"
+            "这是无参数实时查询，返回此刻玩家可见快照中的 round、行动方和 phase；"
+            "回答第几回合必须使用 round，不能把 action_turn 当作回合数。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+        timeout=5.0,
+    )
+    async def hearthstone_current_turn(self, **_: Any) -> dict[str, Any]:
+        selected_mode, payload = await self._resolve_live_query_payload(
+            mode="auto",
+            topic="current_strategy",
+        )
+        return _current_turn_llm_tool_result(payload, mode=selected_mode)
 
     @llm_tool(
         name="hearthstone_live_state",
         description=(
-            "回答任何当前炉石传说或酒馆战棋问题前必须调用。适用于第几回合、轮到谁、"
-            "双方场面、手牌、Choice、商店、酒馆法术、战团、金币、实际费用、升本、刷新、"
-            "冻结、对手、买什么、怎么出牌或怎么站位。无需传 mode/focus 也会自动识别当前游戏模式；"
-            "必须把用户原问题原样传入 query，以便自动聚焦并与兜底链路去重。"
+            "用户询问当前炉石传说或酒馆战棋的双方场面、手牌、Choice、商店、酒馆法术、"
+            "战团、金币、实际费用、升本、刷新、冻结、对手、买什么、怎么出牌或怎么站位时调用。"
+            "只问回合数或轮到谁时改用 hearthstone_current_turn。query 可省略；若传入，"
+            "应使用用户原问题，插件会自动识别模式和聚焦。"
         ),
         parameters={
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "minLength": 1,
-                    "description": "必填；用户当前关于炉石的原问题，不要改写。",
-                },
-                "focus": {
-                    "type": "string",
-                    "enum": [
-                        "auto",
-                        "overview",
-                        "shop",
-                        "economy",
-                        "board",
-                        "hand",
-                        "choice",
-                        "opponent",
-                        "strategy",
-                    ],
-                    "default": "auto",
-                    "description": "可选；不确定时省略，插件会返回当前模式的综合视图。",
-                },
-                "mode": {
-                    "type": "string",
-                    "enum": ["auto", "constructed", "battlegrounds"],
-                    "default": "auto",
-                },
-                "topic": {
-                    "type": "string",
-                    "enum": [
-                        "current_strategy",
-                        "season_meta",
-                        "hero_performance",
-                        "post_game",
-                    ],
-                    "default": "current_strategy",
-                },
-                "opponent_relation": {
-                    "type": "string",
-                    "enum": ["auto", "current", "next", "last"],
-                    "default": "auto",
+                    "description": "可选；用户当前关于炉石的原问题，不要改写。",
                 },
             },
-            "required": ["query"],
             "additionalProperties": False,
         },
         timeout=5.0,
@@ -5404,43 +5538,9 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         mode: str = "auto",
         topic: str = "current_strategy",
         opponent_relation: str = "auto",
-        _ctx: Mapping[str, Any] | None = None,
         **_: Any,
     ) -> dict[str, Any]:
-        context = _ctx if isinstance(_ctx, Mapping) else {}
-        query_text = normalize_query_text(
-            query or context.get("latest_user_request"),
-            limit=240,
-        )
-        ledger = getattr(self, "_query_ledger", None)
-        claim_query = getattr(ledger, "claim", None)
-        acquired_claim = None
-        if callable(claim_query):
-            target = str(
-                getattr(getattr(self, "cfg", None), "target_lanlan", "") or ""
-            ).strip()[:80]
-            acquired_claim = claim_query(owner="tool", text=query_text, target=target)
-        if query_text and callable(claim_query) and acquired_claim is None:
-            return {
-                "format": "hearthstone_compact_v1",
-                "available": False,
-                "status": "query_already_handled",
-                "reason": "query_already_handled",
-                "reply": "HS_QUERY available=0;reason=query_already_handled",
-                "answer_contract": {"do_not_reply": True},
-            }
-        if not query_text and callable(claim_query) and acquired_claim is None:
-            return {
-                "format": "hearthstone_compact_v1",
-                "available": False,
-                "status": "query_correlation_required",
-                "reason": "query_correlation_required",
-                "reply": "HS_QUERY available=0;reason=query_correlation_required",
-                "answer_contract": {
-                    "do_not_reply": True,
-                    "retry_with_query": True,
-                },
-            }
+        query_text = normalize_query_text(query, limit=240)
         intent = classify_live_query(query_text)
         if intent is not None:
             if focus == "auto":
@@ -5449,33 +5549,27 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 mode = intent.mode_hint
             if opponent_relation == "auto":
                 opponent_relation = intent.opponent_relation
-        try:
-            selected_mode, payload = await self._resolve_live_query_payload(
-                mode=mode,
-                topic=topic,
-            )
-            selected_focus = focus if focus != "auto" else "strategy"
-            if (
-                selected_mode == "constructed"
-                and selected_focus not in _CONSTRUCTED_TOOL_FOCUSES
-            ):
-                selected_focus = "strategy"
-            if (
-                selected_mode == "battlegrounds"
-                and selected_focus not in _BATTLEGROUNDS_TOOL_FOCUSES
-            ):
-                selected_focus = "strategy"
-            return _focused_llm_tool_result(
-                payload,
-                mode=selected_mode,
-                focus=selected_focus,
-                opponent_relation=opponent_relation,
-            )
-        except BaseException:
-            release_claim = getattr(ledger, "release", None)
-            if acquired_claim is not None and callable(release_claim):
-                release_claim(acquired_claim, owner="tool")
-            raise
+        selected_mode, payload = await self._resolve_live_query_payload(
+            mode=mode,
+            topic=topic,
+        )
+        selected_focus = focus if focus != "auto" else "strategy"
+        if (
+            selected_mode == "constructed"
+            and selected_focus not in _CONSTRUCTED_TOOL_FOCUSES
+        ):
+            selected_focus = "strategy"
+        if (
+            selected_mode == "battlegrounds"
+            and selected_focus not in _BATTLEGROUNDS_TOOL_FOCUSES
+        ):
+            selected_focus = "strategy"
+        return _focused_llm_tool_result(
+            payload,
+            mode=selected_mode,
+            focus=selected_focus,
+            opponent_relation=opponent_relation,
+        )
 
     async def hearthstone_current_state(
         self, focus: str | None = None, **_: Any

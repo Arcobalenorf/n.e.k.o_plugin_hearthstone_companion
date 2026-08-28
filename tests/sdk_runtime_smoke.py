@@ -219,7 +219,10 @@ async def _exercise_lifecycle(plugin: Any, unwrap_or: Any, host_ctx: _HostContex
     shutdown: dict[str, Any] = {}
     try:
         tools = {item["name"] for item in plugin.list_llm_tools()}
-        expected_tools = {"hearthstone_live_state"}
+        expected_tools = {
+            "hearthstone_current_turn",
+            "hearthstone_live_state",
+        }
         if tools != expected_tools:
             raise RuntimeError(f"stable SDK did not auto-register LLM tools: {tools!r}")
         entries = {item["id"]: item for item in plugin.list_entries()}

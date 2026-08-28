@@ -25,9 +25,10 @@ def _load_package() -> None:
 
 _load_package()
 
-build_live_state_segments = importlib.import_module(
+_commentary = importlib.import_module(
     f"{PACKAGE_NAME}.commentary"
-).build_live_state_segments
+)
+build_atomic_live_state_segment = _commentary.build_atomic_live_state_segment
 PowerLogParser = importlib.import_module(f"{PACKAGE_NAME}.powerlog").PowerLogParser
 PowerLogLocator = importlib.import_module(f"{PACKAGE_NAME}.tailer").PowerLogLocator
 
@@ -102,19 +103,19 @@ def _snapshot_summary(snapshot: Any) -> dict[str, Any]:
 def _context_summary(snapshot: Any | None) -> dict[str, Any] | None:
     if snapshot is None:
         return None
-    segments = build_live_state_segments(
+    segments = build_atomic_live_state_segment(
         snapshot,
         observed_at=1_780_000_000.0,
-        max_prompt_bytes=900,
+        max_prompt_bytes=4096,
     )
     encoded_lengths = [len(text.encode("utf-8")) for _name, text in segments]
     return {
         "mode": snapshot.mode,
         "match_id": snapshot.game_number,
-        "segment_count": len(segments),
-        "segment_names": [name for name, _text in segments],
-        "max_segment_bytes": max(encoded_lengths, default=0),
-        "total_bytes": sum(encoded_lengths),
+        "atomic_context_count": len(segments),
+        "context_names": [name for name, _text in segments],
+        "max_context_bytes": max(encoded_lengths, default=0),
+        "total_context_bytes": sum(encoded_lengths),
     }
 
 

@@ -134,8 +134,6 @@ _FOLLOW_UP_TERMS = (
     "查一下",
     "看一下",
 )
-
-
 @dataclass(frozen=True, slots=True)
 class LiveQueryIntent:
     mode_hint: str = "auto"

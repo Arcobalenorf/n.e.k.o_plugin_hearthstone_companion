@@ -111,6 +111,120 @@ def test_event_callback_receives_the_validated_source_generation() -> None:
     assert observed == [("game_started", generation)]
 
 
+def test_guarded_delivery_requires_the_same_game_within_one_source_generation() -> None:
+    submitted: list[str] = []
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+    writer_finished = threading.Event()
+    guarded_result: list[tuple[bool, object]] = []
+    monitor = CompanionMonitor(
+        CompanionConfig(),
+        _logger(),
+        on_llm=lambda *_args: False,
+    )
+    with monitor._lock:
+        monitor._snapshot = GameSnapshot(
+            mode="constructed",
+            phase="playing",
+            game_number=5,
+        )
+    generation = monitor.capture()[2]
+
+    def submit_current_game() -> bool:
+        callback_entered.set()
+        assert release_callback.wait(1.0)
+        submitted.append("game-5")
+        return True
+
+    guarded_thread = threading.Thread(
+        target=lambda: guarded_result.append(
+            monitor.run_if_source_generation(
+                generation,
+                5,
+                submit_current_game,
+            )
+        )
+    )
+    guarded_thread.start()
+    assert callback_entered.wait(1.0)
+
+    def advance_game() -> None:
+        with monitor._lock:
+            monitor._snapshot = replace(monitor._snapshot, game_number=6)
+        writer_finished.set()
+
+    writer_thread = threading.Thread(target=advance_game)
+    writer_thread.start()
+    assert writer_finished.wait(0.05) is False
+
+    release_callback.set()
+    guarded_thread.join(1.0)
+    writer_thread.join(1.0)
+
+    assert guarded_thread.is_alive() is False
+    assert writer_thread.is_alive() is False
+    assert guarded_result == [(True, True)]
+    assert writer_finished.is_set()
+    assert submitted == ["game-5"]
+
+    current, result = monitor.run_if_source_generation(
+        generation,
+        5,
+        lambda: submitted.append("stale-game") or True,
+    )
+
+    assert current is False
+    assert result is None
+    assert submitted == ["game-5"]
+
+
+def test_generation_guard_rejects_same_game_when_snapshot_predicate_fails() -> None:
+    submitted: list[str] = []
+    monitor = CompanionMonitor(
+        CompanionConfig(),
+        _logger(),
+        on_llm=lambda *_args: False,
+    )
+    with monitor._lock:
+        monitor._snapshot = GameSnapshot(
+            mode="constructed",
+            phase="spectator",
+            game_number=5,
+        )
+    generation = monitor.capture()[2]
+
+    current, result = monitor.run_if_source_generation(
+        generation,
+        5,
+        lambda: submitted.append("invalid-phase") or True,
+        lambda snapshot: snapshot.phase not in {"ended", "spectator"},
+    )
+
+    assert current is False
+    assert result is None
+    assert submitted == []
+
+
+def test_state_callback_receives_source_generation_when_supported() -> None:
+    received: list[tuple[GameSnapshot, int | None]] = []
+    monitor = CompanionMonitor(
+        CompanionConfig(),
+        _logger(),
+        on_llm=lambda *_args: False,
+        on_state=lambda snapshot, generation: received.append((snapshot, generation)),
+    )
+    snapshot = GameSnapshot(
+        mode="constructed",
+        phase="playing",
+        game_number=5,
+    )
+    generation = monitor.capture()[2]
+
+    monitor._notify_state(snapshot, source_generation=generation)
+
+    assert received == [(snapshot, generation)]
+
+
 def test_game_started_uses_settled_same_match_snapshot() -> None:
     event_snapshot = GameSnapshot(mode="unknown", phase="starting", game_number=3)
     settled = GameSnapshot(mode="constructed", phase="mulligan", game_number=3)

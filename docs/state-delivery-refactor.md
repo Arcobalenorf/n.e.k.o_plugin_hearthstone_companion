@@ -16,7 +16,7 @@ GameEvent -> commentary arbiter ----------|-> sparse respond commentary
 
 1. 真实日志能恢复正确的普通对战和酒馆公开状态；
 2. 状态变化会产生一次新的语义发布，纯时间戳或 revision 变化不会重复发布；
-3. 发布会定向到实际提问或当前角色，不会每秒制造无目标消息；
+3. 已知角色时发布会定向到实际角色；冷启动时使用宿主限定的单活动会话路由，并以 1 秒租约重试而不广播到多个会话；
 4. 模型调用工具时能取得同一权威快照；模型未调用工具时，明确炉石问题仍会收到一次带聚焦事实的定向兜底；
 5. 主动陪伴只对稀疏事件开口，并且每次 `respond` 自带所需事实；
 6. 停止、换源、撤销共享或对局过期后，旧上下文会被同键失效消息覆盖。
@@ -58,15 +58,16 @@ GameEvent -> commentary arbiter ----------|-> sparse respond commentary
 - 话语时间；
 - 角色名；
 - 最多 240 字的归一化原问题及其 fingerprint；
-- 是否已由 tool、Agent 或 fallback 认领。
+- 是否已由可信角色级 Agent 或 fallback 认领、提交。
 
 这些内容不持久化，默认 90 秒后从内存账本清除；共享关闭或插件停止时立即清空。
 
-角色解析来源为：显式 `target_lanlan`、Agent 调用携带的公开 `_ctx`，以及最近 user-context 记录。背景状态只使用显式配置或已观察到的 user-context 目标；无法解析唯一目标时 fail-closed，不发送无目标消息，也不得导入宿主内部配置管理器。
+角色解析来源为：显式 `target_lanlan`、Agent 调用携带的公开 `_ctx`，以及最近 user-context 记录。背景 `read` 在角色明确时定向；冷启动无法解析角色时省略 `target_lanlan` 并使用 `active-session` coalesce key。宿主只在恰好一个会话连接时路由，零个或多个会话直接丢弃；插件用 1 秒未解析租约重试，因为 SDK 提交回执不等于宿主已消费。生命周期和所有主动 `respond` 仍要求明确角色，不得广播，也不得导入宿主内部配置管理器。
 
 明确炉石问题经本地分类后进入短延迟认领窗口：
 
-- `hearthstone_live_state` 同轮工具或兼容 Agent 先执行时，标记 query 已认领；
+- 带可信角色 `_ctx` 的 Agent 先执行时，可认领或抢占尚未提交的同角色兜底；
+- `@llm_tool` 回调没有可信角色身份，只读取当前快照，不认领、迁移或抑制任何角色的兜底；
 - 否则协调器从同一权威快照构建聚焦结果，将原问题和事实放进同一条定向 `respond`；
 - 同一角色、同一话语只允许一个回答路径主动提交；
 - fallback 以原始 user-context 记录中的角色为权威；生命周期、日志源或显式目标变化时清空查询账本；
@@ -83,14 +84,14 @@ GameEvent -> commentary arbiter ----------|-> sparse respond commentary
 
 ### 5. 工具与兼容入口
 
-保留唯一模型工具 `hearthstone_live_state`，因为它能在同一用户轮次提供更完整的聚焦事实。兼容 Agent 入口复用同一查询服务和认领账本，但不再作为基础读取前提。工具注册健康检查只处理官方文档明确存在的 main-server registry 丢失问题，不参与状态发布。
+模型工具收敛为无参数 `hearthstone_current_turn` 与仅含可选 `query` 的 `hearthstone_live_state`：前者消除 round/action_turn 歧义，后者在同一用户轮次提供完整的聚焦事实。两者都是无角色、fail-open 的当前快照读取器。兼容 Agent 入口复用同一查询服务，且只在 `_ctx.lanlan_name` 存在时进入角色级认领账本；无角色 Agent 调用可以显式查询，但不改变任何角色的 claim。工具注册健康检查只处理官方文档明确存在的 main-server registry 丢失问题，不参与状态发布。
 
 ## 失败策略
 
 | 失败点 | 行为 |
 | --- | --- |
 | 日志未找到或过期 | 查询 fail-closed，覆盖旧上下文，不使用缓存建议 |
-| user-context 暂时不可用 | 保留上次已知角色；工具继续可用；不重复制造无目标消息 |
+| user-context 暂时不可用 | 保留上次已知角色；工具继续可用；无角色被动快照按 1 秒租约尝试单活动会话路由 |
 | `read` 提交被拒绝 | 不推进 fingerprint/时间游标，下次刷新重试 |
 | `respond` 提交被拒绝 | 不认领 query、不推进 arbiter，仍受查询 TTL/事件 TTL 限制 |
 | 工具 registry 丢失 | 按官方接口有界检查并重注册，不改宿主 |

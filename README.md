@@ -6,12 +6,12 @@
 
 ## 陪伴体验
 
-- 监听到新鲜对局后，本机持续维护一份权威结构化快照；当目标角色已由显式设置或官方聊天上下文确认时，状态变化会覆盖一组不可见的 `read` 上下文，不生成可见聊天消息，也不依赖旧 callback 恰好被当前回答消费。
-- 当前事实通过共享同一快照的官方链路到达角色：可替换的被动 `read` 上下文、首答同轮的唯一 `@llm_tool`、单一 Agent 查询入口，以及从 `bus.memory` 识别明确炉石问题后的定向 `respond` 兜底。工具或 Agent 成功认领查询后会取消兜底，各查询路径按角色和问题去重。
+- 监听到新鲜对局后，本机持续维护一份权威结构化快照；状态变化会覆盖一条不可见的原子 `read` 上下文，不生成可见聊天消息。已知角色时定向发布；冷启动尚无角色时省略目标，宿主只会在恰好一个连接会话时接收，零个或多个会话都会丢弃。
+- 当前事实通过共享同一快照的官方链路到达角色：单条可替换的原子 `read` 上下文、两个职责清晰的首答同轮 `@llm_tool`、单一 Agent 查询入口，以及从 `bus.memory` 识别明确炉石问题后的延迟定向 `respond` 兜底。LLM 工具回调没有可信角色身份，因此只读当前快照且不操作查询账本；只有带角色的 Agent 与兜底按角色、原问题和时间窗协调，兜底保持 fail-open。
 - 三连、低血量、升本、逐轮战果与最终名次等公开事实会形成结构化情绪信号；真正的台词始终由当前 N.E.K.O 角色生成。
 - 新对局开始、插件重新接上进行中的对局和最终结算属于独立生命周期：默认各回应一次，不受中局解说冷却或聊天静默窗影响；旁观与未知目标不会触发广播。
 - 免打扰模式默认关闭；中局解说仍只选择稀疏且有情绪价值的事件，并受普通/关键冷却与 30 秒用户聊天静默窗约束；希望安静游玩时可随时开启免打扰。
-- 用户问普通对战或酒馆的回合、场面、手牌、Choice、商店、战团、经济或决策时，模型统一调用 `hearthstone_live_state`。`query` 必须原样传入；`mode`、`focus`、`topic` 和 `opponent_relation` 可省略，插件会自动选择。
+- 用户只问当前回合或行动方时，模型调用无参数 `hearthstone_current_turn`；场面、手牌、Choice、商店、战团、经济或决策调用 `hearthstone_live_state`。综合工具只保留可选 `query`，插件自动识别模式和聚焦。
 - 酒馆快照在本机建立逐卡 `known_affordable`、`known_unaffordable` 或 `unknown_cost_may_be_zero` 的决策面，再按问题焦点返回必要局势、证据和规则依据。
 - 回合、场面、手牌、商店、经济、Choice、对手或综合策略只返回相应紧凑视图、证据门禁和相关卡牌规则，JSON 硬上限为 4096 bytes，避免完整酒馆状态挤占单轮上下文。
 - 启用插件即默认允许问答工具按需提供过滤后的玩家可见状态，并回应对局开始、重连和结算；关闭局势共享会一并停止这些能力。免打扰模式默认关闭。
@@ -20,7 +20,7 @@
 
 ## 酒馆战棋支持
 
-`v0.3.11` 支持普通对战与单排/双排酒馆的可验证公开状态：
+`v0.3.12` 支持普通对战与单排/双排酒馆的可验证公开状态：
 
 - 战棋模式、Bob、本地玩家与最多八名英雄；
 - 英雄选择阶段实际观测到的本地候选、选择完成后的我方英雄、招募/战斗阶段、逐轮胜负、回合、当前对手；
@@ -44,7 +44,7 @@ HSReplay Tier7 与 Firestone 的全局表现数据属于各自的私有遥测；
 - 只读 Hearthstone 自己生成的 `Power.log`，不注入、不读内存、不抓包、不模拟协议。
 - 自动连接仅查询进程列表中名称精确为 `Hearthstone.exe` 的可执行文件路径，再检查同目录 `Logs`；不扫描磁盘、不读取进程内存。
 - 不自动点击、出牌或代打，不推断隐藏手牌、未揭示奥秘或未来商店。
-- 不上传原始日志，不保留玩家名、BattleTag、账号 ID 或完整单局历史；默认共享会在目标角色明确后用可替换的后台 `read` 上下文同步有限的近期公开状态，并供工具查询、明确问题兜底、生命周期回应或免打扰关闭后的中局解说使用，可随时在面板中关闭。
+- 不上传原始日志，不保留玩家名、BattleTag、账号 ID 或完整单局历史；默认共享用可替换的后台 `read` 上下文同步有限的近期公开状态。角色未解析时不附目标，宿主仅在恰好一个连接会话时接收；工具查询、明确问题兜底、生命周期回应或免打扰关闭后的中局解说也只使用过滤后状态，可随时在面板中关闭。
 - 首次接入已有日志默认且最多只在本机恢复解析末尾 64 MiB，这些日志字节不会整体发送给模型。
 - 卡牌目录更新只发送固定的公共目录 GET，不发送牌局、卡牌 ID 或玩家信息；可用 `card_catalog_network_enabled=false` 关闭。
 - 本机统计只保存按赛季、模式和英雄聚合的场次与名次计数。
@@ -102,7 +102,7 @@ uv run python -m plugin.neko_plugin_cli.cli verify "<plugin-repo>\dist\hearthsto
 
 ## English summary
 
-Hearthstone Catgirl Companion is a read-only N.E.K.O plugin for constructed Hearthstone and Battlegrounds. It maintains one authoritative local snapshot and exposes one same-turn `hearthstone_live_state` tool plus one Agent entry. A bounded `bus.memory` watcher sends a targeted `respond` fallback only for explicit Hearthstone questions that were not claimed by the tool or Agent. Users can disable data sharing without disabling local log monitoring, while proactive commentary remains off by default. It supports Power.log-observed local hero choices, solo and Duos Battlegrounds state, per-combat outcomes, aggregate-only local results, and versioned official season rules. N.E.K.O owns the actual character response; the separate transparent overlay is diagnostic-only because the public SDK does not return generated reply text. The plugin never claims access to unlicensed global win-rate telemetry.
+Hearthstone Catgirl Companion is a read-only N.E.K.O plugin for constructed Hearthstone and Battlegrounds. It maintains one authoritative local snapshot and exposes a zero-argument `hearthstone_current_turn` tool, a compact `hearthstone_live_state` tool, and one Agent entry. Passive context is published as one replaceable atomic snapshot. Before a role is known it is targetless and the host accepts it only when exactly one session is connected; it uses a one-second retry lease until routing is resolved. LLM tool callbacks are roleless snapshot reads and never suppress role-scoped delivery. A bounded `bus.memory` watcher sends a delayed targeted `respond` fallback for explicit Hearthstone questions unless a trusted role-scoped Agent has already handled that utterance. Users can disable data sharing without disabling local log monitoring. Do Not Disturb is off by default, allowing sparse mid-match commentary; users can turn it on without disabling on-demand answers or match lifecycle reactions. It supports Power.log-observed local hero choices, solo and Duos Battlegrounds state, per-combat outcomes, aggregate-only local results, and versioned official season rules. N.E.K.O owns the actual character response; the separate transparent overlay is diagnostic-only because the public SDK does not return generated reply text. The plugin never claims access to unlicensed global win-rate telemetry.
 
 ## 许可证
 

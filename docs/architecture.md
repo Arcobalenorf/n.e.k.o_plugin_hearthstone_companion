@@ -6,8 +6,8 @@ N.E.K.O 的核心是关系与陪伴。插件负责理解游戏现场，不负责
 
 1. 本地层只做公开事实提炼、情绪信号、节奏仲裁和隐私过滤；
 2. 所有主动可见台词由当前 N.E.K.O 角色通过 `ai_behavior="respond"` 生成；
-3. 新鲜对局只在本机维护一份权威状态；分段 `read` 快照以固定 `coalesce_key` 持续覆盖当前会话，同轮 `@llm_tool` 查询提供更完整、按问题聚焦的事实；
-4. `bus.memory` 只识别最近明确的炉石问题和实际角色，未被工具或 Agent 认领时才定向触发一次 `respond` 兜底；
+3. 新鲜对局只在本机维护一份权威状态；单条原子 `read` 快照以固定 `coalesce_key` 持续覆盖当前会话，同轮 `@llm_tool` 查询提供更完整、按问题聚焦的事实；
+4. `bus.memory` 只识别最近明确的炉石问题和实际角色，未被可信角色级 Agent 认领时才定向触发一次 `respond` 兜底；无角色工具只读快照，不抑制定向兜底；
 5. 面板和独立浮层只承担透明诊断，不参与自动陪伴输出。
 
 ```text
@@ -29,15 +29,15 @@ CompanionMonitor single-owner pipeline
         |
         +--> authoritative immutable snapshot
                              |
-                             +--> hearthstone_live_state @llm_tool --> current NEKO turn
+                             +--> current_turn/live_state @llm_tool --> current NEKO turn
                              +--> query_hearthstone_live_state Agent --> post-turn fallback
 
 Recent user utterance --> bus.memory bounded polling --> explicit Hearthstone intent
         |
         +--> role/query ledger --> unclaimed after delay --> targeted [] + respond
-        +--> claimed by tool/Agent -----------------------> no duplicate fallback
+        +--> claimed by role-scoped Agent ---------------> no duplicate fallback
 
-Constructed or Battlegrounds question --> same-turn hearthstone_live_state tool
+Constructed or Battlegrounds question --> same-turn dedicated live tool
         |
         +--> live public snapshot + focused evidence + attributed rules/local samples
         +--> tool result returns to NEKO; the character writes the answer
@@ -80,13 +80,15 @@ hsbg.cards public API --> fixed-origin background GET --> atomic cache --> obser
 
 ## 统一实时查询
 
-`hearthstone_live_state` 是唯一模型可见的同轮只读工具。每次询问回合、行动方、公开场面、具体手牌、Choice、商店、战团、经济或决策都应重新查询，不能依赖主动短评或更早聊天历史。工具必须收到用户原始 `query` 以便和兜底链路关联；`mode`、`focus`、`topic` 和 `opponent_relation` 可省略，插件会从快照和问题自动选择。宿主若违反 schema 传入空问题，工具 fail-closed，不读取局势，由定向 memory 兜底处理。
+同轮只读工具保持两个清晰入口：无参数 `hearthstone_current_turn` 专门回答当前完整轮次、行动方和阶段；`hearthstone_live_state` 回答公开场面、具体手牌、Choice、商店、战团、经济或决策，只保留可选的用户原始 `query`。两者每次都重新读取权威快照，不能依赖主动短评或更早聊天历史；`round` 是用户口语中的完整轮次，`action_turn` 只是交替行动计数。
 
 普通对战支持 `overview/board/hand/opponent/choice/strategy`，酒馆额外支持 `shop/economy`；对手查询可声明 `current/next/last`。插件先在本机建立完整事实和 capability，再只把所问视图、对应 evidence gate 与相关卡牌规则编码为 `hearthstone_compact_v1`。聚焦 JSON 限制为 4096 bytes，超限时明确标记 `truncated` 并进一步收敛。`complete_legal_actions` 固定为 `false`，防止把局势分析说成完整求解器结论。
 
-`query_hearthstone_live_state` 是唯一 Agent 入口，复用同一快照构建和紧凑 serializer。Agent 属于主回答后的独立路由，因此不能代替同轮工具，只作为模型未调用工具时的第二路径。入口和工具会在能精确匹配最近查询时认领 query ledger，并取消尚未发送的兜底。
+`query_hearthstone_live_state` 是唯一 Agent 入口，复用同一快照构建和紧凑 serializer。Agent 属于主回答后的独立路由，因此不能代替同轮工具，只作为模型未调用工具时的第二路径。宿主会给 Agent 注入可信的 `_ctx.lanlan_name`，query ledger 只用这个角色、原问题、意图和时间窗关联 Agent 与 memory 兜底。普通 `@llm_tool` 回调没有可信角色身份，只读取调用时的权威快照，既不认领角色级查询，也不被兜底反向阻断。
 
-`live_query_watch` 每秒通过官方 `bus.memory.get(bucket_id="default")` 有界读取近期用户话语。它只接受明确的炉石查询，按记录中的实际 `lanlan` 路由；配置固定 `target_lanlan` 时过滤其他角色。未被工具或 Agent 认领的查询才通过 `visibility=[] + ai_behavior="respond"` 发送包含当刻聚焦快照的定向兜底。SDK 回执只确认本地提交，不证明模型已生成回答，因此验收必须检查最终角色回复。
+`live_query_watch` 每秒通过官方 `bus.memory.get(bucket_id="default")` 有界读取近期用户话语，同步 IPC 在线程中执行，不阻塞插件事件循环。它只接受明确的炉石查询，按记录中的实际 `lanlan` 路由；配置固定 `target_lanlan` 时过滤其他角色。超过 4 秒选择窗口且仍未被可信角色级 Agent 认领的查询，才通过 `visibility=[] + ai_behavior="respond"` 发送包含当刻聚焦快照的定向兜底。无角色工具无法安全取消它，所以此处选择 fail-open；SDK 回执只确认本地提交，不证明模型已生成回答，验收必须检查最终角色回复。
+
+普通被动上下文只发布一条最多 4096 UTF-8 bytes、单 coalesce key 的原子快照。显式或聊天角色已知时携带 `target_lanlan` 并按 30 秒续租；冷启动无角色时省略目标并使用 `active-session` key，宿主仅在恰好一个连接会话时路由，零个或多个会话直接丢弃。由于 SDK 提交回执不是宿主消费确认，无目标游标只租约 1 秒，直到角色明确或状态失效。原子快照不会出现新 revision 的 core 与旧 revision 的商店/战团混合，但 `ai_behavior="read"` 在活动语音会话中仍依赖宿主下一次自然 hot-swap，因此只承担背景上下文，不能代替同轮工具。
 
 公开 SDK 的 push receipt 只确认提交，不确认宿主已消费、生成或播放，也没有返回最终角色文本的正式回调。因此独立浮层不能承接自动角色台词，也不会自动显示解析器事件；它只接受用户显式触发的诊断文本。
 
@@ -106,7 +108,7 @@ hsbg.cards public API --> fixed-origin background GET --> atomic cache --> obser
 
 酒馆卡牌快照保存日志实际观测的 `card_type`、`current_cost`、`premium`、当前位置、冻结和当前关键词；刷新/升本费用优先读取对应 `GAME_MODE_BUTTON_SLOT` 按钮实体。客户端不会在每个招募阶段重发恒定按钮费用，因此当前可见 `PLAY` 按钮只要同一实体在本轮本阶段有明确 tag observation，或完成了当前 GameState 基线，就可沿用其持久 `COST`；该规则不放宽玩家经济 tag、隐藏按钮或已移出场按钮。完整实体包中的 boolean 标签缺失按默认 false，包尚未收尾时保持 `null`，防止截断包伪装成完整状态，也防止旧冻结/金色/关键词续命。商店、手牌、战团、经济和 Choice 分别携带完整度、revision、回合、阶段与观测时间；金币、刷新费用和升本费用还分别保存自己的 observation。金币以当前 `RESOURCES` 建立基线；历史 `RESOURCES_USED/TEMP_RESOURCES` 会过期并按未发生处理，只有同回合同阶段重报后才加入当前值。未观测或已过期的动态值保持 `null`，不使用公共目录或默认规则补猜。`CHANGE_ENTITY` 真正换 CardID 时先撤销旧类型、费用、攻血、星级、金色和关键词，直到新身份重新提供证据。购买拆为 `shop_card_priority_advice`、`purchase_affordability` 和 `specific_purchase_advice`：费用缺失不污染已经具备完整实时商店与规则证据的定性选牌，但会让可负担性与精确购买顺序降为 `partial`。工具结果最前面的 `current_recruit_decision` 按卡标记 `known_affordable`、`known_unaffordable` 或 `unknown_cost_may_be_zero`，并将整店可负担性保持为 `unknown`；`decision_guardrails` 再提供完整证据边界，禁止模型因金币为 0 就把未知费用卡牌判为买不起。升本可负担性、升本策略、刷新、Choice 与站位也有独立 capability，角色必须按被问事项检查对应状态，不能因一个子能力不可用而覆盖另一个已可用能力。
 
-唯一 `@llm_tool` 由公开 SDK 在插件构造时自动注册并排队提交给宿主，可在生成首答的同一轮调用。`plugin.toml` 使用 `passive=false`，让用户插件 Agent 在模型未选择工具时仍能发现唯一查询入口。设置、监听、浮层和清空统计入口继续以 `metadata.agent_auto=false` 隐藏。分段 `read` 使用同键覆盖，语义变化立即更新、完全相同的状态每 30 秒续租；目标只能来自显式配置或官方近期话语记录，无法解析目标时 fail-closed。三条查询链路互补，不假设模型必然调用某个工具，也不把 Agent 的后置结果冒充首答工具结果。
+两个 `@llm_tool` 由公开 SDK 在插件构造时自动注册并排队提交给宿主，可在生成首答的同一轮调用。`plugin.toml` 使用 `passive=false`，让用户插件 Agent 在模型未选择工具时仍能发现唯一查询入口。设置、监听、浮层和清空统计入口继续以 `metadata.agent_auto=false` 隐藏。原子 `read` 使用单键覆盖，语义变化立即更新、完全相同的状态每 30 秒续租；目标只能来自显式配置或官方近期话语记录，无法解析目标时 fail-closed。三条查询链路互补，不假设模型必然调用某个工具，也不把 Agent 的后置结果冒充首答工具结果。
 
 官方工具文档明确说明 `/api/tools` 注册只存在于当前角色的 `LLMSessionManager` 内，主服务重启、首启竞态或会话管理器重建后不会由 `@llm_tool` 自动回灌。插件因此使用官方 `@timer_interval` 在独立定时线程里读取公开的 `GET /api/tools`：只有某个当前角色缺少本插件的远程工具，或 source、loopback callback、remote 标志不一致时，才通过公开 `unregister_llm_tool()` / `register_llm_tool()` 原子持锁恢复并再次确认；健康注册不做任何变更。官方 SDK 会拒绝同名重复注册，因此不能省略本地注销步骤。失败使用有界退避且只记录脱敏错误码，缓存的本地 schema 允许后续定时器再次恢复。这能自动收敛运行期注册丢失，但定时检查仍存在最多一个检查间隔的窗口，不能冒充宿主提供的逐 turn 前同步保证。
 

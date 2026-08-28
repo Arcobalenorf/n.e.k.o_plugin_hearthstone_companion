@@ -864,7 +864,7 @@ def _live_battlegrounds(
 
 
 _LIVE_STATE_PREFIX = """\
-仅用于炉石问题，无关勿提；缺失不猜。费用/金色/关键词以快照为准；?=未知。
+炉石专用；缺失勿猜；费用/状态看快照；第几回合只用round，禁用turn。
 过滤后的实时局势 JSON："""
 
 
@@ -980,6 +980,67 @@ def build_live_state_context(
     if len(prompt) <= limit:
         return prompt
     raise ValueError("live Hearthstone state exceeds max_prompt_chars")
+
+
+def build_atomic_live_state_segment(
+    snapshot: GameSnapshot,
+    *,
+    observed_at: float | None = None,
+    max_prompt_bytes: int = 4096,
+) -> tuple[tuple[str, str], ...]:
+    """Build one replaceable passive snapshot with a strict UTF-8 budget."""
+    byte_limit = int(max_prompt_bytes)
+    if byte_limit < 512:
+        raise ValueError("max_prompt_bytes is too small for atomic live state")
+
+    char_limits = tuple(
+        dict.fromkeys(
+            max(len(_LIVE_STATE_PREFIX) + 129, value)
+            for value in (
+                byte_limit,
+                byte_limit * 3 // 4,
+                byte_limit // 2,
+                byte_limit // 3,
+            )
+        )
+    )
+    for char_limit in char_limits:
+        try:
+            prompt = build_live_state_context(
+                snapshot,
+                observed_at=observed_at,
+                max_prompt_chars=char_limit,
+            )
+        except ValueError:
+            continue
+        if len(prompt.encode("utf-8")) <= byte_limit:
+            return (("core", prompt),)
+
+    public_state = snapshot.to_public_dict()
+    minimal = {
+        "kind": "hearthstone_live_state",
+        "observed_at": round(
+            time.time() if observed_at is None else float(observed_at),
+            3,
+        ),
+        "state": {
+            "mode": public_state.get("mode"),
+            "phase": public_state.get("phase"),
+            "game_number": public_state.get("game_number"),
+            "turn": public_state.get("turn"),
+            "round": public_state.get("round"),
+            "active_side": public_state.get("active_side"),
+            "details": "call_hearthstone_live_state",
+        },
+    }
+    prompt = _LIVE_STATE_PREFIX + json.dumps(
+        minimal,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    if len(prompt.encode("utf-8")) > byte_limit:
+        raise ValueError("minimal atomic live state exceeds max_prompt_bytes")
+    return (("core", prompt),)
 
 
 _LIVE_DELIVERY_PREFIX = "HS live:"
@@ -1978,6 +2039,7 @@ def build_llm_prompt(
 __all__ = [
     "CommentaryArbiter",
     "build_emotion_cue",
+    "build_atomic_live_state_segment",
     "build_live_state_context",
     "build_live_state_contexts",
     "build_live_state_segments",

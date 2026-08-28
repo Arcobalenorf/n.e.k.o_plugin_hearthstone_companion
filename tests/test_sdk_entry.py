@@ -2770,35 +2770,31 @@ def test_llm_state_tool_returns_public_state_with_consent_even_when_proactive_is
 
 def test_llm_tool_description_covers_both_live_game_modes(monkeypatch) -> None:
     entry = _load_sdk_entry(monkeypatch)
+    turn_metadata = (
+        entry.HearthstoneCompanionPlugin.hearthstone_current_turn
+        .__neko_test_decorator_kwargs__
+    )
     metadata = (
         entry.HearthstoneCompanionPlugin.hearthstone_live_state
         .__neko_test_decorator_kwargs__
     )
 
+    assert turn_metadata["name"] == "hearthstone_current_turn"
+    assert turn_metadata["parameters"] == {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    }
+    assert "第几回合" in turn_metadata["description"]
+    assert "action_turn" in turn_metadata["description"]
     assert metadata["name"] == "hearthstone_live_state"
     description = metadata["description"]
     parameters = metadata["parameters"]
-    assert set(parameters["properties"]["focus"]["enum"]) == {
-        "auto",
-        "overview",
-        "shop",
-        "economy",
-        "board",
-        "hand",
-        "choice",
-        "opponent",
-        "strategy",
-    }
-    assert set(parameters["properties"]["mode"]["enum"]) == {
-        "auto",
-        "constructed",
-        "battlegrounds",
-    }
-    for phrase in ("回合", "双方场面", "手牌", "商店", "酒馆法术", "实际费用", "升本"):
+    for phrase in ("双方场面", "手牌", "商店", "酒馆法术", "实际费用", "升本"):
         assert phrase in description
-    assert "query" in parameters["properties"]
-    assert parameters["required"] == ["query"]
-    assert parameters["properties"]["query"]["minLength"] == 1
+    assert set(parameters["properties"]) == {"query"}
+    assert "required" not in parameters
+    assert "minLength" not in parameters["properties"]["query"]
     assert not hasattr(
         entry.HearthstoneCompanionPlugin.hearthstone_current_state,
         "__neko_test_decorator_kwargs__",
@@ -2807,6 +2803,139 @@ def test_llm_tool_description_covers_both_live_game_modes(monkeypatch) -> None:
         entry.HearthstoneCompanionPlugin.hearthstone_battlegrounds_advice,
         "__neko_test_decorator_kwargs__",
     )
+
+
+def test_current_turn_tool_returns_round_without_action_turn_ambiguity(
+    monkeypatch,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin._query_ledger = entry.QueryLedger()
+    plugin._delivery_target = lambda: (_ for _ in ()).throw(
+        AssertionError("official LLM tool callbacks are roleless")
+    )
+
+    async def resolve(**_kwargs: Any) -> tuple[str, dict[str, Any]]:
+        return (
+            "constructed",
+            {
+                "available": True,
+                "reason": "",
+                "state": {
+                    "round": 11,
+                    "turn": 21,
+                    "active_side": "player",
+                    "phase": "playing",
+                },
+            },
+        )
+
+    plugin._resolve_live_query_payload = resolve
+
+    result = asyncio.run(plugin.hearthstone_current_turn())
+
+    assert result["format"] == "hearthstone_current_turn_v1"
+    assert result["available"] is True
+    assert result["round_known"] is True
+    assert result["round"] == 11
+    assert result["action_turn"] == 21
+    assert result["active_side"] == "player"
+    assert result["answer_contract"]["never_answer_round_from_action_turn"] is True
+
+
+def test_battlegrounds_turn_is_available_when_strategy_evidence_is_incomplete(
+    monkeypatch,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+
+    async def resolve(**_kwargs: Any) -> tuple[str, dict[str, Any]]:
+        return (
+            "battlegrounds",
+            {
+                "available": False,
+                "status": "unavailable",
+                "reason": "no_phase_specific_battlegrounds_evidence",
+                "current_public_state": {
+                    "round": 5,
+                    "phase": "recruit",
+                },
+            },
+        )
+
+    plugin._resolve_live_query_payload = resolve
+
+    result = asyncio.run(plugin.hearthstone_current_turn())
+
+    assert result["mode"] == "battlegrounds"
+    assert result["available"] is True
+    assert result["round_known"] is True
+    assert result["round"] == 5
+    assert result["phase"] == "recruit"
+    assert "reason" not in result
+
+
+def test_argument_free_turn_tool_does_not_claim_late_voice_query(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin._query_ledger = entry.QueryLedger()
+    plugin._delivery_target = lambda: ""
+    source_timestamp = time.time()
+
+    async def resolve(**_kwargs: Any) -> tuple[str, dict[str, Any]]:
+        return "constructed", {
+            "available": True,
+            "state": {"round": 7, "turn": 13, "active_side": "opponent"},
+        }
+
+    plugin._resolve_live_query_payload = resolve
+
+    result = asyncio.run(plugin.hearthstone_current_turn())
+    observed = plugin._query_ledger.observe(
+        "现在第几回合",
+        target="role-a",
+        source_timestamp=source_timestamp,
+    )
+
+    assert result["round"] == 7
+    assert observed.claimed_by == ""
+    assert plugin._query_ledger.pending(
+        now=source_timestamp + 2.0,
+        min_age=1.0,
+    ) == (observed,)
+
+
+def test_argument_free_turn_tool_does_not_claim_shop_question(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin._query_ledger = entry.QueryLedger()
+    plugin._ownership_lock = threading.RLock()
+    plugin._delivery_lock = threading.RLock()
+    plugin._delivery_target = lambda: "role-a"
+    source_timestamp = time.time()
+    shop_question = plugin._query_ledger.observe(
+        "商店里有什么随从",
+        target="role-a",
+        source_timestamp=source_timestamp,
+        intent="shop",
+    )
+
+    async def resolve(**_kwargs: Any) -> tuple[str, dict[str, Any]]:
+        return "battlegrounds", {
+            "available": True,
+            "current_public_state": {"round": 5, "phase": "recruit"},
+        }
+
+    plugin._resolve_live_query_payload = resolve
+
+    result = asyncio.run(plugin.hearthstone_current_turn())
+
+    assert result["round"] == 5
+    assert shop_question.claimed_by == ""
+    assert plugin._query_ledger.pending(
+        now=source_timestamp + 5.0,
+        min_age=1.0,
+    ) == (shop_question,)
 
 
 def test_constructed_current_state_exposes_fresh_analysis_capabilities(monkeypatch) -> None:
@@ -3412,6 +3541,291 @@ def test_ended_pending_is_dropped_after_monitor_moves_to_the_next_game(monkeypat
     assert submitted == []
 
 
+def test_ended_retry_is_rejected_when_same_source_advances_during_refresh(
+    monkeypatch,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    submitted: list[dict[str, Any]] = []
+    plugin = _new_game_lifecycle_plugin(entry, submitted)
+    ended = GameSnapshot(
+        mode="constructed",
+        phase="ended",
+        game_number=4,
+        result="won",
+    )
+    monitor = entry.CompanionMonitor(
+        CompanionConfig(),
+        plugin.logger,
+        on_llm=lambda *_args: False,
+    )
+    with monitor._lock:
+        monitor._snapshot = ended
+    generation = monitor.capture()[2]
+    plugin._monitor = monitor
+    plugin.push_message = lambda **_kwargs: {"submitted": False}
+    plugin._observe_game_event(
+        GameEvent("game_ended", 10, "won", 100.0, {"result": "won"}),
+        ended,
+        generation,
+    )
+    assert plugin._pending_game_lifecycle is not None
+
+    original_try_capture = monitor.try_capture
+
+    def advance_after_capture(**kwargs: Any) -> tuple[GameSnapshot, Any, int] | None:
+        captured = original_try_capture(**kwargs)
+        with monitor._lock:
+            monitor._snapshot = GameSnapshot(
+                mode="constructed",
+                phase="mulligan",
+                game_number=5,
+            )
+        return captured
+
+    monitor.try_capture = advance_after_capture
+    plugin.push_message = lambda **kwargs: submitted.append(kwargs) or {"submitted": True}
+
+    assert plugin._retry_pending_game_lifecycle() is False
+    assert plugin._pending_game_lifecycle is None
+    assert submitted == []
+
+
+def test_lifecycle_retry_rejects_same_game_after_phase_becomes_spectator(
+    monkeypatch,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    submitted: list[dict[str, Any]] = []
+    plugin = _new_game_lifecycle_plugin(entry, submitted)
+    active = GameSnapshot(
+        mode="constructed",
+        phase="playing",
+        game_number=4,
+    )
+    monitor = entry.CompanionMonitor(
+        CompanionConfig(),
+        plugin.logger,
+        on_llm=lambda *_args: False,
+    )
+    with monitor._lock:
+        monitor._snapshot = active
+    generation = monitor.capture()[2]
+    plugin._monitor = monitor
+    plugin.push_message = lambda **_kwargs: {"submitted": False}
+    plugin._observe_game_event(
+        GameEvent("state_ready", 0, "ready", 100.0, {"game_number": 4}),
+        active,
+        generation,
+    )
+    assert plugin._pending_game_lifecycle is not None
+
+    original_try_capture = monitor.try_capture
+    advanced = False
+
+    def become_spectator_after_capture(
+        **kwargs: Any,
+    ) -> tuple[GameSnapshot, Any, int] | None:
+        nonlocal advanced
+        captured = original_try_capture(**kwargs)
+        if not advanced:
+            advanced = True
+            with monitor._lock:
+                monitor._snapshot = GameSnapshot(
+                    mode="constructed",
+                    phase="spectator",
+                    game_number=4,
+                )
+        return captured
+
+    monitor.try_capture = become_spectator_after_capture
+    plugin.push_message = lambda **kwargs: submitted.append(kwargs) or {"submitted": True}
+
+    assert plugin._retry_pending_game_lifecycle() is False
+    assert plugin._pending_game_lifecycle is None
+    assert submitted == []
+
+
+@pytest.mark.parametrize("settings_transition", [False, True])
+def test_stale_lifecycle_retry_cannot_clear_new_epoch_pending(
+    monkeypatch,
+    settings_transition: bool,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    plugin = _new_game_lifecycle_plugin(entry, [])
+    old_snapshot = GameSnapshot(
+        mode="constructed",
+        phase="playing",
+        game_number=4,
+    )
+    monitor = entry.CompanionMonitor(
+        CompanionConfig(),
+        plugin.logger,
+        on_llm=lambda *_args: False,
+    )
+    with monitor._lock:
+        monitor._snapshot = old_snapshot
+    old_generation = monitor.capture()[2]
+    plugin._monitor = monitor
+    plugin.push_message = lambda **_kwargs: {"submitted": False}
+    plugin._observe_game_event(
+        GameEvent("state_ready", 0, "ready", 100.0, {"game_number": 4}),
+        old_snapshot,
+        old_generation,
+    )
+    old_pending = plugin._pending_game_lifecycle
+    assert old_pending is not None
+
+    retry_entered = threading.Event()
+    release_retry = threading.Event()
+    retry_result: list[bool] = []
+    original_submit = plugin._submit_game_lifecycle
+
+    def pause_before_submit(*args: Any, **kwargs: Any) -> bool:
+        retry_entered.set()
+        assert release_retry.wait(1.0)
+        return original_submit(*args, **kwargs)
+
+    plugin._submit_game_lifecycle = pause_before_submit
+    retry_thread = threading.Thread(
+        target=lambda: retry_result.append(plugin._retry_pending_game_lifecycle())
+    )
+    retry_thread.start()
+    assert retry_entered.wait(1.0)
+
+    new_snapshot = GameSnapshot(
+        mode="constructed",
+        phase="playing",
+        game_number=5,
+    )
+    with monitor._lock:
+        monitor._begin_source_generation_locked()
+        monitor._snapshot = new_snapshot
+    new_generation = monitor.capture()[2]
+    assert plugin._advance_game_lifecycle_epoch(
+        monitor=monitor,
+        source_generation=new_generation,
+    )
+    new_epoch = plugin._game_lifecycle_epoch
+    new_event = GameEvent(
+        "state_ready",
+        0,
+        "ready",
+        101.0,
+        {"game_number": 5},
+    )
+    plugin._queue_game_lifecycle(
+        stage="resumed",
+        identity=f"{new_epoch}:5:resumed",
+        epoch=new_epoch,
+        event=new_event,
+        snapshot=new_snapshot,
+        source_generation=new_generation,
+    )
+    new_pending = plugin._pending_game_lifecycle
+    assert new_pending is not None
+    assert new_pending is not old_pending
+    plugin._settings_transition = settings_transition
+
+    release_retry.set()
+    retry_thread.join(1.0)
+
+    assert retry_thread.is_alive() is False
+    assert retry_result == [False]
+    assert plugin._pending_game_lifecycle is new_pending
+
+
+def test_new_game_start_wins_against_an_in_flight_old_game_retry(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    submitted: list[dict[str, Any]] = []
+    plugin = _new_game_lifecycle_plugin(entry, submitted)
+    retry_after_precheck = threading.Event()
+    release_retry = threading.Event()
+    started_callback_entered = threading.Event()
+    started_finished = threading.Event()
+    retry_result: list[bool] = []
+
+    def observe_from_monitor(
+        event: GameEvent,
+        snapshot: GameSnapshot,
+        source_generation: int,
+    ) -> None:
+        if event.kind == "game_started":
+            started_callback_entered.set()
+        plugin._observe_game_event(event, snapshot, source_generation)
+        if event.kind == "game_started":
+            started_finished.set()
+
+    monitor = entry.CompanionMonitor(
+        CompanionConfig(),
+        plugin.logger,
+        on_llm=lambda *_args: False,
+        on_event=observe_from_monitor,
+    )
+    ended = GameSnapshot(
+        mode="constructed",
+        phase="ended",
+        game_number=4,
+        result="won",
+    )
+    with monitor._lock:
+        monitor._snapshot = ended
+    generation = monitor.capture()[2]
+    plugin._monitor = monitor
+    plugin.push_message = lambda **_kwargs: {"submitted": False}
+    plugin._observe_game_event(
+        GameEvent("game_ended", 10, "won", 100.0, {"result": "won"}),
+        ended,
+        generation,
+    )
+    assert plugin._pending_game_lifecycle is not None
+
+    original_build_prompt = entry.build_llm_prompt
+
+    def pause_old_retry(event: GameEvent, *args: Any, **kwargs: Any) -> str:
+        if event.kind == "game_ended":
+            retry_after_precheck.set()
+            assert release_retry.wait(1.0)
+        return original_build_prompt(event, *args, **kwargs)
+
+    monkeypatch.setattr(entry, "build_llm_prompt", pause_old_retry)
+    plugin.push_message = lambda **kwargs: submitted.append(kwargs) or {"submitted": True}
+    retry_thread = threading.Thread(
+        target=lambda: retry_result.append(plugin._retry_pending_game_lifecycle())
+    )
+    retry_thread.start()
+    assert retry_after_precheck.wait(1.0)
+
+    started = GameSnapshot(
+        mode="constructed",
+        phase="mulligan",
+        game_number=5,
+    )
+    with monitor._lock:
+        monitor._snapshot = started
+    started_thread = threading.Thread(
+        target=lambda: monitor._notify_event(
+            GameEvent("game_started", 5, "started", 101.0, {}),
+            started,
+            source_generation=generation,
+        )
+    )
+    started_thread.start()
+    assert started_callback_entered.wait(1.0)
+    assert started_finished.wait(0.05) is False
+
+    release_retry.set()
+    retry_thread.join(1.0)
+    started_thread.join(1.0)
+
+    assert retry_thread.is_alive() is False
+    assert started_thread.is_alive() is False
+    assert retry_result == [False]
+    assert started_finished.is_set()
+    assert [item["metadata"]["lifecycle_stage"] for item in submitted] == ["started"]
+    assert submitted[0]["metadata"]["match_id"] == 5
+    assert plugin._pending_game_lifecycle is None
+    assert not any(key.endswith(":4:ended") for key in plugin._game_lifecycle_sent)
+
+
 def test_successful_new_game_lifecycle_supersedes_an_old_ended_pending(monkeypatch) -> None:
     entry = _load_sdk_entry(monkeypatch)
     submitted: list[dict[str, Any]] = []
@@ -3782,11 +4196,9 @@ def test_live_state_is_shared_silently_to_explicit_target(
 
     assert plugin._share_live_state(snapshot) is True
 
-    assert len(submitted) == 2
-    assert [message["metadata"]["segment"] for message in submitted] == [
-        "core",
-        "shop_1",
-    ]
+    assert len(submitted) == 1
+    assert submitted[0]["metadata"]["segment"] == "core"
+    assert submitted[0]["metadata"]["format"] == "hearthstone_live_atomic_v1"
     assert submitted[0]["coalesce_key"] == plugin._live_state_key("当前角色")
     assert all(message["visibility"] == [] for message in submitted)
     assert all(message["ai_behavior"] == "read" for message in submitted)
@@ -3800,18 +4212,19 @@ def test_live_state_is_shared_silently_to_explicit_target(
         == "filtered_player_visible_live_state"
         for message in submitted
     )
-    texts = [message["parts"][0]["text"] for message in submitted]
-    payloads = [json.loads(text.split(":", 1)[1]) for text in texts]
-    assert all(len(text.encode("utf-8")) <= 900 for text in texts)
-    assert payloads[0]["gold"] == 7
-    assert payloads[0]["refresh_actual_cost"] == 0
-    assert payloads[0]["upgrade_actual_cost"] == 6
-    assert payloads[1]["cards"] == [
-        ["BG_SPELL_RUNTIME", "实时酒馆法术", 1, 0, None, 0, 1, "s-D"]
-    ]
+    text = submitted[0]["parts"][0]["text"]
+    assert len(text.encode("utf-8")) <= entry._LIVE_STATE_DELIVERY_MAX_BYTES
+    assert "BG_SPELL_RUNTIME" in text
+    assert "实时酒馆法术" in text
+    payload = json.loads(text.split("过滤后的实时局势 JSON：", 1)[1])
+    battlegrounds = payload["state"]["battlegrounds"]
+    cost_fields = payload["schema"]["costs"].split("|")
+    costs = dict(zip(cost_fields, battlegrounds["costs"], strict=True))
+    assert costs["refresh"] == 0
+    assert costs["upgrade"] == 6
     assert plugin._live_state_shared is True
     assert plugin._live_state_target == "当前角色"
-    assert plugin._live_state_segments == ("core", "shop_1")
+    assert plugin._live_state_segments == ("core",)
     assert plugin._live_state_game_number == 3
 
 
@@ -4209,20 +4622,14 @@ def test_live_state_republishes_same_turn_card_and_economy_changes(monkeypatch) 
     assert plugin._share_live_state(snapshot(gold=6, card_id="SHOP_A")) is True
     assert plugin._share_live_state(snapshot(gold=5, card_id="SHOP_B")) is True
 
-    assert len(submitted) == 4
+    assert len(submitted) == 2
     assert {item["metadata"]["kind"] for item in submitted} == {
         "game_live_state"
     }
-    assert [item["metadata"]["segment"] for item in submitted] == [
-        "core",
-        "shop_1",
-        "core",
-        "shop_1",
-    ]
-    assert "SHOP_A" in submitted[1]["parts"][0]["text"]
-    assert "SHOP_B" in submitted[3]["parts"][0]["text"]
-    assert submitted[0]["coalesce_key"] == submitted[2]["coalesce_key"]
-    assert submitted[1]["coalesce_key"] == submitted[3]["coalesce_key"]
+    assert [item["metadata"]["segment"] for item in submitted] == ["core", "core"]
+    assert "SHOP_A" in submitted[0]["parts"][0]["text"]
+    assert "SHOP_B" in submitted[1]["parts"][0]["text"]
+    assert submitted[0]["coalesce_key"] == submitted[1]["coalesce_key"]
 
 
 def test_live_state_publish_delivers_each_semantic_snapshot_immediately(monkeypatch) -> None:
@@ -4522,7 +4929,7 @@ def test_constructed_live_segments_keep_seven_named_minions_after_host_parser() 
     assert required <= set(host_selection["selected_names"]), json.dumps(host_selection)
 
 
-def test_unresolved_current_role_refuses_background_state_without_querying_bus(
+def test_unresolved_current_role_publishes_active_session_state_without_querying_bus(
     monkeypatch,
 ) -> None:
     entry = _load_sdk_entry(monkeypatch)
@@ -4563,10 +4970,13 @@ def test_unresolved_current_role_refuses_background_state_without_querying_bus(
         battlegrounds=BattlegroundsSnapshot(round=3, phase="recruit"),
     )
 
-    assert plugin._publish_live_state(snapshot) is False
+    assert plugin._publish_live_state(snapshot) is True
     assert bus_calls == 0
-    assert submitted == []
-    assert plugin._live_state_shared is False
+    assert len(submitted) == 1
+    assert submitted[0]["ai_behavior"] == "read"
+    assert "target_lanlan" not in submitted[0]
+    assert submitted[0]["metadata"]["routing_scope"] == "active_session_fallback"
+    assert plugin._live_state_shared is True
     assert plugin._live_state_target == ""
 
 
@@ -4610,11 +5020,57 @@ def test_user_context_ignores_other_roles_when_target_is_configured(
     assert pending[0].target == "role-a"
 
 
+def test_ignored_role_cannot_advance_fixed_targets_memory_watermark(
+    monkeypatch,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(
+        llm_data_consent=True,
+        target_lanlan="role-a",
+    )
+    plugin._ownership_lock = threading.RLock()
+    plugin._delivery_lock = threading.RLock()
+    plugin._query_ledger = entry.QueryLedger()
+    plugin._session_target = "role-a"
+    plugin._last_user_context_timestamp = 0.0
+    plugin._last_user_context_signatures = set()
+    plugin._last_user_chat_at = 0.0
+    now = time.time()
+
+    assert plugin._observe_user_context(
+        (
+            {
+                "type": "user_message",
+                "content": "对面场上有什么随从",
+                "lanlan": "role-b",
+                "_ts": now + 10.0,
+            },
+        )
+    ) == 0
+    assert plugin._observe_user_context(
+        (
+            {
+                "type": "user_message",
+                "content": "现在第几回合",
+                "lanlan": "role-a",
+                "_ts": now,
+            },
+        )
+    ) == 1
+
+    pending = plugin._query_ledger.pending(now=now + 5.0, min_age=1.0)
+    assert len(pending) == 1
+    assert pending[0].target == "role-a"
+    assert pending[0].text == "现在第几回合"
+
+
 def test_recent_user_context_uses_official_keyword_call_and_payload_record(
     monkeypatch,
 ) -> None:
     entry = _load_sdk_entry(monkeypatch)
     calls: list[dict[str, Any]] = []
+    caller_thread = threading.get_ident()
     record = types.SimpleNamespace(
         payload={
             "type": "user_message",
@@ -4633,7 +5089,12 @@ def test_recent_user_context_uses_official_keyword_call_and_payload_record(
             timeout: float,
         ) -> list[Any]:
             calls.append(
-                {"bucket_id": bucket_id, "limit": limit, "timeout": timeout}
+                {
+                    "bucket_id": bucket_id,
+                    "limit": limit,
+                    "timeout": timeout,
+                    "thread": threading.get_ident(),
+                }
             )
             return [record]
 
@@ -4651,7 +5112,11 @@ def test_recent_user_context_uses_official_keyword_call_and_payload_record(
     records = asyncio.run(plugin._read_recent_user_context())
     observed = plugin._observe_user_context(records)
 
-    assert calls == [{"bucket_id": "default", "limit": 8, "timeout": 0.25}]
+    assert len(calls) == 1
+    assert calls[0]["bucket_id"] == "default"
+    assert calls[0]["limit"] == 8
+    assert calls[0]["timeout"] == 1.5
+    assert calls[0]["thread"] != caller_thread
     assert observed == 1
     assert plugin._session_target == "role-a"
     pending = plugin._query_ledger.pending(now=102.0, min_age=1.0)
@@ -4700,6 +5165,94 @@ def test_user_context_replay_preserves_new_identical_agent_claim(monkeypatch) ->
     assert second.source_timestamp == now + 6.0
     assert second.claimed_by == "agent"
     assert plugin._query_ledger.pending(now=now + 8.0, min_age=1.0) == ()
+
+
+def test_chat_then_memory_replay_preserves_agent_claim(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(llm_data_consent=True)
+    plugin._ownership_lock = threading.RLock()
+    plugin._query_ledger = entry.QueryLedger()
+    plugin._session_target = ""
+    plugin._last_user_context_timestamp = 0.0
+    plugin._last_user_context_signatures = set()
+    plugin._last_user_chat_at = 0.0
+    now = time.time()
+    monkeypatch.setattr(entry.time, "time", lambda: now)
+
+    asyncio.run(
+        plugin.on_chat_message(
+            text="现在第几回合",
+            _ctx={"lanlan_name": "role-a"},
+        )
+    )
+    agent = plugin._query_ledger.claim(
+        owner="agent",
+        text="现在第几回合",
+        target="role-a",
+        now=now + 0.1,
+    )
+    assert agent is not None
+
+    assert plugin._observe_user_context(
+        (
+            {
+                "type": "user_message",
+                "content": "现在第几回合",
+                "lanlan": "role-a",
+                "_ts": now + 0.2,
+            },
+        )
+    ) == 1
+
+    assert agent.claimed_by == "agent"
+    assert agent.source_timestamp == now + 0.2
+    assert plugin._query_ledger.pending(now=now + 1.0, min_age=0.0) == ()
+
+
+def test_memory_batch_binds_current_same_text_to_provisional_agent_claim(
+    monkeypatch,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(llm_data_consent=True)
+    plugin._ownership_lock = threading.RLock()
+    plugin._query_ledger = entry.QueryLedger()
+    plugin._session_target = ""
+    plugin._last_user_context_timestamp = 0.0
+    plugin._last_user_context_signatures = set()
+    plugin._last_user_chat_at = 0.0
+    now = time.time()
+    monkeypatch.setattr(entry.time, "time", lambda: now)
+    provisional = plugin._query_ledger.claim(
+        owner="agent",
+        text="现在第几回合",
+        target="role-a",
+        now=now,
+        new_if_handled=True,
+    )
+    assert provisional is not None
+
+    assert plugin._observe_user_context(
+        (
+            {
+                "type": "user_message",
+                "content": "现在第几回合",
+                "lanlan": "role-a",
+                "_ts": now - 10.0,
+            },
+            {
+                "type": "user_message",
+                "content": "现在第几回合",
+                "lanlan": "role-a",
+                "_ts": now,
+            },
+        )
+    ) == 2
+
+    assert provisional.source_timestamp == now
+    assert provisional.claimed_by == "agent"
+    assert plugin._query_ledger.pending(now=now + 1.0, min_age=0.0) == ()
 
 
 def test_user_context_watermark_handles_distinct_records_with_equal_timestamp(
@@ -5092,21 +5645,37 @@ def test_game_end_clears_pending_live_queries(monkeypatch) -> None:
     assert plugin._query_ledger.pending(now=102.0, min_age=1.0) == ()
 
 
-def test_live_state_tool_does_not_read_again_after_fallback_claim(monkeypatch) -> None:
+def test_live_state_tool_reads_current_snapshot_without_preempting_fallback(monkeypatch) -> None:
     entry = _load_sdk_entry(monkeypatch)
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
     plugin._query_ledger = entry.QueryLedger()
-    plugin._delivery_target = lambda: "role-a"
-    plugin._query_ledger.claim(
-        owner="fallback",
-        text="现在第几回合",
-        target="role-a",
+    plugin._delivery_target = lambda: (_ for _ in ()).throw(
+        AssertionError("official LLM tool callbacks are roleless")
     )
+    observed = plugin._query_ledger.observe(
+        "现在第几回合",
+        target="role-b",
+        source_timestamp=time.time(),
+    )
+    fallback_claim = plugin._query_ledger.claim(
+        owner="fallback",
+        text=observed.text,
+        target=observed.target,
+    )
+    assert fallback_claim is not None
 
-    async def unexpected_resolution(**_kwargs: Any) -> tuple[str, dict[str, Any]]:
-        raise AssertionError("duplicate query reached snapshot resolver")
+    async def resolve(**_kwargs: Any) -> tuple[str, dict[str, Any]]:
+        return "constructed", {
+            "available": True,
+            "state": {
+                "round": 6,
+                "turn": 11,
+                "active_side": "player",
+                "phase": "playing",
+            },
+        }
 
-    plugin._resolve_live_query_payload = unexpected_resolution
+    plugin._resolve_live_query_payload = resolve
 
     result = asyncio.run(
         plugin.hearthstone_live_state(
@@ -5115,35 +5684,132 @@ def test_live_state_tool_does_not_read_again_after_fallback_claim(monkeypatch) -
         )
     )
 
-    assert result["status"] == "query_already_handled"
-    assert result["answer_contract"]["do_not_reply"] is True
+    assert result["available"] is True
+    assert "round=6" in result["views"][0]["state"]
+    assert fallback_claim.claimed_by == "fallback"
 
 
-def test_live_state_tool_requires_query_when_memory_has_no_unique_pending(
+def test_current_turn_tool_fails_open_after_an_unknown_roles_fallback_commit(
     monkeypatch,
 ) -> None:
     entry = _load_sdk_entry(monkeypatch)
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
     plugin._query_ledger = entry.QueryLedger()
-    plugin.cfg = CompanionConfig()
+    plugin._delivery_target = lambda: (_ for _ in ()).throw(
+        AssertionError("official LLM tool callbacks are roleless")
+    )
+    observed = plugin._query_ledger.observe(
+        "现在第几回合",
+        target="role-a",
+        source_timestamp=time.time(),
+        intent="overview",
+    )
+    fallback = plugin._query_ledger.claim(
+        owner="fallback",
+        text=observed.text,
+        target=observed.target,
+    )
+    assert fallback is observed
+    assert plugin._query_ledger.commit(
+        fallback,
+        owner="fallback",
+        submit=lambda: True,
+    )
 
-    async def unexpected_resolution(**_kwargs: Any) -> tuple[str, dict[str, Any]]:
-        raise AssertionError("uncorrelated tool call reached snapshot resolver")
+    async def resolve(**_kwargs: Any) -> tuple[str, dict[str, Any]]:
+        return "constructed", {
+            "available": True,
+            "state": {
+                "round": 8,
+                "turn": 15,
+                "active_side": "player",
+                "phase": "playing",
+            },
+        }
 
-    plugin._resolve_live_query_payload = unexpected_resolution
+    plugin._resolve_live_query_payload = resolve
 
-    result = asyncio.run(plugin.hearthstone_live_state())
+    result = asyncio.run(plugin.hearthstone_current_turn())
 
-    assert result["status"] == "query_correlation_required"
-    assert result["answer_contract"]["do_not_reply"] is True
-    assert plugin._query_ledger.pending(now=time.time() + 2.0, min_age=0.0) == ()
+    assert result["round"] == 8
+    assert result["available"] is True
 
 
-def test_live_state_tool_unrouted_claim_migrates_to_memory_role(monkeypatch) -> None:
+def test_current_turn_tool_leaves_new_question_for_role_scoped_fallback(
+    monkeypatch,
+) -> None:
     entry = _load_sdk_entry(monkeypatch)
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
     plugin._query_ledger = entry.QueryLedger()
-    plugin._stable_target = lambda: ""
+    plugin._delivery_target = lambda: "role-a"
+    old = plugin._query_ledger.observe(
+        "这一局是什么模式",
+        target="role-a",
+        source_timestamp=time.time() - 1.0,
+        intent="overview",
+    )
+    fallback = plugin._query_ledger.claim(
+        owner="fallback",
+        text=old.text,
+        target=old.target,
+    )
+    assert fallback is old
+    assert plugin._query_ledger.commit(
+        fallback,
+        owner="fallback",
+        submit=lambda: True,
+    )
+    current = plugin._query_ledger.observe(
+        "现在第几回合",
+        target="role-a",
+        source_timestamp=time.time(),
+        intent="overview",
+    )
+
+    async def resolve(**_kwargs: Any) -> tuple[str, dict[str, Any]]:
+        return "constructed", {
+            "available": True,
+            "state": {
+                "round": 11,
+                "turn": 21,
+                "active_side": "player",
+                "phase": "playing",
+            },
+        }
+
+    plugin._resolve_live_query_payload = resolve
+    result = asyncio.run(plugin.hearthstone_current_turn())
+
+    assert result["round"] == 11
+    assert current.claimed_by == ""
+
+
+def test_live_state_tool_allows_argument_free_realtime_query(
+    monkeypatch,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin._query_ledger = entry.QueryLedger()
+    plugin._delivery_target = lambda: ""
+
+    async def resolve(**_kwargs: Any) -> tuple[str, dict[str, Any]]:
+        return "constructed", {"available": False, "reason": "state_unavailable"}
+
+    plugin._resolve_live_query_payload = resolve
+
+    result = asyncio.run(plugin.hearthstone_live_state())
+
+    assert result["mode"] == "constructed"
+    assert result["available"] is False
+    assert result["reason"] == "state_unavailable"
+    assert plugin._query_ledger.pending(now=time.time() + 2.0, min_age=0.0) == ()
+
+
+def test_live_state_tool_does_not_claim_later_memory_role(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin._query_ledger = entry.QueryLedger()
+    plugin._delivery_target = lambda: ""
 
     async def resolve(**_kwargs: Any) -> tuple[str, dict[str, Any]]:
         return "constructed", {"available": False, "reason": "state_unavailable"}
@@ -5162,7 +5828,41 @@ def test_live_state_tool_unrouted_claim_migrates_to_memory_role(monkeypatch) -> 
     )
 
     assert observed.target == "role-b"
-    assert observed.claimed_by == "tool"
+    assert observed.claimed_by == ""
+
+
+def test_roleless_turn_tool_does_not_guess_between_two_roles(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin._query_ledger = entry.QueryLedger()
+    plugin._delivery_target = lambda: (_ for _ in ()).throw(
+        AssertionError("official LLM tool callbacks are roleless")
+    )
+    now = time.time()
+    role_a = plugin._query_ledger.observe(
+        "现在第几回合",
+        target="role-a",
+        source_timestamp=now,
+    )
+    role_b = plugin._query_ledger.observe(
+        "现在第几回合",
+        target="role-b",
+        source_timestamp=now + 0.01,
+    )
+
+    async def resolve(**_kwargs: Any) -> tuple[str, dict[str, Any]]:
+        return "constructed", {
+            "available": True,
+            "state": {"round": 9, "turn": 17, "phase": "playing"},
+        }
+
+    plugin._resolve_live_query_payload = resolve
+
+    result = asyncio.run(plugin.hearthstone_current_turn())
+
+    assert result["round"] == 9
+    assert role_a.claimed_by == ""
+    assert role_b.claimed_by == ""
 
 
 def test_live_query_watch_does_not_read_memory_without_live_state_access(
@@ -5191,27 +5891,129 @@ def test_live_query_watch_does_not_read_memory_without_live_state_access(
     assert plugin._query_ledger.pending(min_age=0.0) == ()
 
 
-def test_agent_query_is_silent_after_another_path_claims_question(monkeypatch) -> None:
+def test_agent_treats_same_text_invocation_as_new_turn_before_memory(monkeypatch) -> None:
     entry = _load_sdk_entry(monkeypatch)
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
     plugin._query_ledger = entry.QueryLedger()
+    plugin._ownership_lock = threading.RLock()
+    plugin._delivery_lock = threading.RLock()
     plugin._delivery_target = lambda: "role-a"
-    plugin._query_ledger.claim(
-        owner="tool",
+    first = plugin._query_ledger.claim(
+        owner="agent",
         text="现在第几回合",
         target="role-a",
     )
+    assert first is not None
+
+    async def resolve(**_kwargs: Any) -> tuple[str, dict[str, Any]]:
+        return "constructed", {"available": True, "state": {"round": 4}}
 
     async def finish(**kwargs: Any) -> dict[str, Any]:
         return kwargs
 
+    plugin._resolve_live_query_payload = resolve
     plugin.finish = finish
+    result = asyncio.run(
+        plugin.query_hearthstone_live_state(
+            query="现在第几回合",
+            _ctx={"lanlan_name": "role-a"},
+        )
+    )
+
+    assert result["delivery"] == "proactive"
+    assert result["data"]["payload"]["state"]["round"] == 4
+
+
+def test_fixed_target_rejects_another_roles_agent_query(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(
+        llm_data_consent=True,
+        target_lanlan="role-a",
+    )
+    plugin._session_target = "role-a"
+
+    async def unexpected_resolve(**_kwargs: Any) -> tuple[str, dict[str, Any]]:
+        raise AssertionError("another role must not read the fixed target's state")
+
+    async def finish(**kwargs: Any) -> dict[str, Any]:
+        return kwargs
+
+    plugin._resolve_live_query_payload = unexpected_resolve
+    plugin.finish = finish
+
+    result = asyncio.run(
+        plugin.query_hearthstone_live_state(
+            query="现在第几回合",
+            _ctx={"lanlan_name": "role-b"},
+        )
+    )
+
+    assert result["delivery"] == "silent"
+    assert result["data"]["status"] == "target_mismatch"
+    assert plugin._session_target == "role-a"
+
+
+def test_fixed_target_rejects_agent_query_without_role_identity(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(
+        llm_data_consent=True,
+        target_lanlan="role-a",
+    )
+
+    async def unexpected_resolve(**_kwargs: Any) -> tuple[str, dict[str, Any]]:
+        raise AssertionError("an unscoped Agent must not read fixed-target state")
+
+    async def finish(**kwargs: Any) -> dict[str, Any]:
+        return kwargs
+
+    plugin._resolve_live_query_payload = unexpected_resolve
+    plugin.finish = finish
+
     result = asyncio.run(
         plugin.query_hearthstone_live_state(query="现在第几回合")
     )
 
     assert result["delivery"] == "silent"
-    assert result["data"]["status"] == "query_already_handled"
+    assert result["data"]["status"] == "target_mismatch"
+
+
+def test_role_scoped_agent_allows_explicit_selection_without_query(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin._query_ledger = entry.QueryLedger()
+    plugin._ownership_lock = threading.RLock()
+    plugin._delivery_lock = threading.RLock()
+    plugin._session_target = ""
+    pending = plugin._query_ledger.observe(
+        "现在第几回合",
+        target="role-a",
+        source_timestamp=time.time(),
+        intent="overview",
+    )
+
+    async def resolve(**_kwargs: Any) -> tuple[str, dict[str, Any]]:
+        return "battlegrounds", {"available": True, "state": {}}
+
+    async def finish(**kwargs: Any) -> dict[str, Any]:
+        return kwargs
+
+    plugin._resolve_live_query_payload = resolve
+    plugin.finish = finish
+
+    result = asyncio.run(
+        plugin.query_hearthstone_live_state(
+            focus="shop",
+            mode="battlegrounds",
+            _ctx={"lanlan_name": "role-a"},
+        )
+    )
+
+    assert result["delivery"] == "proactive"
+    assert result["data"]["payload"]["available"] is True
+    assert plugin._session_target == "role-a"
+    assert plugin._query_ledger.pending(min_age=0.0) == (pending,)
 
 
 def test_agent_query_requires_query_or_official_request_context(monkeypatch) -> None:
@@ -5271,26 +6073,14 @@ def test_live_state_expiration_replaces_pending_snapshot_with_same_key(
     assert plugin._share_live_state(snapshot) is True
     assert plugin._expire_live_state() is True
 
-    assert [item["ai_behavior"] for item in submitted] == ["read"] * 4
-    assert submitted[0]["coalesce_key"] == submitted[2]["coalesce_key"]
-    assert submitted[1]["coalesce_key"] == submitted[3]["coalesce_key"]
-    assert [item["metadata"]["segment"] for item in submitted] == [
-        "core",
-        "shop_1",
-        "core",
-        "shop_1",
-    ]
-    assert all(
-        item["metadata"]["kind"] == "game_live_state_expired"
-        for item in submitted[2:]
-    )
-    assert all(item["metadata"]["context_expired"] is True for item in submitted[2:])
-    assert "实时公开状态已失效" in submitted[2]["parts"][0]["text"]
-    assert "BG_" not in submitted[2]["parts"][0]["text"]
-    assert all(
-        item["metadata"]["privacy_scope"] == "no_game_state_tombstone"
-        for item in submitted[2:]
-    )
+    assert [item["ai_behavior"] for item in submitted] == ["read"] * 2
+    assert submitted[0]["coalesce_key"] == submitted[1]["coalesce_key"]
+    assert [item["metadata"]["segment"] for item in submitted] == ["core", "core"]
+    assert submitted[1]["metadata"]["kind"] == "game_live_state_expired"
+    assert submitted[1]["metadata"]["context_expired"] is True
+    assert "实时公开状态已失效" in submitted[1]["parts"][0]["text"]
+    assert "BG_" not in submitted[1]["parts"][0]["text"]
+    assert submitted[1]["metadata"]["privacy_scope"] == "no_game_state_tombstone"
     assert plugin._live_state_shared is False
     assert plugin._live_state_segments == ()
     assert plugin._live_state_snapshot is None
@@ -5348,7 +6138,7 @@ def test_live_state_rejection_does_not_mark_notice_as_shared(monkeypatch) -> Non
     assert plugin._live_state_snapshot is None
 
 
-def test_live_state_partial_publish_expires_the_entire_segment_set(monkeypatch) -> None:
+def test_atomic_live_state_rejection_leaves_no_partial_context(monkeypatch) -> None:
     entry = _load_sdk_entry(monkeypatch)
     submitted: list[dict[str, Any]] = []
     plugin = object.__new__(entry.HearthstoneCompanionPlugin)
@@ -5366,10 +6156,7 @@ def test_live_state_partial_publish_expires_the_entire_segment_set(monkeypatch) 
 
     def push_message(**kwargs: Any) -> dict[str, bool]:
         submitted.append(kwargs)
-        rejected = (
-            kwargs["metadata"]["kind"] == "game_live_state"
-            and kwargs["metadata"]["segment"] == "shop_1"
-        )
+        rejected = kwargs["metadata"]["kind"] == "game_live_state"
         return {"submitted": not rejected}
 
     plugin.push_message = push_message
@@ -5400,9 +6187,6 @@ def test_live_state_partial_publish_expires_the_entire_segment_set(monkeypatch) 
         for item in submitted
     ] == [
         ("game_live_state", "core"),
-        ("game_live_state", "shop_1"),
-        ("game_live_state_expired", "core"),
-        ("game_live_state_expired", "shop_1"),
     ]
     assert plugin._live_state_shared is False
     assert plugin._live_state_segments == ()
@@ -5647,6 +6431,65 @@ def test_sync_active_context_rejects_a_snapshot_from_a_replaced_source_generatio
     assert plugin._live_state_shared is False
 
 
+def test_live_state_rejects_an_older_snapshot_from_the_same_source_generation(
+    monkeypatch,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    submitted: list[dict[str, Any]] = []
+    old_snapshot = GameSnapshot(
+        mode="constructed",
+        phase="playing",
+        game_number=3,
+        turn=5,
+        round=3,
+    )
+    new_snapshot = replace(old_snapshot, turn=7, round=4)
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(llm_data_consent=True, target_lanlan="lanlan-a")
+    plugin._ownership_lock = threading.RLock()
+    plugin._delivery_lock = threading.RLock()
+    plugin._started = True
+    plugin._monitor_dispatch_enabled = True
+    plugin._settings_transition = False
+    plugin._live_state_shared = False
+    plugin._live_state_target = ""
+    plugin._live_state_segments = ()
+    plugin._live_state_game_number = 0
+    plugin._live_state_snapshot = None
+    plugin._live_state_published_at = 0.0
+    plugin.logger = types.SimpleNamespace(warning=lambda *_args, **_kwargs: None)
+    plugin.push_message = lambda **kwargs: submitted.append(kwargs) or {"submitted": True}
+    monitor = entry.CompanionMonitor(
+        CompanionConfig(),
+        plugin.logger,
+        on_llm=lambda *_args: False,
+    )
+    with monitor._lock:
+        monitor._snapshot = new_snapshot
+    generation = monitor.capture()[2]
+    plugin._monitor = monitor
+
+    assert plugin._publish_live_state(
+        old_snapshot,
+        expected_monitor=monitor,
+        expected_source_generation=generation,
+    ) is False
+    assert plugin._publish_live_state(
+        new_snapshot,
+        expected_monitor=monitor,
+        expected_source_generation=generation,
+    ) is True
+
+    live_updates = [
+        message
+        for message in submitted
+        if message["metadata"].get("context_expired") is False
+    ]
+    assert len(live_updates) == 1
+    assert '"round":4' in live_updates[0]["parts"][0]["text"]
+    assert '"round":3' not in live_updates[0]["parts"][0]["text"]
+
+
 def test_recent_user_chat_suppresses_noncritical_proactive_commentary(monkeypatch) -> None:
     entry = _load_sdk_entry(monkeypatch)
     submitted: list[dict[str, Any]] = []
@@ -5834,7 +6677,7 @@ def test_live_state_cleanup_rejection_keeps_segments_for_retry_after_consent_rac
     assert [item["metadata"]["context_expired"] for item in submitted] == [False, True]
     assert plugin._live_state_shared is True
     assert plugin._live_state_target == "兰兰A"
-    assert plugin._live_state_segments == ("core", "shop_1")
+    assert plugin._live_state_segments == ("core",)
 
 
 def test_target_change_expires_old_live_state_before_publishing_to_new_role(monkeypatch) -> None:
@@ -5912,6 +6755,99 @@ def test_empty_config_uses_chat_context_role_for_commentary(
     assert len(submitted) == 1
     assert submitted[0]["target_lanlan"] == target
     assert submitted[0]["metadata"]["kind"] == "catgirl_commentary"
+
+
+def test_chat_observer_updates_routing_but_leaves_query_observation_to_memory(
+    monkeypatch,
+) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(llm_data_consent=True)
+    plugin._ownership_lock = threading.RLock()
+    plugin._query_ledger = entry.QueryLedger()
+    plugin._session_target = ""
+    plugin._last_user_chat_at = 0.0
+
+    result = asyncio.run(
+        plugin.on_chat_message(
+            text="现在第几回合",
+            _ctx={"lanlan_name": "role-a"},
+        )
+    )
+
+    assert result["status"] == "observed"
+    assert plugin._session_target == "role-a"
+    assert plugin._last_user_chat_at > 0
+    assert plugin._query_ledger.pending(min_age=0.0) == ()
+
+
+def test_chat_observer_does_not_retain_query_without_data_consent(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(llm_data_consent=False)
+    plugin._ownership_lock = threading.RLock()
+    plugin._query_ledger = entry.QueryLedger()
+    plugin._session_target = ""
+    plugin._last_user_chat_at = 0.0
+
+    asyncio.run(
+        plugin.on_chat_message(
+            text="现在第几回合",
+            _ctx={"lanlan_name": "role-a"},
+        )
+    )
+
+    assert plugin._query_ledger.pending(min_age=0.0) == ()
+    assert plugin._session_target == "role-a"
+
+
+def test_fixed_target_chat_ignores_other_roles_before_accepting_target(monkeypatch) -> None:
+    entry = _load_sdk_entry(monkeypatch)
+    plugin = object.__new__(entry.HearthstoneCompanionPlugin)
+    plugin.cfg = CompanionConfig(llm_data_consent=True, target_lanlan="role-a")
+    plugin._ownership_lock = threading.RLock()
+    plugin._query_ledger = entry.QueryLedger()
+    plugin._session_target = "role-a"
+    plugin._last_user_chat_at = 123.0
+
+    asyncio.run(
+        plugin.on_chat_message(
+            text="现在第几回合",
+            _ctx={"lanlan_name": "role-b"},
+        )
+    )
+
+    assert plugin._session_target == "role-a"
+    assert plugin._last_user_chat_at == 123.0
+    assert plugin._query_ledger.pending(min_age=0.0) == ()
+
+    before = time.time()
+    asyncio.run(
+        plugin.on_chat_message(
+            text="商店里有什么",
+            _ctx={"lanlan_name": "role-a"},
+        )
+    )
+    plugin._last_user_context_timestamp = 0.0
+    plugin._last_user_context_signatures = set()
+    assert plugin._observe_user_context(
+        (
+            {
+                "type": "user_message",
+                "content": "商店里有什么",
+                "lanlan": "role-a",
+                "_ts": before,
+            },
+        )
+    ) == 1
+    pending = plugin._query_ledger.pending(
+        now=before + entry._LIVE_QUERY_FALLBACK_DELAY_SECONDS + 0.1,
+        min_age=entry._LIVE_QUERY_FALLBACK_DELAY_SECONDS,
+    )
+
+    assert len(pending) == 1
+    assert pending[0].target == "role-a"
+    assert pending[0].text == "商店里有什么"
 
 
 def test_stable_target_uses_only_explicit_configuration(monkeypatch) -> None:

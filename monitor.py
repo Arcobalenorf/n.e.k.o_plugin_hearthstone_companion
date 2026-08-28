@@ -16,7 +16,7 @@ OutputCallback = Callable[[str, GameEvent, GameSnapshot], bool]
 StatusCallback = Callable[[dict[str, Any]], None]
 ResultCallback = Callable[[GameEvent, GameSnapshot], None]
 EventCallback = Callable[..., None]
-StateCallback = Callable[[GameSnapshot], None]
+StateCallback = Callable[..., None]
 LIVE_STATE_MAX_AGE_SECONDS = 300.0
 LIVE_CONTEXT_PUBLISH_INTERVAL_SECONDS = 0.5
 BATTLEGROUNDS_SHOP_SETTLE_SECONDS = 0.5
@@ -51,6 +51,9 @@ class CompanionMonitor:
             on_event
         )
         self._on_state = on_state
+        self._on_state_accepts_source_generation = (
+            self._state_callback_accepts_source_generation(on_state)
+        )
         self._parser = PowerLogParser()
         self._tailer = PowerLogTailer(
             PowerLogLocator(config.log_path), initial_read_max_bytes=config.initial_read_max_bytes
@@ -82,6 +85,18 @@ class CompanionMonitor:
             return False
         try:
             inspect.signature(callback).bind(None, None, None)
+        except (TypeError, ValueError):
+            return False
+        return True
+
+    @staticmethod
+    def _state_callback_accepts_source_generation(
+        callback: StateCallback | None,
+    ) -> bool:
+        if callback is None:
+            return False
+        try:
+            inspect.signature(callback).bind(None, None)
         except (TypeError, ValueError):
             return False
         return True
@@ -212,11 +227,17 @@ class CompanionMonitor:
     def run_if_source_generation(
         self,
         expected_generation: int,
+        expected_game_number: int,
         callback: Callable[[], Any],
+        snapshot_valid: Callable[[GameSnapshot], bool] | None = None,
     ) -> tuple[bool, Any]:
-        """Linearize a short delivery with the currently active log source."""
+        """Linearize a short delivery with the expected source and game."""
         with self._lock:
             if expected_generation != self._source_generation:
+                return False, None
+            if expected_game_number != self._snapshot.game_number:
+                return False, None
+            if snapshot_valid is not None and not snapshot_valid(self._snapshot):
                 return False, None
             return True, callback()
 
@@ -848,7 +869,10 @@ class CompanionMonitor:
                 ):
                     return
             try:
-                self._on_state(snapshot)
+                if self._on_state_accepts_source_generation:
+                    self._on_state(snapshot, source_generation)
+                else:
+                    self._on_state(snapshot)
             except Exception as exc:
                 with self._lock:
                     self._status.last_error_code = f"state:{type(exc).__name__}"
