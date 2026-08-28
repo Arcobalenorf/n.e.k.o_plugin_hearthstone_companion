@@ -33,6 +33,18 @@ def test_locales_define_standard_plugin_metadata() -> None:
         assert all(translations[key].strip() for key in REQUIRED_PLUGIN_KEYS)
 
 
+def test_do_not_disturb_help_matches_the_disabled_default() -> None:
+    english = _load_locale("en.json")["setup.doNotDisturb.help"]
+    chinese = _load_locale("zh-CN.json")["setup.doNotDisturb.help"]
+
+    assert "Off by default" in english
+    assert "Turn it on" in english
+    assert "Enabled by default" not in english
+    assert "默认关闭" in chinese
+    assert "开启后" in chinese
+    assert "默认开启" not in chinese
+
+
 def test_manifest_initial_read_default_matches_runtime() -> None:
     from hearthstone_companion_under_test.config import CompanionConfig
 
@@ -51,15 +63,15 @@ def test_manifest_enables_game_state_questions_by_default() -> None:
 
     assert CompanionConfig.from_mapping({}).llm_data_consent is True
     assert manifest["hearthstone_companion"]["llm_data_consent"] is True
-    assert CompanionConfig.from_mapping({}).llm_do_not_disturb is True
-    assert manifest["hearthstone_companion"]["llm_commentary_enabled"] is False
+    assert CompanionConfig.from_mapping({}).llm_do_not_disturb is False
+    assert manifest["hearthstone_companion"]["llm_commentary_enabled"] is True
     assert "llm_lifecycle_enabled" not in CompanionConfig.from_mapping({}).to_dict()
     assert "llm_lifecycle_enabled" not in manifest["hearthstone_companion"]
     assert "llm_do_not_disturb" not in manifest["hearthstone_companion"]
 
     with (ROOT / "config.example.toml").open("rb") as handle:
         runtime_template = tomllib.load(handle)["hearthstone_companion"]
-    assert runtime_template["llm_commentary_enabled"] is False
+    assert runtime_template["llm_commentary_enabled"] is True
     assert "llm_do_not_disturb" not in runtime_template
 
 
@@ -107,7 +119,8 @@ def test_primary_setup_is_offline_first_and_keeps_log_details_in_diagnostics() -
     assert "actions.enable_companion.withDoNotDisturb" in panel_source
     assert "actions.enable_companion.withoutDoNotDisturb" in panel_source
     assert "llm_data_consent: true" in panel_source
-    assert "llm_do_not_disturb: true" in panel_source
+    assert "llm_do_not_disturb: false" in panel_source
+    assert "value?.llm_do_not_disturb === true" in panel_source
     assert "value?.llm_data_consent !== false" in panel_source
     assert "llm_lifecycle_enabled" not in panel_source
     assert "llm_commentary_enabled" not in panel_source

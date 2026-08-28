@@ -269,7 +269,7 @@ type ActionOutcome = {
 }
 
 const DEFAULT_SETTINGS: SettingsDraft = {
-  llm_do_not_disturb: true,
+  llm_do_not_disturb: false,
   llm_data_consent: true,
   target_lanlan: "",
   card_catalog_network_enabled: true,
@@ -282,7 +282,7 @@ const DEFAULT_SETTINGS: SettingsDraft = {
 function asSettingsDraft(value?: SettingsState): SettingsDraft {
   const dataSharingEnabled = value?.llm_data_consent !== false
   return {
-    llm_do_not_disturb: value?.llm_do_not_disturb !== false,
+    llm_do_not_disturb: value?.llm_do_not_disturb === true,
     llm_data_consent: dataSharingEnabled,
     target_lanlan: String(value?.target_lanlan || ""),
     card_catalog_network_enabled: value?.card_catalog_network_enabled !== false,

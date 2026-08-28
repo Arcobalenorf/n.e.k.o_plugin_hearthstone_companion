@@ -6945,7 +6945,7 @@ def test_config_change_with_missing_effective_section_degrades_fail_closed(monke
     assert result["status"] == "degraded"
     assert result["restart_required"] is True
     assert plugin.cfg.llm_data_consent is False
-    assert plugin.cfg.llm_do_not_disturb is True
+    assert plugin.cfg.llm_do_not_disturb is False
     assert plugin._config_runtime_error_codes == ("config:invalid_effective_section",)
 
 
@@ -6988,7 +6988,7 @@ def test_config_change_revocation_stays_fail_closed_when_context_restore_is_reje
 
     assert result["status"] == "accepted"
     assert plugin.cfg.llm_data_consent is False
-    assert plugin.cfg.llm_do_not_disturb is True
+    assert plugin.cfg.llm_do_not_disturb is False
     assert monitor_updates
     assert all(config.llm_data_consent is False for config in monitor_updates)
     assert plugin._live_state_shared is True
@@ -7040,7 +7040,7 @@ def test_config_change_revocation_restores_context_and_resets_transition_when_mo
 
     assert result["status"] == "accepted"
     assert plugin.cfg.llm_data_consent is False
-    assert plugin.cfg.llm_do_not_disturb is True
+    assert plugin.cfg.llm_do_not_disturb is False
     assert plugin._settings_transition is False
     assert plugin._live_state_shared is False
     assert plugin._live_state_segments == ()
@@ -7293,7 +7293,7 @@ def test_sparse_save_preserves_legacy_profile_commentary_preference(monkeypatch)
     ]
     assert active_profile["log_path"] == "new.log"
     assert active_profile["llm_commentary_enabled"] is True
-    assert runtime_section["llm_commentary_enabled"] is False
+    assert runtime_section["llm_commentary_enabled"] is True
     assert "log_path" not in runtime_section or runtime_section["log_path"] == ""
     assert "llm_do_not_disturb" not in runtime_section
     assert plugin.cfg.llm_do_not_disturb is False
@@ -7434,7 +7434,7 @@ def test_save_settings_reads_back_full_config_after_sparse_profile_result(monkey
 
     result = asyncio.run(plugin.save_settings(log_path="  new.log  "))
 
-    assert result["llm_enabled"] is False
+    assert result["llm_enabled"] is True
     assert patches == [{entry._CONFIG_SECTION: {"log_path": "new.log"}}]
     assert dump_calls == 1
     assert plugin.cfg.log_path == "new.log"
@@ -7547,7 +7547,7 @@ def test_save_settings_creates_default_profile_for_stable_sdk(monkeypatch) -> No
 
     result = asyncio.run(plugin.save_settings(llm_data_consent=True))
 
-    assert result["llm_enabled"] is False
+    assert result["llm_enabled"] is True
     assert update_attempts == 2
     assert patches == [{entry._CONFIG_SECTION: {"llm_data_consent": True}}]
     assert profiles == [
@@ -7607,7 +7607,7 @@ def test_save_settings_uses_runtime_config_when_stable_sdk_has_no_profile(monkey
 
     result = asyncio.run(plugin.save_settings(llm_data_consent=True))
 
-    assert result["llm_enabled"] is False
+    assert result["llm_enabled"] is True
     assert updates == [{entry._CONFIG_SECTION: {"llm_data_consent": True}}]
     assert plugin.cfg.log_path == "custom.log"
     assert plugin.cfg.llm_data_consent is True
@@ -8062,7 +8062,7 @@ def test_save_settings_serializes_with_overlay_start(monkeypatch) -> None:
 
     save_result, start_result, overlay = asyncio.run(scenario())
 
-    assert save_result["llm_enabled"] is False
+    assert save_result["llm_enabled"] is True
     assert isinstance(start_result, FakeErr)
     assert overlay.config.overlay_enabled is False
     assert overlay.running is False
@@ -8374,7 +8374,7 @@ def test_settings_transition_resets_when_fail_closed_update_raises(monkeypatch) 
     assert persisted[0][entry._CONFIG_SECTION]["llm_data_consent"] is False
     assert plugin._settings_transition is False
     assert plugin.cfg.llm_data_consent is False
-    assert plugin.cfg.llm_do_not_disturb is True
+    assert plugin.cfg.llm_do_not_disturb is False
 
 
 def test_clear_stats_timeout_confirms_serial_compensation(monkeypatch) -> None:

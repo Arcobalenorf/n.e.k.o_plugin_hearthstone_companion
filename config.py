@@ -36,7 +36,7 @@ def _do_not_disturb(data: Mapping[str, Any]) -> bool:
     if "llm_commentary_enabled" in data:
         legacy = data["llm_commentary_enabled"]
         return not legacy if isinstance(legacy, bool) else True
-    return True
+    return False
 
 
 @dataclass(slots=True)
@@ -45,7 +45,7 @@ class CompanionConfig:
     log_path: str = ""
     poll_interval_seconds: float = 0.1
     initial_read_max_bytes: int = 64 * 1024 * 1024
-    llm_do_not_disturb: bool = True
+    llm_do_not_disturb: bool = False
     llm_data_consent: bool = True
     llm_min_priority: int = 5
     llm_cooldown_seconds: float = 25.0

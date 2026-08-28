@@ -4,7 +4,7 @@ name = "炉石猫娘陪玩"
 description = "只读理解炉石与酒馆战棋局势，以结构化事实和情绪信号驱动当前 N.E.K.O 角色自然陪伴，并支持可追问的酒馆建议。"
 short_description = "Data-aware Hearthstone and Battlegrounds companionship through the active NEKO character."
 keywords = ["炉石", "炉石传说", "酒馆战棋", "hearthstone", "battlegrounds", "陪玩", "猫娘", "对局"]
-version = "0.3.10"
+version = "0.3.11"
 type = "plugin"
 entry = "plugin.plugins.hearthstone_companion:HearthstoneCompanionPlugin"
 passive = false
@@ -52,7 +52,7 @@ poll_interval_seconds = 0.1
 initial_read_max_bytes = 67108864
 # Keep the former storage key so existing profile overlays retain their preference.
 # The UI and runtime expose its inverse as the do-not-disturb setting.
-llm_commentary_enabled = false
+llm_commentary_enabled = true
 llm_data_consent = true
 llm_min_priority = 5
 llm_cooldown_seconds = 25

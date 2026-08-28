@@ -87,16 +87,16 @@ def config(**overrides: object) -> CompanionConfig:
     return CompanionConfig.from_mapping(values)
 
 
-def test_llm_defaults_to_data_sharing_but_respects_explicit_opt_out() -> None:
+def test_llm_defaults_to_commentary_but_respects_explicit_opt_out() -> None:
     snapshot = GameSnapshot(phase="playing")
 
-    assert CommentaryArbiter(config()).allow_llm(event(), snapshot, now=100.0) is False
-    assert CommentaryArbiter(config(llm_do_not_disturb=False)).allow_llm(
-        event(), snapshot, now=100.0
-    ) is True
-    assert CommentaryArbiter(config(llm_data_consent=True)).allow_llm(
+    assert CommentaryArbiter(config()).allow_llm(event(), snapshot, now=100.0) is True
+    assert CommentaryArbiter(config(llm_do_not_disturb=True)).allow_llm(
         event(), snapshot, now=100.0
     ) is False
+    assert CommentaryArbiter(config(llm_data_consent=True)).allow_llm(
+        event(), snapshot, now=100.0
+    ) is True
     assert CommentaryArbiter(
         config(llm_do_not_disturb=False, llm_data_consent=False)
     ).allow_llm(event(), snapshot, now=100.0) is False

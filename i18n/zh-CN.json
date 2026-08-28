@@ -67,7 +67,7 @@
   "setup.consent.enabledHelp": "目标 NEKO 角色会收到可替换的后台公开局势上下文，并可据此回答提问。",
   "setup.consent.disabledHelp": "局势共享已关闭；重新开启并保存后，角色才能回答当前局势与酒馆建议。",
   "setup.doNotDisturb.title": "2. 免打扰模式",
-  "setup.doNotDisturb.help": "默认开启，避免角色因中局事件频繁插话；关闭后角色可在少量关键局势主动回应。开场、重连、结算和按需问答不受影响。",
+  "setup.doNotDisturb.help": "默认关闭，角色可在少量关键局势主动回应；开启后避免角色因中局事件插话。开场、重连、结算和按需问答不受影响。",
   "setup.enabled": "已开启",
   "setup.disabled": "未开启",
   "setup.pending": "有更改待保存",

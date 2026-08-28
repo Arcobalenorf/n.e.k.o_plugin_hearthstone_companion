@@ -67,7 +67,7 @@
   "setup.consent.enabledHelp": "The active NEKO character can read filtered player-visible game state when you ask a question.",
   "setup.consent.disabledHelp": "Game-state sharing is off. Re-enable and save it before asking for live game or Battlegrounds advice.",
   "setup.doNotDisturb.title": "2. Do Not Disturb",
-  "setup.doNotDisturb.help": "Enabled by default to prevent frequent mid-game interruptions. Turn it off to allow occasional reactions at meaningful moments. Match start, reconnect, result, and on-demand answers are unaffected.",
+  "setup.doNotDisturb.help": "Off by default so the character can react occasionally at meaningful moments. Turn it on to suppress mid-game interruptions. Match start, reconnect, result, and on-demand answers are unaffected.",
   "setup.enabled": "Enabled",
   "setup.disabled": "Disabled",
   "setup.pending": "Unsaved changes",
