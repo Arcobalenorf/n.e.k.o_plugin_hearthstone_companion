@@ -50,6 +50,12 @@ def _load_entry() -> Any:
     package.__path__ = [str(PROJECT_ROOT)]
     sys.modules[PACKAGE_NAME] = package
 
+    sdk_module_names = ("plugin", "plugin.sdk", "plugin.sdk.plugin")
+    missing = object()
+    previous_sdk_modules = {
+        name: sys.modules.get(name, missing) for name in sdk_module_names
+    }
+
     plugin_package = types.ModuleType("plugin")
     plugin_package.__path__ = []
     sdk_package = types.ModuleType("plugin.sdk")
@@ -76,14 +82,21 @@ def _load_entry() -> Any:
     sys.modules["plugin.sdk"] = sdk_package
     sys.modules["plugin.sdk.plugin"] = sdk_module
 
-    module_name = f"{PACKAGE_NAME}.sdk_entry"
-    spec = importlib.util.spec_from_file_location(module_name, PROJECT_ROOT / "__init__.py")
-    if spec is None or spec.loader is None:
-        raise RuntimeError("sdk_entry_unavailable")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
+    try:
+        module_name = f"{PACKAGE_NAME}.sdk_entry"
+        spec = importlib.util.spec_from_file_location(module_name, PROJECT_ROOT / "__init__.py")
+        if spec is None or spec.loader is None:
+            raise RuntimeError("sdk_entry_unavailable")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        for name, previous in previous_sdk_modules.items():
+            if previous is missing:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
 
 
 ENTRY = _load_entry()

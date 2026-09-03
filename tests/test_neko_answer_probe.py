@@ -11,11 +11,12 @@ import tomllib
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import neko_answer_probe as probe
 import owned_process
 import pytest
+import real_log_checkpoint_probe as checkpoint_probe
 from neko_answer_eval import AnswerCase
 from neko_answer_probe import (
     _ANSWER_TEXT_EXTRACTOR,
@@ -46,6 +47,54 @@ from neko_answer_probe import (
     _wait_for_lifecycle_completion,
     _write_isolated_config,
 )
+
+
+def test_checkpoint_entry_loader_restores_existing_sdk_modules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    existing = {
+        name: ModuleType(name)
+        for name in ("plugin", "plugin.sdk", "plugin.sdk.plugin")
+    }
+    for name, module in existing.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    checkpoint_probe._load_entry()
+
+    assert {name: sys.modules.get(name) for name in existing} == existing
+
+
+def test_checkpoint_entry_loader_removes_temporary_sdk_modules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_names = ("plugin", "plugin.sdk", "plugin.sdk.plugin")
+    for name in module_names:
+        monkeypatch.delitem(sys.modules, name, raising=False)
+
+    checkpoint_probe._load_entry()
+
+    assert all(name not in sys.modules for name in module_names)
+
+
+def test_checkpoint_entry_loader_restores_sdk_modules_after_load_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    existing = {
+        name: ModuleType(name)
+        for name in ("plugin", "plugin.sdk", "plugin.sdk.plugin")
+    }
+    for name, module in existing.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(
+        checkpoint_probe.importlib.util,
+        "spec_from_file_location",
+        lambda *_args, **_kwargs: None,
+    )
+
+    with pytest.raises(RuntimeError, match="sdk_entry_unavailable"):
+        checkpoint_probe._load_entry()
+
+    assert {name: sys.modules.get(name) for name in existing} == existing
 
 
 def test_query_case_status_blocks_only_invalid_deterministic_passive_context() -> None:
