@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import inspect
 import json
 import math
 import os
@@ -32,13 +31,24 @@ from plugin.sdk.plugin import (
 )
 
 from .card_catalog import BattlegroundsCardCatalog
-from .commentary import build_atomic_live_state_segment, build_llm_prompt
+from .commentary import (
+    build_card_answer_area,
+    build_live_state_segments,
+    build_llm_prompt,
+)
 from .config import CompanionConfig
-from .delivery import LiveStatePublisher, QueryLedger
+from .delivery import LiveStatePublisher
+from .diagnostics import (
+    DiagnosticTracker,
+    canonical_fact_fingerprint,
+    sanitize_diagnostic_code,
+)
 from .instructions import HEARTHSTONE_CONTEXT_INSTRUCTIONS
 from .live_query import (
     classify_live_query,
     normalize_query_text,
+    requests_live_advice,
+    requests_live_rules,
 )
 from .log_config import ensure_power_log_config
 from .models import GameEvent, GameSnapshot
@@ -63,10 +73,6 @@ _LIVE_STATE_DELIVERY_MAX_BYTES = 4096
 _LIVE_STATE_REFRESH_SECONDS = 30.0
 _LIFECYCLE_PENDING_SECONDS = 30.0
 _LIFECYCLE_SENT_LIMIT = 128
-_LIVE_QUERY_FALLBACK_DELAY_SECONDS = 4.0
-_LIVE_QUERY_FALLBACK_MAX_AGE_SECONDS = 12.0
-_LIVE_QUERY_FALLBACK_MAX_CHARS = 5200
-_USER_CONTEXT_READ_TIMEOUT_SECONDS = 1.5
 _CONSTRUCTED_TOOL_FOCUSES = (
     "overview",
     "board",
@@ -99,6 +105,8 @@ _LLM_TOOL_HANDLER_NAMES = {
     "hearthstone_current_turn": "hearthstone_current_turn",
     "hearthstone_live_state": "hearthstone_live_state",
 }
+_DIAGNOSTIC_SCHEMA = "hearthstone_companion_diagnostics_v1"
+_PLUGIN_VERSION = "0.4.0"
 _OVERLAY_RUNTIME_FIELDS = (
     "overlay_enabled",
     "overlay_window_titles",
@@ -199,6 +207,37 @@ def _submitted(result: Any) -> bool:
         return bool(result["submitted"])
     except (KeyError, TypeError):
         return bool(getattr(result, "submitted", False))
+
+
+def _diagnostic_tracker(owner: Any) -> DiagnosticTracker:
+    tracker = getattr(owner, "_diagnostics", None)
+    if tracker is None:
+        tracker = DiagnosticTracker()
+        owner._diagnostics = tracker
+    return tracker
+
+
+def _record_route_diagnostic(
+    owner: Any,
+    route: str,
+    *,
+    status: str,
+    reason: str = "",
+    mode: str = "",
+    focus: str = "",
+    fact_sha256: str = "",
+) -> None:
+    try:
+        _diagnostic_tracker(owner).record_route(
+            route,
+            status=status,
+            reason=reason,
+            mode=mode,
+            focus=focus,
+            fact_sha256=fact_sha256,
+        )
+    except Exception:
+        return
 
 
 def _is_err_result(result: Any) -> bool:
@@ -672,7 +711,10 @@ _AGENT_STATE_CODES = (
 
 
 def _agent_text(value: Any, *, limit: int = 48) -> str:
-    text = ("" if value is None else str(value)).replace("\r", " ").replace("\n", " ")
+    text = ("" if value is None else str(value)).encode(
+        "utf-8", errors="replace"
+    ).decode("utf-8")
+    text = text.replace("\r", " ").replace("\n", " ")
     text = text.replace(";", ",").replace("[", "(").replace("]", ")").strip()
     if len(text) <= limit:
         return text
@@ -689,7 +731,7 @@ def _agent_scalar(value: Any) -> str:
 
 def _agent_atom(value: Any, *, limit: int = 28) -> str:
     text = _agent_text(value, limit=limit)
-    for delimiter in ("|", ",", ";", "=", "/", "[", "]"):
+    for delimiter in ("|", ",", ";", "=", "/", "~", "[", "]", "{", "}"):
         text = text.replace(delimiter, " ")
     return " ".join(text.split())
 
@@ -713,7 +755,7 @@ def _agent_keyword_state(value: Any) -> tuple[list[str], bool]:
 def _agent_card(card: Any, *, name_limit: int = 24) -> str:
     if not isinstance(card, Mapping):
         return "?"
-    card_id = _agent_text(card.get("card_id"), limit=28) or "?"
+    card_id = _catalog_card_id(card.get("card_id")) or "?"
     name = _agent_text(card.get("name"), limit=name_limit) if name_limit > 0 else ""
     identity = card_id if not name or name == card_id else f"{card_id}/{name}"
     raw_type = str(card.get("card_type") or "").upper()
@@ -725,6 +767,8 @@ def _agent_card(card: Any, *, name_limit: int = 24) -> str:
     }.get(raw_type, raw_type or "?")
     keywords = card.get("keywords")
     active_keywords, keyword_unknown = _agent_keyword_state(keywords)
+    if isinstance(keywords, (list, tuple)) and card.get("keywords_complete") is not True:
+        keyword_unknown = True
     keyword_text = ",".join(active_keywords) or ("?" if keyword_unknown else "-")
     fields = [
         f"type={card_type}",
@@ -772,7 +816,7 @@ def _agent_identity_list(value: Any, *, limit: int, name_limit: int) -> str:
     identities: list[str] = []
     for raw_card in value[:limit]:
         card = raw_card if isinstance(raw_card, Mapping) else {}
-        card_id = _agent_atom(card.get("card_id"), limit=28) or "?"
+        card_id = _catalog_card_id(card.get("card_id")) or "?"
         name = _agent_atom(card.get("name"), limit=name_limit) if name_limit else ""
         identities.append(
             card_id if not name or name == card_id else f"{card_id}~{name}"
@@ -820,7 +864,7 @@ def _agent_compact_battlegrounds_cards(
     used_keywords: set[str] = set()
     for raw_card in value[:limit]:
         card = raw_card if isinstance(raw_card, Mapping) else {}
-        card_id = _agent_atom(card.get("card_id"), limit=28) or "?"
+        card_id = _catalog_card_id(card.get("card_id")) or "?"
         name = _agent_atom(card.get("name"), limit=name_limit) if name_limit else ""
         identity = card_id if not name or name == card_id else f"{card_id}~{name}"
         raw_type = str(card.get("card_type") or "").upper()
@@ -882,7 +926,7 @@ def _agent_sparse_battlegrounds_cards(
     used_keywords: set[str] = set()
     for raw_card in value[:limit]:
         card = raw_card if isinstance(raw_card, Mapping) else {}
-        card_id = _agent_atom(card.get("card_id"), limit=28) or "?"
+        card_id = _catalog_card_id(card.get("card_id")) or "?"
         name = _agent_atom(card.get("name"), limit=name_limit) if name_limit else ""
         identity = card_id if not name or name == card_id else f"{card_id}~{name}"
         raw_type = str(card.get("card_type") or "").upper()
@@ -1019,10 +1063,15 @@ def _agent_constructed_reply(
         used_states: set[str] = set()
         for raw_card in value[:limit]:
             card = raw_card if isinstance(raw_card, Mapping) else {}
-            card_id = _agent_atom(card.get("card_id"), limit=28) or "?"
+            card_id = _catalog_card_id(card.get("card_id")) or "?"
             name = _agent_atom(card.get("name"), limit=name_limit) if name_limit else ""
             identity = card_id if not name or name == card_id else f"{card_id}~{name}"
             active_keywords, keyword_unknown = _agent_keyword_state(card.get("keywords"))
+            if (
+                isinstance(card.get("keywords"), (list, tuple))
+                and card.get("keywords_complete") is not True
+            ):
+                keyword_unknown = True
             keyword_text = "".join(
                 keyword_codes[name]
                 for name in active_keywords
@@ -1156,7 +1205,7 @@ def _agent_constructed_reply(
         ]
 
     variants = (
-        ((12, True), (8, False), (4, False), (0, False))
+        ((24, True), (12, False), (8, False), (4, False), (0, False))
         if focused_tool
         else ((12, True), (8, False), (4, False))
     )
@@ -1197,12 +1246,59 @@ def _agent_constructed_reply(
     return "HS_QUERY;available=1;omitted=oversize_identities"
 
 
-def _agent_catalog_rules(payload: Mapping[str, Any], cards: Any) -> str:
+def _catalog_card_id(value: Any) -> str:
+    """Return one bounded identifier without silently changing its identity."""
+
+    text = str(value or "").strip()
+    if (
+        not text
+        or not text.isascii()
+        or len(text) > 80
+        or any(ord(character) < 32 for character in text)
+    ):
+        return ""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return ""
+    if any(
+        delimiter in text
+        for delimiter in ("|", ",", ";", "=", "{", "}", "[", "]", "/", "~")
+    ):
+        return ""
+    return text
+
+
+def _catalog_rule_text(value: Any, *, limit: int = 72) -> tuple[str, bool]:
+    raw = str(value or "").encode("utf-8", errors="replace").decode("utf-8")
+    raw = raw.replace("\r", " ").replace("\n", " ")
+    normalized = " ".join(raw.split())
+    normalized = (
+        normalized.replace("|", ",")
+        .replace(";", ",")
+        .replace("{", "(")
+        .replace("}", ")")
+    )
+    if len(normalized) <= limit:
+        return normalized, False
+    return normalized[:limit].rstrip(), True
+
+
+def _agent_catalog_projection(
+    payload: Mapping[str, Any],
+    cards_by_view: Mapping[str, list[Any]],
+    *,
+    max_rules: int = 7,
+) -> dict[str, Any]:
+    """Project public catalog data into an attributed, query-scoped contract."""
+
     catalog = (
         payload.get("card_catalog")
         if isinstance(payload.get("card_catalog"), Mapping)
         else {}
     )
+    if not catalog:
+        return {}
     facts = catalog.get("cards") if isinstance(catalog.get("cards"), Mapping) else None
     if not isinstance(facts, Mapping):
         facts = (
@@ -1210,26 +1306,245 @@ def _agent_catalog_rules(payload: Mapping[str, Any], cards: Any) -> str:
             if isinstance(catalog.get("observed_card_facts"), Mapping)
             else {}
         )
-    if not isinstance(cards, list):
-        return ""
-    rules: list[str] = []
-    seen_card_ids: set[str] = set()
-    for card in cards:
-        if not isinstance(card, Mapping):
-            continue
-        card_id = str(card.get("card_id") or "")
-        if not card_id or card_id in seen_card_ids:
-            continue
-        seen_card_ids.add(card_id)
+    dataset = catalog.get("dataset") if isinstance(catalog.get("dataset"), Mapping) else {}
+    coverage = (
+        catalog.get("coverage")
+        if isinstance(catalog.get("coverage"), Mapping)
+        else {}
+    )
+
+    ordered_by_view: dict[str, list[str]] = {}
+    requested_ids: list[str] = []
+    for view, cards in cards_by_view.items():
+        view_ids: list[str] = []
+        for raw_card in cards:
+            card = raw_card if isinstance(raw_card, Mapping) else {}
+            card_id = _catalog_card_id(card.get("card_id"))
+            if not card_id or card_id in view_ids:
+                continue
+            view_ids.append(card_id)
+            if card_id not in requested_ids:
+                requested_ids.append(card_id)
+        if view_ids:
+            ordered_by_view[str(view)] = view_ids
+
+    resolved_rules: dict[str, tuple[str, bool]] = {}
+    no_rules_text_ids: list[str] = []
+    for card_id in requested_ids:
         fact = facts.get(card_id) if isinstance(facts, Mapping) else None
         if not isinstance(fact, Mapping):
             continue
-        rules_text = _agent_text(fact.get("rules_text"), limit=72)
+        rules_text, text_truncated = _catalog_rule_text(fact.get("rules_text"))
         if rules_text:
-            rules.append(f"{_agent_text(card_id, limit=28)}={rules_text}")
-        if len(rules) >= 7:
+            resolved_rules[card_id] = (rules_text, text_truncated)
+        else:
+            no_rules_text_ids.append(card_id)
+
+    known_missing = {
+        card_id
+        for value in list(coverage.get("missing_ids") or ())
+        if (card_id := _catalog_card_id(value))
+    }
+    lookup_omitted = {
+        card_id
+        for value in list(coverage.get("truncated_ids") or ())
+        if (card_id := _catalog_card_id(value))
+    }
+    missing_ids = [card_id for card_id in requested_ids if card_id in known_missing]
+    lookup_omitted_ids = [
+        card_id for card_id in requested_ids if card_id in lookup_omitted
+    ]
+    unresolved_unknown_ids = [
+        card_id
+        for card_id in requested_ids
+        if card_id not in resolved_rules
+        and card_id not in no_rules_text_ids
+        and card_id not in known_missing
+        and card_id not in lookup_omitted
+    ]
+
+    queues = {
+        view: [card_id for card_id in view_ids if card_id in resolved_rules]
+        for view, view_ids in ordered_by_view.items()
+    }
+    selected: list[tuple[str, str]] = []
+    selected_ids: set[str] = set()
+    indices = {view: 0 for view in queues}
+    rule_limit = max(0, min(40, int(max_rules)))
+    while len(selected) < rule_limit:
+        progressed = False
+        for view, queue in queues.items():
+            while indices[view] < len(queue):
+                card_id = queue[indices[view]]
+                indices[view] += 1
+                if card_id in selected_ids:
+                    continue
+                selected.append((view, card_id))
+                selected_ids.add(card_id)
+                progressed = True
+                break
+            if len(selected) >= rule_limit:
+                break
+        if not progressed:
             break
-    return "|".join(rules)
+
+    rules_by_view: dict[str, list[dict[str, Any]]] = {}
+    for view, card_id in selected:
+        rules_text, text_truncated = resolved_rules[card_id]
+        rules_by_view.setdefault(view, []).append(
+            {
+                "card_id": card_id,
+                "rules_text": rules_text,
+                "text_truncated": text_truncated,
+            }
+        )
+    output_omitted_ids = [
+        card_id for card_id in requested_ids if card_id in resolved_rules and card_id not in selected_ids
+    ]
+    text_truncated_ids = [
+        card_id
+        for card_id in requested_ids
+        if card_id in resolved_rules and resolved_rules[card_id][1]
+    ]
+    raw_truncated_count = coverage.get("truncated_count")
+    truncated_count = (
+        raw_truncated_count
+        if isinstance(raw_truncated_count, int)
+        and not isinstance(raw_truncated_count, bool)
+        and raw_truncated_count >= 0
+        else 0
+    )
+    listed_truncated_count = len(
+        {
+            card_id
+            for value in list(coverage.get("truncated_ids") or ())
+            if (card_id := _catalog_card_id(value))
+        }
+    )
+    return {
+        "meta": {
+            "available": bool(catalog.get("available", bool(facts))),
+            "provider": _agent_atom(dataset.get("provider"), limit=40) or "unknown",
+            "patch": _agent_atom(dataset.get("patch"), limit=32) or "unknown",
+            "checked_at": dataset.get("checked_at"),
+            "stale": dataset.get("stale") if isinstance(dataset.get("stale"), bool) else None,
+            "untrusted_reference_text": True,
+        },
+        "coverage": {
+            "requested_count": len(requested_ids),
+            "resolved_count": len(resolved_rules),
+            "missing_ids": missing_ids,
+            "lookup_omitted_ids": lookup_omitted_ids,
+            "catalog_global_lookup_omitted_unlisted_count": max(
+                0, truncated_count - listed_truncated_count
+            ),
+            "no_rules_text_ids": no_rules_text_ids,
+            "unresolved_unknown_ids": unresolved_unknown_ids,
+            "text_truncated_ids": text_truncated_ids,
+            "output_omitted_ids": output_omitted_ids,
+            "output_omitted_count": len(output_omitted_ids),
+        },
+        "rules_by_view": rules_by_view,
+    }
+
+
+def _catalog_ids_text(value: Any, *, limit: int = 4) -> str:
+    ids = [
+        card_id
+        for item in list(value or ())
+        if (card_id := _catalog_card_id(item))
+    ]
+    shown = ids[:limit]
+    suffix = f",+{len(ids) - len(shown)}" if len(ids) > len(shown) else ""
+    return (",".join(shown) or "-") + suffix
+
+
+def _agent_catalog_output(projection: Mapping[str, Any]) -> list[str]:
+    if not projection:
+        return []
+    meta = projection.get("meta") if isinstance(projection.get("meta"), Mapping) else {}
+    coverage = (
+        projection.get("coverage")
+        if isinstance(projection.get("coverage"), Mapping)
+        else {}
+    )
+    checked_at = meta.get("checked_at")
+    if isinstance(checked_at, (int, float)) and not isinstance(checked_at, bool) and checked_at > 0:
+        checked_at_text = str(int(checked_at))
+    else:
+        checked_at_text = "unknown"
+    stale = meta.get("stale")
+    stale_text = "1" if stale is True else "0" if stale is False else "unknown"
+    lines = [
+        "catalog_meta="
+        f"available:{_agent_scalar(meta.get('available'))};"
+        f"provider:{_agent_atom(meta.get('provider'), limit=40) or 'unknown'};"
+        f"patch:{_agent_atom(meta.get('patch'), limit=32) or 'unknown'};"
+        f"checked_at_unix:{checked_at_text};stale:{stale_text};"
+        "untrusted_reference_text:1",
+        "catalog_coverage="
+        f"requested:{_agent_scalar(coverage.get('requested_count'))};"
+        f"resolved:{_agent_scalar(coverage.get('resolved_count'))};"
+        f"missing_ids:{_catalog_ids_text(coverage.get('missing_ids'))};"
+        f"lookup_omitted_ids:{_catalog_ids_text(coverage.get('lookup_omitted_ids'))};"
+        "catalog_global_lookup_omitted_unlisted:"
+        f"{_agent_scalar(coverage.get('catalog_global_lookup_omitted_unlisted_count'))};"
+        f"no_rules_text_ids:{_catalog_ids_text(coverage.get('no_rules_text_ids'))};"
+        f"unresolved_unknown_ids:{_catalog_ids_text(coverage.get('unresolved_unknown_ids'))};"
+        f"text_truncated_ids:{_catalog_ids_text(coverage.get('text_truncated_ids'))};"
+        f"output_omitted_ids:{_catalog_ids_text(coverage.get('output_omitted_ids'))};"
+        f"output_omitted_count:{_agent_scalar(coverage.get('output_omitted_count'))}",
+    ]
+    rules_by_view = (
+        projection.get("rules_by_view")
+        if isinstance(projection.get("rules_by_view"), Mapping)
+        else {}
+    )
+    for view, raw_rules in rules_by_view.items():
+        rendered: list[str] = []
+        for raw_rule in list(raw_rules or ()):
+            rule = raw_rule if isinstance(raw_rule, Mapping) else {}
+            card_id = _catalog_card_id(rule.get("card_id"))
+            rules_text = str(rule.get("rules_text") or "")
+            if not card_id or not rules_text:
+                continue
+            suffix = ",text_truncated:1" if rule.get("text_truncated") else ""
+            rendered.append(f"{card_id}{{{rules_text}{suffix}}}")
+        if rendered:
+            lines.append(f"catalog_rules[{view}]=" + "|".join(rendered))
+    incomplete = any(
+        coverage.get(key)
+        for key in (
+            "missing_ids",
+            "lookup_omitted_ids",
+            "no_rules_text_ids",
+            "unresolved_unknown_ids",
+            "text_truncated_ids",
+            "output_omitted_count",
+        )
+    )
+    if incomplete:
+        lines.append("rule_based_advice_incomplete=1")
+    return lines
+
+
+def _agent_catalog_rules(payload: Mapping[str, Any], cards: Any) -> str:
+    if not isinstance(cards, list):
+        return ""
+    projection = _agent_catalog_projection(payload, {"selected": cards}, max_rules=7)
+    rules_by_view = (
+        projection.get("rules_by_view")
+        if isinstance(projection.get("rules_by_view"), Mapping)
+        else {}
+    )
+    rendered: list[str] = []
+    for raw_rule in list(rules_by_view.get("selected") or ()):
+        rule = raw_rule if isinstance(raw_rule, Mapping) else {}
+        card_id = _catalog_card_id(rule.get("card_id"))
+        rules_text = str(rule.get("rules_text") or "")
+        if card_id and rules_text:
+            rendered.append(f"{card_id}={rules_text}")
+    return "|".join(rendered)
 
 
 def _agent_capabilities(payload: Mapping[str, Any]) -> str:
@@ -1243,6 +1558,7 @@ def _agent_capabilities(payload: Mapping[str, Any]) -> str:
         ("purchase_affordability", "buy"),
         ("specific_purchase_advice", "sequence"),
         ("upgrade_affordability", "level"),
+        ("upgrade_advice", "upgrade"),
         ("refresh_advice", "refresh"),
         ("specific_positioning_advice", "position"),
         ("current_choice_comparison", "choice"),
@@ -1272,7 +1588,17 @@ def _agent_battlegrounds_reply(
     opponent_relation: str = "auto",
     focused_tool: bool = False,
 ) -> str:
-    if not payload.get("available"):
+    topic = str(payload.get("topic") or "current_strategy")
+    state = (
+        payload.get("current_public_state")
+        if isinstance(payload.get("current_public_state"), Mapping)
+        else {}
+    )
+    # ``available`` describes the selected advice topic, while a fresh public
+    # snapshot can still answer factual shop/board/economy questions. Keep the
+    # fact path usable and let the per-capability gates suppress unsupported
+    # recommendations.
+    if not payload.get("available") and (topic != "current_strategy" or not state):
         return (
             "HS_QUERY mode=battlegrounds;available=0;"
             f"reason={_agent_text(payload.get('reason') or 'no_live_battlegrounds_state')}"
@@ -1281,7 +1607,6 @@ def _agent_battlegrounds_reply(
     identity_reply_fits = (
         _focused_tool_state_fits if focused_tool else _agent_identity_reply_fits
     )
-    topic = str(payload.get("topic") or "current_strategy")
     if topic != "current_strategy":
         selected = {
             "season_meta": payload.get("season_rules"),
@@ -1298,11 +1623,6 @@ def _agent_battlegrounds_reply(
             return candidate
         return f"{prefix};data_chars={len(encoded)};omitted=oversize_topic_payload"
 
-    state = (
-        payload.get("current_public_state")
-        if isinstance(payload.get("current_public_state"), Mapping)
-        else {}
-    )
     phase = str(state.get("phase") or "unknown")
     selected_focus = str(focus or "auto")
     if selected_focus == "auto":
@@ -1361,6 +1681,7 @@ def _agent_battlegrounds_reply(
     limit = 7
     extra: list[str] = []
     area_name = selected_focus
+    opponent_area_complete: bool | None = None
 
     if selected_focus == "overview":
         return ";".join(
@@ -1442,39 +1763,15 @@ def _agent_battlegrounds_reply(
                 ]
             )
     elif selected_focus == "opponent":
-        opponents = state.get("opponents")
-        opponents = opponents if isinstance(opponents, Mapping) else {}
-        requested_relation = str(opponent_relation or "auto")
-        if requested_relation not in {"current", "next", "last"} or not isinstance(
-            opponents.get(requested_relation), Mapping
-        ):
-            requested_relation = "auto"
-        observed_last = opponents.get("last")
-        observed_last = observed_last if isinstance(observed_last, Mapping) else {}
-        observed_last_board = observed_last.get("board")
-        observed_last_board = (
-            observed_last_board if isinstance(observed_last_board, Mapping) else {}
+        relation, observed, board, observed_cards, opponent_area_complete = (
+            _focused_battlegrounds_opponent_view(
+                payload,
+                opponent_relation=opponent_relation,
+            )
         )
-        relation = requested_relation if requested_relation != "auto" else next(
-            (
-                name
-                for name in (
-                    "current",
-                    "last" if list(observed_last_board.get("minions") or []) else "next",
-                    "next",
-                    "last",
-                )
-                if isinstance(opponents.get(name), Mapping)
-            ),
-            "current",
-        )
-        observed = opponents.get(relation)
-        observed = observed if isinstance(observed, Mapping) else {}
         hero = observed.get("hero")
         hero = hero if isinstance(hero, Mapping) else {}
-        board = observed.get("board")
-        board = board if isinstance(board, Mapping) else {}
-        target_cards = board.get("minions")
+        target_cards = observed_cards if opponent_area_complete else []
         target_label = f"{relation}_opponent_board"
         area_name = "opponent"
         extra = [
@@ -1483,6 +1780,7 @@ def _agent_battlegrounds_reply(
             f"hp={_agent_scalar(observed.get('effective_health'))}",
             f"t={_agent_scalar(observed.get('tavern_tier'))}",
             f"seen_r={_agent_scalar(board.get('observed_round'))}",
+            f"seen_combat={1 if board.get('observed_in_combat') is True else 0}",
         ]
     else:
         selected_focus = "board"
@@ -1496,7 +1794,12 @@ def _agent_battlegrounds_reply(
 
     area = areas.get(area_name)
     area = area if isinstance(area, Mapping) else {}
-    completeness = f"q={_agent_scalar(area.get('complete'))}"
+    completeness_value = (
+        opponent_area_complete
+        if selected_focus == "opponent"
+        else area.get("complete")
+    )
+    completeness = f"q={_agent_scalar(completeness_value)}"
     gate = evidence_gate()
 
     target_count = len(target_cards) if isinstance(target_cards, list) else 0
@@ -1533,7 +1836,7 @@ def _agent_battlegrounds_reply(
                 return candidate
 
     variants = (
-        ((12, True), (8, False), (4, False), (0, False))
+        ((24, True), (12, False), (8, False), (4, False), (0, False))
         if focused_tool
         else (((12, True), (8, False), (4, False)) if target_count <= 3 else ())
     )
@@ -1722,9 +2025,753 @@ def _focused_tool_query_reply(
 
 
 def _focused_tool_json_bytes(value: Mapping[str, Any]) -> int:
-    return len(
-        json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    # The host and tests may serialize with default separators, so budget for
+    # that larger representation rather than the plugin's compact encoding.
+    return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+
+
+def _focused_view_focuses(
+    payload: Mapping[str, Any],
+    *,
+    mode: str,
+    focus: str,
+) -> tuple[str, ...]:
+    if focus != "strategy":
+        return (focus,)
+    if mode == "constructed":
+        state = payload.get("state") if isinstance(payload.get("state"), Mapping) else {}
+        choice = state.get("choice") if isinstance(state.get("choice"), Mapping) else {}
+        return (
+            ("overview", "choice")
+            if list(choice.get("options") or [])
+            else ("overview", "board", "hand", "opponent")
+        )
+    state = (
+        payload.get("current_public_state")
+        if isinstance(payload.get("current_public_state"), Mapping)
+        else {}
     )
+    return {
+        "hero_select": ("overview", "choice"),
+        "recruit": ("overview", "economy", "shop", "board", "hand"),
+        "combat": ("overview", "board", "opponent"),
+    }.get(str(state.get("phase") or ""), ("overview", "board"))
+
+
+def _focused_capability_text(evidence: Mapping[str, Any]) -> str:
+    rendered: list[str] = []
+    for name, raw_value in evidence.items():
+        if isinstance(raw_value, Mapping):
+            available = "1" if raw_value.get("available") else "0"
+            missing = [
+                _agent_atom(item, limit=36)
+                for item in list(raw_value.get("missing_evidence") or ())[:4]
+            ]
+            missing = [item for item in missing if item]
+            suffix = f"/missing={','.join(missing)}" if missing else ""
+            rendered.append(f"{name}={available}{suffix}")
+        else:
+            rendered.append(f"{name}={1 if raw_value else 0}")
+    return ";".join(rendered) or "none_observed"
+
+
+def _focused_recruit_decision_text(
+    payload: Mapping[str, Any],
+    *,
+    include_cards: bool,
+) -> str:
+    decision = (
+        payload.get("current_recruit_decision")
+        if isinstance(payload.get("current_recruit_decision"), Mapping)
+        else {}
+    )
+    if not decision:
+        return "unavailable"
+    fields = [
+        f"scope={_agent_atom(decision.get('scope'), limit=36) or '?'}",
+        f"gold={_agent_scalar(decision.get('current_gold'))}",
+        "whole_shop_affordability="
+        + (_agent_atom(decision.get("whole_shop_affordability"), limit=44) or "?"),
+        "qualitative_shop_priority_allowed="
+        + _agent_scalar(decision.get("qualitative_shop_priority_allowed")),
+        "whole_shop_affordability_allowed="
+        + _agent_scalar(decision.get("whole_shop_affordability_allowed")),
+        "exact_purchase_sequence_allowed="
+        + _agent_scalar(decision.get("exact_purchase_sequence_allowed")),
+        "legal_actions_enumerated="
+        + _agent_scalar(decision.get("legal_actions_enumerated")),
+    ]
+    raw_cards = decision.get("cards")
+    cards = list(raw_cards) if isinstance(raw_cards, list) else []
+    if include_cards and cards:
+        rendered_cards: list[str] = []
+        for raw_card in cards[:7]:
+            card = raw_card if isinstance(raw_card, Mapping) else {}
+            rendered_cards.append(
+                "/".join(
+                    (
+                        _agent_scalar(card.get("position")),
+                        _catalog_card_id(card.get("card_id")) or "?",
+                        _agent_scalar(card.get("current_cost")),
+                        _agent_atom(card.get("affordability"), limit=36) or "?",
+                    )
+                )
+            )
+        fields.append("cards[pos/id/cost/affordability]=" + ",".join(rendered_cards))
+    if decision.get("required_answer_zh_CN"):
+        fields.append(
+            "required_answer="
+            + _agent_text(decision.get("required_answer_zh_CN"), limit=96)
+        )
+    return ";".join(fields)
+
+
+def _focused_guardrail_text(payload: Mapping[str, Any]) -> str:
+    guardrails = (
+        payload.get("decision_guardrails")
+        if isinstance(payload.get("decision_guardrails"), Mapping)
+        else {}
+    )
+    if not guardrails:
+        return "unavailable"
+    fields: list[str] = []
+    for key in (
+        "qualitative_shop_priority_allowed",
+        "purchase_affordability_allowed",
+        "exact_purchase_sequence_allowed",
+        "whole_shop_affordability",
+    ):
+        if key in guardrails:
+            fields.append(f"{key}={_agent_scalar(guardrails.get(key))}")
+    unknown_ids = [
+        _catalog_card_id(item)
+        for item in list(guardrails.get("unknown_actual_cost_card_ids") or ())[:7]
+    ]
+    unknown_ids = [item for item in unknown_ids if item]
+    fields.append("unknown_actual_cost_card_ids=" + (",".join(unknown_ids) or "none"))
+    disclaimer = guardrails.get("required_disclaimer_zh_CN")
+    if disclaimer:
+        fields.append("required_disclaimer=" + _agent_text(disclaimer, limit=96))
+    instruction = guardrails.get("mandatory_instruction")
+    if instruction:
+        fields.append("mandatory_instruction=" + _agent_text(instruction, limit=120))
+    return ";".join(fields)
+
+
+def _focused_cards_by_view(
+    payload: Mapping[str, Any],
+    *,
+    mode: str,
+    view_focuses: tuple[str, ...],
+    opponent_relation: str,
+) -> dict[str, list[Any]]:
+    return {
+        focus: _focused_tool_cards(
+            payload,
+            mode=mode,
+            focus=focus,
+            opponent_relation=opponent_relation,
+        )
+        for focus in view_focuses
+        if focus not in {"overview", "economy"}
+    }
+
+
+def _focused_incomplete_transport_views(
+    cards_by_view: Mapping[str, list[Any]],
+) -> set[str]:
+    def name_fits(value: Any) -> bool:
+        text = " ".join(str(value or "").split()).strip()
+        if not text:
+            return True
+        try:
+            text.encode("utf-8")
+        except UnicodeEncodeError:
+            return False
+        return len(text) <= 24
+
+    incomplete: set[str] = set()
+    for view, cards in cards_by_view.items():
+        limit = 10 if view == "hand" else 8 if view == "choice" else 7
+        if len(cards) > limit or any(
+            not _catalog_card_id(
+                card.get("card_id") if isinstance(card, Mapping) else None
+            )
+            for card in cards
+        ) or any(
+            not name_fits(card.get("name"))
+            for card in cards
+            if isinstance(card, Mapping)
+        ):
+            incomplete.add(view)
+    return incomplete
+
+
+def _focused_compact_strategy_view(
+    payload: Mapping[str, Any],
+    *,
+    mode: str,
+    focus: str,
+    opponent_relation: str,
+    name_limit: int,
+) -> tuple[str, bool]:
+    if focus in {"overview", "economy"}:
+        return (
+            _focused_tool_query_reply(
+                payload,
+                mode=mode,
+                focus=focus,
+                opponent_relation=opponent_relation,
+            ),
+            True,
+        )
+    cards = _focused_tool_cards(
+        payload,
+        mode=mode,
+        focus=focus,
+        opponent_relation=opponent_relation,
+    )
+    limit = 10 if focus == "hand" else 8 if focus == "choice" else 7
+    delivered = cards[:limit]
+    rows: list[str] = []
+    names_complete = True
+    for index, raw_card in enumerate(delivered, start=1):
+        card = raw_card if isinstance(raw_card, Mapping) else {}
+        card_id = _catalog_card_id(card.get("card_id")) or "?"
+        full_name = _agent_atom(card.get("name"), limit=160)
+        name = _agent_atom(card.get("name"), limit=name_limit) if name_limit else ""
+        if full_name and name != full_name:
+            names_complete = False
+        identity = card_id if not name or name == card_id else f"{card_id}~{name}"
+        active_keywords, keywords_unknown = _agent_keyword_state(card.get("keywords"))
+        if not isinstance(card.get("keywords"), (Mapping, list, tuple)):
+            keywords_unknown = True
+        keyword_codes = {
+            name: code for code, name in _AGENT_CONSTRUCTED_KEYWORD_CODES
+        }
+        current_keywords = "".join(
+            keyword_codes[name]
+            for name in active_keywords
+            if name in keyword_codes
+        )
+        if keywords_unknown:
+            current_keywords = f"{current_keywords}?" if current_keywords else "?"
+        raw_states = card.get("states")
+        normalized_states = (
+            [str(item).strip().casefold() for item in raw_states]
+            if isinstance(raw_states, (list, tuple))
+            else []
+        )
+        state_codes = {name: code for code, name in _AGENT_STATE_CODES}
+        current_states = "".join(
+            state_codes[name] for name in normalized_states if name in state_codes
+        )
+        if any(name not in state_codes for name in normalized_states):
+            current_states = f"{current_states}?" if current_states else "?"
+        position = card.get("position", card.get("zone_position")) or index
+        if mode == "battlegrounds":
+            raw_type = str(card.get("card_type") or "").upper()
+            card_type = {
+                "MINION": "M",
+                "SPELL": "S",
+                "BATTLEGROUND_SPELL": "BS",
+                "TAVERN_SPELL": "BS",
+            }.get(raw_type, raw_type or "?")
+            rows.append(
+                "/".join(
+                    (
+                        identity,
+                        card_type,
+                        _agent_scalar(card.get("current_cost", card.get("cost"))),
+                        _agent_scalar(card.get("attack")),
+                        _agent_scalar(card.get("health")),
+                        _agent_scalar(card.get("tier")),
+                        _agent_scalar(position),
+                        _agent_scalar(card.get("premium")),
+                        current_keywords or "-",
+                        "0" if keywords_unknown else "1",
+                    )
+                )
+            )
+        elif focus in {"hand", "choice"}:
+            raw_type = str(card.get("card_type") or "").upper()
+            card_type = {
+                "MINION": "M",
+                "SPELL": "S",
+                "WEAPON": "W",
+                "LOCATION": "L",
+            }.get(raw_type, raw_type or "?")
+            rows.append(
+                "/".join(
+                    (
+                        identity,
+                        card_type,
+                        _agent_scalar(card.get("current_cost", card.get("cost"))),
+                        _agent_scalar(position),
+                        current_keywords or "-",
+                        "0" if keywords_unknown else "1",
+                        current_states or "-",
+                    )
+                )
+            )
+        else:
+            rows.append(
+                "/".join(
+                    (
+                        identity,
+                        _agent_scalar(card.get("attack")),
+                        _agent_scalar(card.get("health")),
+                        _agent_scalar(position),
+                        current_keywords or "-",
+                        "0" if keywords_unknown else "1",
+                        current_states or "-",
+                    )
+                )
+            )
+    if mode == "battlegrounds":
+        schema = "id~name/type/actual_cost/atk/hp/tier/pos/golden/current_kw/kw_complete"
+    elif focus in {"hand", "choice"}:
+        schema = "id~name/type/actual_cost/pos/current_kw/kw_complete/state"
+    else:
+        schema = "id~name/atk/hp/pos/current_kw/kw_complete/state"
+    if not name_limit:
+        schema = schema.replace("~name", "")
+    omitted = max(0, len(cards) - len(delivered))
+    return (
+        f"count={len(cards)};delivered={len(delivered)};omitted={omitted};"
+        f"fields_complete={1 if omitted == 0 else 0};"
+        f"names_complete={1 if names_complete else 0};cards[{schema}]="
+        + (",".join(rows) if rows else "-"),
+        omitted == 0 and names_complete,
+    )
+
+
+def _focused_transport_evidence(
+    evidence: Mapping[str, Any],
+    *,
+    mode: str,
+    incomplete_views: set[str],
+) -> dict[str, Any]:
+    if not incomplete_views:
+        return dict(evidence)
+    keys_by_focus = (
+        {
+            "shop": (
+                "shop_card_priority_advice",
+                "purchase_affordability",
+                "specific_purchase_advice",
+                "refresh_advice",
+            ),
+            "board": ("specific_positioning_advice",),
+            "opponent": ("combat_commentary",),
+            "choice": ("current_choice_comparison",),
+            "hand": ("specific_purchase_advice",),
+        }
+        if mode == "battlegrounds"
+        else {
+            "hand": ("specific_card_play_analysis",),
+            "choice": ("current_choice_options",),
+            "board": ("player_board_identities_complete",),
+            "opponent": ("opponent_board_identities_complete",),
+        }
+    )
+    result = {
+        key: dict(value) if isinstance(value, Mapping) else value
+        for key, value in evidence.items()
+    }
+    for view in incomplete_views:
+        for key in keys_by_focus.get(view, ()):
+            value = result.get(key)
+            if not isinstance(value, Mapping):
+                if key in result:
+                    result[key] = {
+                        "available": False,
+                        "missing_evidence": [
+                            f"model_output_{view}_dynamic_fields_incomplete"
+                        ],
+                    }
+                continue
+            missing = list(value.get("missing_evidence") or ())
+            marker = f"model_output_{view}_dynamic_fields_incomplete"
+            if marker not in missing:
+                missing.append(marker)
+            value["available"] = False
+            value["missing_evidence"] = missing[:4]
+    return result
+
+
+def _focused_catalog_output_evidence(
+    evidence: Mapping[str, Any],
+    *,
+    mode: str,
+    cards_by_view: Mapping[str, list[Any]],
+    catalog_projection: Mapping[str, Any],
+) -> dict[str, Any]:
+    if mode != "battlegrounds" or not cards_by_view:
+        return dict(evidence)
+    coverage = (
+        catalog_projection.get("coverage")
+        if isinstance(catalog_projection.get("coverage"), Mapping)
+        else {}
+    )
+    incomplete_ids = {
+        card_id
+        for key in (
+            "missing_ids",
+            "lookup_omitted_ids",
+            "no_rules_text_ids",
+            "unresolved_unknown_ids",
+            "text_truncated_ids",
+            "output_omitted_ids",
+        )
+        for value in list(coverage.get(key) or ())
+        if (card_id := _catalog_card_id(value))
+    }
+    meta = (
+        catalog_projection.get("meta")
+        if isinstance(catalog_projection.get("meta"), Mapping)
+        else {}
+    )
+    if (
+        not catalog_projection
+        or meta.get("available") is not True
+        or meta.get("stale") is True
+    ):
+        incomplete_views = set(cards_by_view)
+    else:
+        incomplete_views = {
+            view
+            for view, cards in cards_by_view.items()
+            if any(
+                _catalog_card_id(
+                    card.get("card_id") if isinstance(card, Mapping) else None
+                )
+                in incomplete_ids
+                for card in cards
+            )
+        }
+    if not incomplete_views:
+        return dict(evidence)
+
+    result = {
+        key: dict(value) if isinstance(value, Mapping) else value
+        for key, value in evidence.items()
+    }
+    dependent_keys: set[str] = set()
+    if incomplete_views.intersection({"shop", "board", "hand"}):
+        dependent_keys.update(
+            {
+                "shop_card_priority_advice",
+                "specific_purchase_advice",
+                "refresh_advice",
+                "upgrade_advice",
+            }
+        )
+    if "board" in incomplete_views:
+        dependent_keys.add("specific_positioning_advice")
+    if "choice" in incomplete_views:
+        dependent_keys.add("current_choice_comparison")
+    for key in dependent_keys:
+        value = result.get(key)
+        if not isinstance(value, Mapping):
+            if key in result:
+                result[key] = {
+                    "available": False,
+                    "missing_evidence": [
+                        "catalog_rules_not_fully_delivered_to_model"
+                    ],
+                }
+            continue
+        missing = list(value.get("missing_evidence") or ())
+        marker = "catalog_rules_not_fully_delivered_to_model"
+        if marker not in missing:
+            missing.append(marker)
+        value["available"] = False
+        value["missing_evidence"] = missing[:4]
+    return result
+
+
+def _focused_model_output(
+    payload: Mapping[str, Any],
+    canonical: Mapping[str, Any],
+    *,
+    mode: str,
+    focus: str,
+    opponent_relation: str = "auto",
+    include_advice: bool = True,
+    include_catalog_rules: bool = True,
+) -> str:
+    """Serialize one bounded model-visible contract for tools and fallback replies."""
+
+    allowed_focuses = (
+        _CONSTRUCTED_TOOL_FOCUSES
+        if mode == "constructed"
+        else _BATTLEGROUNDS_TOOL_FOCUSES
+    )
+    selected_focus = focus if focus in allowed_focuses else "overview"
+    view_focuses = _focused_view_focuses(
+        payload,
+        mode=mode,
+        focus=selected_focus,
+    )
+    cards_by_view = _focused_cards_by_view(
+        payload,
+        mode=mode,
+        view_focuses=view_focuses,
+        opponent_relation=opponent_relation,
+    )
+    source_incomplete_views = _focused_incomplete_transport_views(cards_by_view)
+    evidence = _focused_tool_evidence(
+        payload,
+        mode=mode,
+        view_focuses=view_focuses,
+    )
+    summary = str(
+        canonical.get("summary")
+        or "当前实时局势证据不完整，不能可靠回答。"
+    )
+    compact_fact = _focused_tool_query_reply(
+        payload,
+        mode=mode,
+        focus="overview" if selected_focus == "strategy" else selected_focus,
+        opponent_relation=opponent_relation,
+    )
+    compact_strategy_variants: dict[int, tuple[list[str], set[str]]] = {}
+    if selected_focus == "strategy":
+        for name_limit in (24, 12, 0):
+            rendered_views: list[str] = []
+            incomplete_views: set[str] = set()
+            for view_focus in view_focuses:
+                rendered, complete = _focused_compact_strategy_view(
+                    payload,
+                    mode=mode,
+                    focus=view_focus,
+                    opponent_relation=opponent_relation,
+                    name_limit=name_limit,
+                )
+                rendered_views.append(f"view[{view_focus}]={rendered}")
+                if not complete:
+                    incomplete_views.add(view_focus)
+            compact_strategy_variants[name_limit] = (
+                rendered_views,
+                incomplete_views,
+            )
+    advice_context = bool(
+        include_advice
+        and mode == "battlegrounds"
+        and selected_focus in {"shop", "strategy"}
+    )
+
+    def build(
+        *,
+        compact_facts: bool,
+        compact_view_name_limit: int | None,
+        include_decision_cards: bool,
+        catalog_rule_limit: int,
+    ) -> str:
+        if compact_view_name_limit is None:
+            selected_views: list[str] = []
+            incomplete_views: set[str] = set()
+        else:
+            selected_views, incomplete_views = compact_strategy_variants.get(
+                compact_view_name_limit,
+                ([], set()),
+            )
+        catalog_projection = _agent_catalog_projection(
+            payload,
+            cards_by_view,
+            max_rules=catalog_rule_limit,
+        )
+        transport_incomplete_views = {
+            *source_incomplete_views,
+            *incomplete_views,
+        }
+        output_evidence = _focused_transport_evidence(
+            evidence,
+            mode=mode,
+            incomplete_views=transport_incomplete_views,
+        )
+        output_evidence = _focused_catalog_output_evidence(
+            output_evidence,
+            mode=mode,
+            cards_by_view=cards_by_view,
+            catalog_projection=catalog_projection,
+        )
+        direct_fact_answer = bool(
+            not compact_facts and not include_advice and not include_catalog_rules
+        )
+        fact_line = (
+            f"facts[{selected_focus}]={compact_fact};"
+            "truncated=1;omitted=verbose_fact_rendering_due_byte_budget"
+            if compact_facts
+            else f"final_answer={summary}"
+            if direct_fact_answer
+            else f"facts[{selected_focus}]={summary}"
+        )
+        sections = [fact_line]
+        if include_advice:
+            sections.append(
+                "answer_rule=facts 是本轮当前玩家可见快照的权威事实，先完整回答；"
+                "策略建议只有对应 capability=1 时才可给出，缺失信息不得猜测"
+            )
+        else:
+            sections.append(
+                "answer_rule=这是当前事实查询，不受建议 capability 门禁；"
+                "final_answer 存在时必须完整照此回复，不得只概括数量、不得用旧对话覆盖"
+            )
+        if selected_focus == "shop":
+            sections.append(
+                "answer_contract=逐组独立转述CardID,数量,类型,实际费用,金色状态,"
+                "当前关键词;相同值不得跨组合并或省略"
+            )
+        sections.extend(selected_views)
+        sections.append(
+            "transport="
+            f"complete:{0 if transport_incomplete_views else 1};"
+            "incomplete_views:"
+            + (",".join(sorted(transport_incomplete_views)) or "-")
+        )
+        if compact_view_name_limit is not None and selected_views:
+            sections.append(
+                "keyword_codes=t:taunt,d:divine_shield,r:reborn,s:stealth,"
+                "w:windfury,W:mega_windfury,p:poisonous,v:venomous,"
+                "l:lifesteal,u:rush,c:charge,x:deathrattle,b:battlecry,"
+                "m:magnetic,e:elusive"
+            )
+        if include_advice and output_evidence:
+            sections.append("capabilities=" + _focused_capability_text(output_evidence))
+        if advice_context:
+            sections.append(
+                "current_recruit_decision="
+                + _focused_recruit_decision_text(
+                    payload,
+                    include_cards=include_decision_cards,
+                )
+            )
+            sections.append("decision_guardrails=" + _focused_guardrail_text(payload))
+        if include_catalog_rules:
+            sections.extend(_agent_catalog_output(catalog_projection))
+        return "\n".join(sections)
+
+    if selected_focus == "strategy":
+        variants = (
+            (False, 24, True, 7),
+            (True, 24, True, 7),
+            (True, 24, False, 7),
+            (True, 24, False, 3),
+            (True, 24, False, 0),
+            (True, 12, False, 7),
+            (True, 12, False, 3),
+            (True, 12, False, 0),
+            (True, 0, False, 7),
+            (True, 0, False, 3),
+            (True, 0, False, 0),
+        )
+    elif canonical.get("truncated") is True:
+        variants = (
+            (True, None, True, 7),
+            (True, None, False, 7),
+            (True, None, False, 3),
+            (True, None, False, 0),
+        )
+    else:
+        variants = (
+            (False, None, True, 7),
+            (True, None, True, 7),
+            (True, None, False, 7),
+            (True, None, False, 3),
+            (True, None, False, 0),
+        )
+    for compact_facts, view_name_limit, include_cards, rule_limit in variants:
+        candidate = build(
+            compact_facts=compact_facts,
+            compact_view_name_limit=view_name_limit,
+            include_decision_cards=include_cards,
+            catalog_rule_limit=rule_limit,
+        )
+        if len(candidate.encode("utf-8")) <= _LLM_TOOL_FOCUSED_MAX_BYTES:
+            return candidate
+
+    emergency = (
+        "当前实时证据超过安全字节上限，牌区动态字段未完整传递；"
+        "所有依赖这些字段的建议 capability 均视为0。请明确告知用户无法可靠建议。\n"
+        f"facts[{selected_focus}]={compact_fact}\n"
+        "truncated=1;transport_complete=0;omitted=card_views_due_byte_budget"
+    )
+    if len(emergency.encode("utf-8")) <= _LLM_TOOL_FOCUSED_MAX_BYTES:
+        return emergency
+    return "实时局势证据超过安全字节上限，不能可靠回答或给出建议。"
+
+
+def _focused_battlegrounds_opponent_view(
+    payload: Mapping[str, Any],
+    *,
+    opponent_relation: str = "auto",
+) -> tuple[str, Mapping[str, Any], Mapping[str, Any], list[Any], bool]:
+    state = (
+        payload.get("current_public_state")
+        if isinstance(payload.get("current_public_state"), Mapping)
+        else {}
+    )
+    opponents = state.get("opponents") if isinstance(state.get("opponents"), Mapping) else {}
+    selected_relation = str(opponent_relation or "auto")
+    if selected_relation not in {"current", "next", "last"} or not isinstance(
+        opponents.get(selected_relation), Mapping
+    ):
+        last = opponents.get("last")
+        last = last if isinstance(last, Mapping) else {}
+        last_board = last.get("board")
+        last_board = last_board if isinstance(last_board, Mapping) else {}
+        selected_relation = next(
+            (
+                relation
+                for relation in (
+                    "current",
+                    "last" if list(last_board.get("minions") or []) else "next",
+                    "next",
+                    "last",
+                )
+                if isinstance(opponents.get(relation), Mapping)
+            ),
+            "current",
+        )
+    observed = opponents.get(selected_relation)
+    observed = observed if isinstance(observed, Mapping) else {}
+    board = observed.get("board")
+    board = board if isinstance(board, Mapping) else {}
+    raw_cards = board.get("minions")
+    cards = list(raw_cards) if isinstance(raw_cards, list) else []
+
+    current_round = state.get("round")
+    observed_round = board.get("observed_round")
+    combat_round = observed.get("combat_round")
+    if selected_relation == "last" and not (
+        isinstance(combat_round, int) and not isinstance(combat_round, bool) and combat_round > 0
+    ):
+        combat_round = state.get("last_opponent_round")
+    observed_in_combat = board.get("observed_in_combat") is True
+    if selected_relation == "current":
+        complete = bool(
+            state.get("phase") == "combat"
+            and observed_in_combat
+            and isinstance(current_round, int)
+            and not isinstance(current_round, bool)
+            and current_round > 0
+            and observed_round == current_round
+        )
+    elif selected_relation == "last":
+        complete = bool(
+            observed_in_combat
+            and isinstance(combat_round, int)
+            and not isinstance(combat_round, bool)
+            and combat_round > 0
+            and observed_round == combat_round
+        )
+    else:
+        # A future opponent can change their board before combat. Its last seen
+        # lineup is useful history, but never a complete current-board answer.
+        complete = False
+    return selected_relation, observed, board, cards, complete
 
 
 def _focused_tool_cards(
@@ -1796,37 +2843,12 @@ def _focused_tool_cards(
         if not isinstance(cards, list) or not cards:
             cards = state.get("hero_choices")
     elif focus == "opponent":
-        opponents = (
-            state.get("opponents")
-            if isinstance(state.get("opponents"), Mapping)
-            else {}
+        _relation, _opponent, _board, cards, complete = _focused_battlegrounds_opponent_view(
+            payload,
+            opponent_relation=opponent_relation,
         )
-        selected_relation = str(opponent_relation or "auto")
-        if selected_relation not in {"current", "next", "last"} or not isinstance(
-            opponents.get(selected_relation), Mapping
-        ):
-            last = opponents.get("last")
-            last = last if isinstance(last, Mapping) else {}
-            last_board = last.get("board")
-            last_board = last_board if isinstance(last_board, Mapping) else {}
-            selected_relation = next(
-                (
-                    relation
-                    for relation in (
-                        "current",
-                        "last" if list(last_board.get("minions") or []) else "next",
-                        "next",
-                        "last",
-                    )
-                    if isinstance(opponents.get(relation), Mapping)
-                ),
-                "current",
-            )
-        observed = opponents.get(selected_relation)
-        observed = observed if isinstance(observed, Mapping) else {}
-        board = observed.get("board")
-        board = board if isinstance(board, Mapping) else {}
-        cards = board.get("minions")
+        if not complete:
+            cards = []
     else:
         cards = []
     return list(cards) if isinstance(cards, list) else []
@@ -1857,11 +2879,13 @@ def _focused_tool_evidence(
                 "purchase_affordability",
                 "specific_purchase_advice",
                 "upgrade_affordability",
+                "upgrade_advice",
                 "refresh_advice",
             ),
             "economy": (
                 "purchase_affordability",
                 "upgrade_affordability",
+                "upgrade_advice",
                 "refresh_advice",
             ),
             "board": ("specific_positioning_advice",),
@@ -1898,6 +2922,489 @@ def _focused_tool_evidence(
     return result
 
 
+def _focused_battlegrounds_area_complete(
+    state: Mapping[str, Any],
+    area_name: str,
+) -> bool:
+    areas = state.get("areas") if isinstance(state.get("areas"), Mapping) else {}
+    area = areas.get(area_name) if isinstance(areas, Mapping) else None
+    return bool(
+        isinstance(area, Mapping)
+        and area.get("complete") is True
+        and area.get("round") == state.get("round")
+        and area.get("phase") == state.get("phase")
+        and area.get("observed_at")
+    )
+
+
+def _focused_economy_checklist(state: Mapping[str, Any]) -> dict[str, Any]:
+    def observed_nonnegative_int(value: Any) -> int | None:
+        return (
+            value
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            else None
+        )
+
+    gold = observed_nonnegative_int(state.get("gold"))
+    refresh_cost = observed_nonnegative_int(state.get("refresh_cost"))
+    upgrade_cost = observed_nonnegative_int(state.get("upgrade_cost"))
+    upgrade_evidence_complete = gold is not None and upgrade_cost is not None
+    can_upgrade = gold >= upgrade_cost if upgrade_evidence_complete else None
+    return {
+        "source_complete": bool(
+            gold is not None and refresh_cost is not None and upgrade_cost is not None
+        ),
+        "gold": gold,
+        "refresh_actual_cost": refresh_cost,
+        "upgrade_actual_cost": upgrade_cost,
+        "upgrade_evidence_complete": upgrade_evidence_complete,
+        "can_upgrade": can_upgrade,
+        "remaining_after_upgrade": (
+            gold - upgrade_cost
+            if can_upgrade is True and gold is not None and upgrade_cost is not None
+            else None
+        ),
+        "shortfall_for_upgrade": (
+            upgrade_cost - gold
+            if can_upgrade is False and gold is not None and upgrade_cost is not None
+            else None
+        ),
+        "remaining_status": (
+            "applicable"
+            if can_upgrade is True
+            else "not_applicable_insufficient_gold"
+            if can_upgrade is False
+            else "unknown"
+        ),
+    }
+
+
+def _focused_answer_checklist(
+    payload: Mapping[str, Any],
+    *,
+    mode: str,
+    focus: str,
+    opponent_relation: str = "auto",
+) -> dict[str, Any]:
+    checklist: dict[str, Any] = {
+        "authority": "canonical_final_field",
+        "answer_policy": "cover_every_full_group_and_requested_field",
+        "mode": mode,
+        "requested_focus": focus,
+    }
+    if mode == "constructed":
+        state = payload.get("state") if isinstance(payload.get("state"), Mapping) else {}
+        checklist["current"] = {
+            "round": state.get("round"),
+            "action_turn": state.get("turn"),
+            "action_turn_is_not_round": True,
+            "active_side": state.get("active_side"),
+            "phase": state.get("phase"),
+        }
+        if focus in {"overview", "strategy"}:
+            return checklist
+        constructed = (
+            state.get("constructed")
+            if isinstance(state.get("constructed"), Mapping)
+            else {}
+        )
+        if focus == "choice":
+            choice = state.get("choice") if isinstance(state.get("choice"), Mapping) else {}
+            cards = choice.get("options")
+            checklist["areas"] = {
+                "choice": build_card_answer_area(
+                    "当前选择项",
+                    cards,
+                    complete=isinstance(cards, list),
+                    deliver_full=True,
+                    include_fields=frozenset(
+                        (
+                            "name",
+                            "card_type",
+                            "card_type_zh",
+                            "current_cost",
+                            "keywords_complete",
+                            "active_keywords",
+                        )
+                    ),
+                )
+            }
+            return checklist
+        side_name = "opponent" if focus == "opponent" else "player"
+        side = (
+            constructed.get(side_name)
+            if isinstance(constructed.get(side_name), Mapping)
+            else {}
+        )
+        if focus == "hand":
+            hand = side.get("hand") if isinstance(side.get("hand"), Mapping) else {}
+            cards = hand.get("known_cards")
+            expected_count = hand.get("count")
+            complete = bool(
+                hand.get("identities_complete") is True
+                and isinstance(cards, list)
+                and isinstance(expected_count, int)
+                and expected_count == len(cards)
+            )
+            area_key, label = "player_hand", "当前手牌"
+        else:
+            board = side.get("board") if isinstance(side.get("board"), Mapping) else {}
+            cards = board.get("minions")
+            expected_count = board.get("count")
+            complete = bool(
+                board.get("identities_complete") is True
+                and isinstance(cards, list)
+                and isinstance(expected_count, int)
+                and expected_count == len(cards)
+            )
+            area_key = "opponent_board" if side_name == "opponent" else "player_board"
+            label = "对手场面" if side_name == "opponent" else "我方场面"
+        checklist["areas"] = {
+            area_key: build_card_answer_area(
+                label,
+                cards,
+                complete=complete,
+                deliver_full=True,
+                include_fields=(
+                    frozenset(
+                        (
+                            "card_type",
+                            "current_cost",
+                            "keywords_complete",
+                            "active_keywords",
+                        )
+                    )
+                    if focus == "hand"
+                    else frozenset(
+                        (
+                            "name",
+                            "attack",
+                            "health",
+                            "keywords_complete",
+                            "active_keywords",
+                        )
+                    )
+                ),
+            )
+        }
+        return checklist
+
+    state = (
+        payload.get("current_public_state")
+        if isinstance(payload.get("current_public_state"), Mapping)
+        else {}
+    )
+    checklist["current"] = {
+        "round": state.get("round"),
+        "phase": state.get("phase"),
+    }
+    if focus in {"shop", "economy"}:
+        checklist["economy"] = _focused_economy_checklist(state)
+    if focus in {"overview", "economy", "strategy"}:
+        return checklist
+
+    if focus == "opponent":
+        relation, observed, board, cards, complete = _focused_battlegrounds_opponent_view(
+            payload,
+            opponent_relation=opponent_relation,
+        )
+        label = {
+            "current": "当前对手场面",
+            "last": "上一轮对手历史场面",
+            "next": "下一位对手已观测历史场面",
+        }.get(relation, "已观测对手场面")
+        area = build_card_answer_area(
+            label,
+            cards,
+            complete=complete,
+            deliver_full=True,
+            include_fields=frozenset(
+                (
+                    "name",
+                    "card_type",
+                    "attack",
+                    "health",
+                    "tier",
+                    "premium",
+                    "keywords_complete",
+                    "active_keywords",
+                )
+            ),
+        )
+        area.update(
+            {
+                "relationship": relation,
+                "current_round": state.get("round"),
+                "combat_round": observed.get("combat_round"),
+                "observed_round": board.get("observed_round"),
+                "observed_in_combat": board.get("observed_in_combat") is True,
+            }
+        )
+        checklist["areas"] = {"opponent_board": area}
+        return checklist
+
+    area_name = {"board": "warband", "choice": "choice"}.get(focus, focus)
+    labels = {
+        "shop": "当前商店",
+        "hand": "当前手牌",
+        "warband": "当前战团",
+        "choice": "当前选择项",
+    }
+    cards = _focused_tool_cards(
+        payload,
+        mode=mode,
+        focus=focus,
+        opponent_relation=opponent_relation,
+    )
+    if area_name == "shop":
+        include_fields = frozenset(
+            (
+                "name",
+                "card_type",
+                "card_type_zh",
+                "current_cost",
+                "attack",
+                "health",
+                "tier",
+                "premium",
+                "keywords_complete",
+                "active_keywords",
+            )
+        )
+    elif area_name == "choice":
+        include_fields = frozenset(
+            (
+                "name",
+                "card_type",
+                "current_cost",
+                "premium",
+                "keywords_complete",
+                "active_keywords",
+            )
+        )
+    else:
+        include_fields = frozenset(
+            (
+                "name",
+                "card_type",
+                "card_type_zh",
+                "current_cost",
+                "attack",
+                "health",
+                "tier",
+                "premium",
+                "keywords_complete",
+                "active_keywords",
+            )
+        )
+    checklist["areas"] = {
+        area_name: build_card_answer_area(
+            labels.get(area_name, area_name),
+            cards,
+            complete=_focused_battlegrounds_area_complete(state, area_name),
+            deliver_full=True,
+            include_fields=include_fields,
+        )
+    }
+    return checklist
+
+
+def _focused_answer_summary(checklist: Mapping[str, Any]) -> str:
+    """Render the canonical checklist into a short, model-ready Chinese answer."""
+
+    def scalar(value: Any) -> str:
+        return "未知" if value is None or value == "" else str(value)
+
+    def yes_no(value: Any) -> str:
+        if value is True:
+            return "是"
+        if value is False:
+            return "否"
+        return "未知"
+
+    focus = str(checklist.get("requested_focus") or "overview")
+    current = checklist.get("current")
+    current = current if isinstance(current, Mapping) else {}
+    economy = checklist.get("economy")
+    economy = economy if isinstance(economy, Mapping) else {}
+
+    if focus == "economy":
+        gold = economy.get("gold")
+        upgrade_cost = economy.get("upgrade_actual_cost")
+        refresh_cost = economy.get("refresh_actual_cost")
+        if economy.get("upgrade_evidence_complete") is not True:
+            return (
+                "当前金币或升本实际费用证据不完整，无法判断能否升本；"
+                f"刷新需要{scalar(refresh_cost)}金币。"
+            )
+        if economy.get("can_upgrade") is True:
+            remaining = economy.get("remaining_after_upgrade")
+            return (
+                f"当前有{scalar(gold)}金币；升本需要{scalar(upgrade_cost)}金币；"
+                f"现在能升本；升完还剩{scalar(remaining)}金币。"
+                f"刷新需要{scalar(refresh_cost)}金币。"
+            )
+        shortfall = economy.get("shortfall_for_upgrade")
+        return (
+            f"当前有{scalar(gold)}金币；升本需要{scalar(upgrade_cost)}金币；"
+            f"现在不能升本；还差{scalar(shortfall)}金币；"
+            f"因此没有升完后的剩余金币。刷新需要{scalar(refresh_cost)}金币。"
+        )
+
+    areas = checklist.get("areas")
+    if isinstance(areas, Mapping) and areas:
+        summaries: list[str] = []
+        field_labels = {
+            "name": "名称",
+            "card_type": "类型",
+            "current_cost": "实际费用",
+            "attack": "攻击",
+            "health": "生命",
+            "tier": "星级",
+        }
+        for raw_area in areas.values():
+            area = raw_area if isinstance(raw_area, Mapping) else {}
+            label = str(area.get("label") or "当前牌区")
+            if area.get("delivery") != "full":
+                summaries.append(f"{label}证据不完整，不能可靠列出。")
+                continue
+            groups = area.get("groups")
+            groups = groups if isinstance(groups, list) else []
+            slot_count = area.get("slot_count")
+            group_count = area.get("group_count")
+            rendered_groups: list[str] = []
+            for index, raw_group in enumerate(groups, start=1):
+                group = raw_group if isinstance(raw_group, Mapping) else {}
+                positions = group.get("positions")
+                positions = positions if isinstance(positions, list) else []
+                fields = [
+                    str(group.get("ordinal") or f"{index}/{len(groups)}"),
+                    f"位置={','.join(str(item) for item in positions) or '未知'}",
+                    f"数量={scalar(group.get('count'))}",
+                    f"CardID={scalar(group.get('card_id'))}",
+                ]
+                for key, field_label in field_labels.items():
+                    if key in group:
+                        fields.append(f"{field_label}={scalar(group.get(key))}")
+                if "card_type_zh" in group and group.get("card_type_zh"):
+                    fields.append(f"类型中文={group['card_type_zh']}")
+                if "premium" in group:
+                    fields.append(f"金色={yes_no(group.get('premium'))}")
+                if "active_keywords" in group:
+                    raw_keywords = group.get("active_keywords")
+                    keywords = raw_keywords if isinstance(raw_keywords, list) else []
+                    if group.get("keywords_complete") is True:
+                        fields.append(
+                            "当前关键词=" + (",".join(str(item) for item in keywords) or "无")
+                        )
+                    else:
+                        fields.append("当前关键词=证据不完整")
+                rendered_groups.append(" ".join(fields))
+            header = (
+                f"{label}共{scalar(slot_count)}个槽位、{scalar(group_count)}组；"
+                "逐组事实："
+            )
+            summaries.append(header + "；".join(rendered_groups) + "。")
+        return " ".join(summaries)
+
+    round_number = current.get("round")
+    phase = current.get("phase")
+    if round_number is not None:
+        if "action_turn" in current:
+            return (
+                f"当前是第{round_number}回合；行动方={scalar(current.get('active_side'))}；"
+                f"阶段={scalar(phase)}。"
+            )
+        return f"当前是第{round_number}回合，阶段={scalar(phase)}。"
+    return "当前实时局势证据不完整，不能可靠回答。"
+
+
+def _focused_canonical_facts(checklist: Mapping[str, Any]) -> dict[str, Any]:
+    """Promote the selected answer facts to stable, shallow tool fields."""
+
+    result: dict[str, Any] = {}
+    current = checklist.get("current")
+    if isinstance(current, Mapping):
+        result["current"] = dict(current)
+    economy = checklist.get("economy")
+    if isinstance(economy, Mapping):
+        result["economy"] = dict(economy)
+
+    areas = checklist.get("areas")
+    if not isinstance(areas, Mapping) or not areas:
+        return result
+    area_name, raw_area = next(iter(areas.items()))
+    area = raw_area if isinstance(raw_area, Mapping) else {}
+    raw_groups = area.get("groups")
+    groups = raw_groups if isinstance(raw_groups, list) else []
+    card_groups: list[dict[str, Any]] = []
+    positioned_ids: list[tuple[int, str]] = []
+    fallback_ids: list[str] = []
+    for index, raw_group in enumerate(groups, start=1):
+        group = raw_group if isinstance(raw_group, Mapping) else {}
+        positions = group.get("positions")
+        positions = list(positions) if isinstance(positions, list) else []
+        card_id = _catalog_card_id(group.get("card_id"))
+        count = group.get("count")
+        count = count if isinstance(count, int) and count >= 0 else len(positions)
+        canonical_group = {
+            "ordinal": str(group.get("ordinal") or f"{index}/{len(groups)}"),
+            "positions": positions,
+            "count": count,
+            "card_id": card_id or None,
+        }
+        field_aliases = (
+            ("name", "name"),
+            ("card_type", "card_type"),
+            ("card_type_zh", "card_type_zh"),
+            ("current_cost", "actual_cost"),
+            ("attack", "attack"),
+            ("health", "health"),
+            ("tier", "tier"),
+            ("premium", "golden"),
+            ("keywords_complete", "keywords_complete"),
+            ("active_keywords", "current_keywords"),
+        )
+        for source_key, target_key in field_aliases:
+            if source_key in group:
+                canonical_group[target_key] = group.get(source_key)
+        card_groups.append(canonical_group)
+        numeric_positions = [
+            position
+            for position in positions
+            if isinstance(position, int) and not isinstance(position, bool)
+        ]
+        if card_id and len(numeric_positions) == count:
+            positioned_ids.extend((position, card_id) for position in numeric_positions)
+        elif card_id:
+            fallback_ids.extend([card_id] * count)
+
+    required_card_ids = [
+        card_id for _position, card_id in sorted(positioned_ids, key=lambda item: item[0])
+    ] + fallback_ids
+    result.update(
+        {
+            "area": str(area_name),
+            "area_label": str(area.get("label") or area_name),
+            "source_complete": area.get("source_complete") is True,
+            "slot_count": area.get("slot_count"),
+            "group_count": area.get("group_count"),
+            "required_card_ids": required_card_ids,
+            "card_groups": card_groups,
+        }
+    )
+    for key in (
+        "relationship",
+        "current_round",
+        "combat_round",
+        "observed_round",
+        "observed_in_combat",
+    ):
+        if key in area:
+            result[key] = area.get(key)
+    return result
+
+
 def _focused_llm_tool_result(
     payload: Mapping[str, Any],
     *,
@@ -1911,27 +3418,11 @@ def _focused_llm_tool_result(
         else _BATTLEGROUNDS_TOOL_FOCUSES
     )
     selected_focus = focus if focus in allowed_focuses else "overview"
-    if selected_focus != "strategy":
-        view_focuses = (selected_focus,)
-    elif mode == "constructed":
-        state = payload.get("state") if isinstance(payload.get("state"), Mapping) else {}
-        choice = state.get("choice") if isinstance(state.get("choice"), Mapping) else {}
-        view_focuses = (
-            ("overview", "choice")
-            if list(choice.get("options") or [])
-            else ("overview", "board", "hand", "opponent")
-        )
-    else:
-        state = (
-            payload.get("current_public_state")
-            if isinstance(payload.get("current_public_state"), Mapping)
-            else {}
-        )
-        view_focuses = {
-            "hero_select": ("overview", "choice"),
-            "recruit": ("overview", "economy", "shop", "board", "hand"),
-            "combat": ("overview", "board", "opponent"),
-        }.get(str(state.get("phase") or ""), ("overview", "board"))
+    view_focuses = _focused_view_focuses(
+        payload,
+        mode=mode,
+        focus=selected_focus,
+    )
 
     views = [
         {
@@ -1955,12 +3446,28 @@ def _focused_llm_tool_result(
             opponent_relation=opponent_relation,
         )
     ]
+    answer_checklist = _focused_answer_checklist(
+        payload,
+        mode=mode,
+        focus=selected_focus,
+        opponent_relation=opponent_relation,
+    )
+    canonical_facts = _focused_canonical_facts(answer_checklist)
+    checklist_areas = answer_checklist.get("areas")
+    result_views = [] if isinstance(checklist_areas, Mapping) else views
     result: dict[str, Any] = {
+        "summary": _focused_answer_summary(answer_checklist),
+        "answer_checklist": {
+            "authority": "canonical_top_level_fields",
+            "answer_policy": "cover_summary_and_every_card_group",
+            "requested_focus": selected_focus,
+        },
+        **canonical_facts,
         "format": "hearthstone_compact_v1",
         "mode": mode,
         "focus": selected_focus,
         "available": bool(payload.get("available")),
-        "views": views,
+        "views": result_views,
         "evidence": _focused_tool_evidence(
             payload,
             mode=mode,
@@ -1978,12 +3485,18 @@ def _focused_llm_tool_result(
     if _focused_tool_json_bytes(result) <= _LLM_TOOL_FOCUSED_MAX_BYTES:
         return result
 
-    fallback = {
+    fallback: dict[str, Any] = {
+        "summary": (
+            "聚焦结果超过字节上限；所问区域事实保留在顶层字段，"
+            "冗余视图和规则依据已省略。"
+        ),
+        "answer_checklist": result["answer_checklist"],
+        **canonical_facts,
         "format": "hearthstone_compact_v1",
         "mode": mode,
         "focus": selected_focus,
         "available": bool(payload.get("available")),
-        "views": views,
+        "views": [],
         "evidence": {},
         "catalog_rules": "",
         "truncated": True,
@@ -1992,16 +3505,118 @@ def _focused_llm_tool_result(
     }
     if reason:
         fallback["reason"] = reason
-    if _focused_tool_json_bytes(fallback) > _LLM_TOOL_FOCUSED_MAX_BYTES:
-        fallback["views"] = views[:1]
-    if _focused_tool_json_bytes(fallback) > _LLM_TOOL_FOCUSED_MAX_BYTES:
-        fallback["views"] = [
+    if _focused_tool_json_bytes(fallback) <= _LLM_TOOL_FOCUSED_MAX_BYTES:
+        return fallback
+
+    fallback.pop("required_card_ids", None)
+    groups = fallback.get("card_groups")
+    if isinstance(groups, list):
+        fallback["card_groups"] = [
             {
-                "focus": view_focuses[0],
-                "state": "HS_QUERY;available=?;omitted=oversize_focused_result",
+                key: value
+                for key, value in group.items()
+                if key not in {"name", "card_type_zh", "ordinal", "count"}
             }
+            if isinstance(group, Mapping)
+            else {}
+            for group in groups
         ]
-    return fallback
+    fallback["truncation_reason"] = "canonical_redundancy_omitted"
+    if _focused_tool_json_bytes(fallback) <= _LLM_TOOL_FOCUSED_MAX_BYTES:
+        return fallback
+
+    fallback.pop("current", None)
+    fallback.pop("economy", None)
+    fallback["truncation_reason"] = "canonical_context_omitted"
+    if _focused_tool_json_bytes(fallback) <= _LLM_TOOL_FOCUSED_MAX_BYTES:
+        return fallback
+
+    compact_groups: list[dict[str, Any]] = []
+    for group in fallback.get("card_groups") or ():
+        if not isinstance(group, Mapping):
+            continue
+        positions = [
+            position
+            for position in list(group.get("positions") or ())
+            if isinstance(position, int) and not isinstance(position, bool)
+        ]
+        count = group.get("count")
+        count = (
+            count
+            if isinstance(count, int) and not isinstance(count, bool) and count >= 0
+            else len(positions)
+        )
+        compact_group: dict[str, Any] = {
+            "positions": positions[:16],
+            "count": count,
+            "card_id": group.get("card_id"),
+        }
+        if len(positions) > 16:
+            compact_group["positions_omitted_count"] = len(positions) - 16
+        compact_groups.append(
+            compact_group
+        )
+    total_card_count = sum(
+        int(group.get("count") or 0) for group in compact_groups
+    )
+    fallback["card_groups"] = []
+    fallback["source_complete"] = False
+    fallback["source_group_count"] = len(compact_groups)
+    fallback["source_card_count"] = total_card_count
+    fallback["delivered_group_count"] = 0
+    fallback["delivered_card_count"] = 0
+    fallback["omitted_group_count"] = len(compact_groups)
+    fallback["omitted_card_count"] = total_card_count
+    fallback["summary"] = (
+        "所问区域过大，仅保留位置和CardID；动态字段承载不完整，不能据此给建议。"
+    )
+    fallback["truncation_reason"] = "canonical_dynamic_fields_omitted"
+    delivered_card_count = 0
+    for group in compact_groups:
+        group_count = int(group.get("count") or 0)
+        candidate = dict(fallback)
+        candidate_groups = [*list(fallback.get("card_groups") or ()), group]
+        candidate["card_groups"] = candidate_groups
+        candidate["delivered_group_count"] = len(candidate_groups)
+        candidate["delivered_card_count"] = delivered_card_count + group_count
+        candidate["omitted_group_count"] = len(compact_groups) - len(candidate_groups)
+        candidate["omitted_card_count"] = max(
+            0, total_card_count - candidate["delivered_card_count"]
+        )
+        if _focused_tool_json_bytes(candidate) > _LLM_TOOL_FOCUSED_MAX_BYTES:
+            break
+        fallback = candidate
+        delivered_card_count += group_count
+    if _focused_tool_json_bytes(fallback) <= _LLM_TOOL_FOCUSED_MAX_BYTES:
+        return fallback
+
+    # This fixed final envelope cannot grow with source data and is therefore
+    # the hard safety boundary for malformed or adversarial snapshots.
+    return {
+        "summary": "所问区域超过安全字节上限，牌组事实未传递，不能据此回答或给建议。",
+        "answer_checklist": {
+            "authority": "canonical_top_level_fields",
+            "answer_policy": "report_incomplete_evidence_only",
+            "requested_focus": selected_focus,
+        },
+        "format": "hearthstone_compact_v1",
+        "mode": mode,
+        "focus": selected_focus,
+        "available": bool(payload.get("available")),
+        "views": [],
+        "evidence": {},
+        "catalog_rules": "",
+        "source_complete": False,
+        "source_group_count": len(compact_groups),
+        "source_card_count": total_card_count,
+        "delivered_group_count": 0,
+        "delivered_card_count": 0,
+        "omitted_group_count": len(compact_groups),
+        "omitted_card_count": total_card_count,
+        "truncated": True,
+        "truncation_reason": "canonical_source_too_large",
+        "byte_limit": _LLM_TOOL_FOCUSED_MAX_BYTES,
+    }
 
 
 def _current_turn_llm_tool_result(
@@ -2030,7 +3645,17 @@ def _current_turn_llm_tool_result(
     except (TypeError, ValueError):
         raw_action_turn = 0
 
+    active_side = state.get("active_side") or "unknown"
+    phase = state.get("phase") or "unknown"
+    if current_round > 0:
+        summary = f"当前是第{current_round}回合；行动方={active_side}；阶段={phase}。"
+    else:
+        summary = (
+            "当前完整回合数尚未观测到，不能用 action_turn 猜测；"
+            f"行动方={active_side}；阶段={phase}。"
+        )
     result: dict[str, Any] = {
+        "summary": summary,
         "format": "hearthstone_current_turn_v1",
         "mode": mode,
         # Strategy evidence can be incomplete while round/phase are still
@@ -2039,8 +3664,8 @@ def _current_turn_llm_tool_result(
         "round_known": current_round > 0,
         "round": current_round if current_round > 0 else None,
         "action_turn": raw_action_turn if raw_action_turn > 0 else None,
-        "active_side": state.get("active_side") or "unknown",
-        "phase": state.get("phase") or "unknown",
+        "active_side": active_side,
+        "phase": phase,
         "answer_contract": {
             "current_round_field": "round",
             "action_turn_is_raw_alternating_counter": True,
@@ -2053,6 +3678,36 @@ def _current_turn_llm_tool_result(
         if reason:
             result["reason"] = reason
     return result
+
+
+def _model_text_tool_result(
+    canonical: Mapping[str, Any],
+    *,
+    output: str | None = None,
+) -> dict[str, Any]:
+    """Return a concise provider output plus a direct-IPC canonical copy."""
+
+    canonical_copy = dict(canonical)
+    model_text = str(
+        output
+        or canonical.get("summary")
+        or "当前实时局势证据不完整，不能可靠回答。"
+    )
+    provider_text = (
+        str(canonical.get("summary") or model_text)
+        if model_text.startswith("final_answer=")
+        else model_text
+    )
+    return {
+        **canonical_copy,
+        "output": provider_text,
+        "is_error": False,
+        "_model_text": provider_text,
+        # The official callback serializer intentionally drops extra envelope
+        # fields. Direct IPC diagnostics use these private copies without
+        # exposing duplicate facts to the model.
+        "_canonical": canonical_copy,
+    }
 
 
 def _sanitize_constructed_tool_state(state: dict[str, Any]) -> dict[str, Any]:
@@ -2124,20 +3779,16 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         self._live_state_published_at = 0.0
         self._state_publisher = LiveStatePublisher(
             push_message=self._publish_sdk_message,
-            build_segments=build_atomic_live_state_segment,
+            build_segments=build_live_state_segments,
             logger=self.logger,
             max_prompt_bytes=_LIVE_STATE_DELIVERY_MAX_BYTES,
             refresh_seconds=_LIVE_STATE_REFRESH_SECONDS,
         )
-        self._query_ledger = QueryLedger()
-        self._session_target = ""
         self._game_lifecycle_epoch = 0
         self._game_lifecycle_source_monitor: Any | None = None
         self._game_lifecycle_source_generation: int | None = None
         self._game_lifecycle_sent: dict[str, float] = {}
         self._pending_game_lifecycle: _PendingGameLifecycleReaction | None = None
-        self._last_user_context_timestamp = 0.0
-        self._last_user_context_signatures: set[str] = set()
         self._ownership_lock = threading.RLock()
         self._delivery_lock = threading.RLock()
         self._settings_lock = asyncio.Lock()
@@ -2156,6 +3807,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         self._config_transition_revision = 0
         self._consent_request_revision = 0
         self._consent_revocation_pending = False
+        self._config_persist_reconcile_error_code = ""
         self._config_revision = 0
         self._config_reconciled_revision = 0
         self._config_reconcile_task: asyncio.Task[None] | None = None
@@ -2171,6 +3823,37 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         self._llm_tool_health_failures = 0
         self._llm_tool_health_next_attempt_at = 0.0
         self._llm_tool_recovery_specs: dict[str, dict[str, Any]] = {}
+        self._diagnostics = DiagnosticTracker()
+        self._diagnostic_export_lock = threading.Lock()
+
+    def _ensure_diagnostics(self) -> DiagnosticTracker:
+        return _diagnostic_tracker(self)
+
+    def _record_route_diagnostic(
+        self,
+        route: str,
+        *,
+        status: str,
+        reason: str = "",
+        mode: str = "",
+        focus: str = "",
+        fact_sha256: str = "",
+    ) -> None:
+        _record_route_diagnostic(
+            self,
+            route,
+            status=status,
+            reason=reason,
+            mode=mode,
+            focus=focus,
+            fact_sha256=fact_sha256,
+        )
+
+    def _record_tool_registration_diagnostic(self, result: Mapping[str, Any]) -> None:
+        try:
+            self._ensure_diagnostics().record_tool_registration(result)
+        except Exception:
+            return
 
     def _local_llm_tool_specs(self) -> dict[str, dict[str, Any]]:
         cached = dict(getattr(self, "_llm_tool_recovery_specs", {}))
@@ -2334,7 +4017,14 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         }
 
     def _defer_llm_tool_health_check(self, *, failed: bool) -> float:
-        with self._llm_tool_health_lock:
+        health_lock = getattr(self, "_llm_tool_health_lock", None)
+        if health_lock is None:
+            health_lock = threading.Lock()
+            self._llm_tool_health_lock = health_lock
+            self._llm_tool_health_in_flight = False
+            self._llm_tool_health_failures = 0
+            self._llm_tool_health_next_attempt_at = 0.0
+        with health_lock:
             if failed:
                 self._llm_tool_health_failures += 1
                 delay = min(
@@ -2358,15 +4048,21 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         now = time.monotonic()
         with self._llm_tool_health_lock:
             if self._llm_tool_health_in_flight:
-                return Ok({"skipped": True, "reason": "check_in_flight"})
+                result = {"skipped": True, "reason": "check_in_flight"}
+                self._record_tool_registration_diagnostic(result)
+                return Ok(result)
             if now < self._llm_tool_health_next_attempt_at:
-                return Ok({"skipped": True, "reason": "retry_backoff"})
+                result = {"skipped": True, "reason": "retry_backoff"}
+                self._record_tool_registration_diagnostic(result)
+                return Ok(result)
             self._llm_tool_health_in_flight = True
 
         try:
             if not bool(getattr(self, "_started", False)):
                 self._reset_llm_tool_health_backoff()
-                return Ok({"skipped": True, "reason": "plugin_not_running"})
+                result = {"skipped": True, "reason": "plugin_not_running"}
+                self._record_tool_registration_diagnostic(result)
+                return Ok(result)
             result = await self._check_and_recover_llm_tools()
             if result["healthy"]:
                 self._reset_llm_tool_health_backoff()
@@ -2379,6 +4075,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 self._defer_llm_tool_health_check(
                     failed=result["reason"] != "no_active_role_registry"
                 )
+            self._record_tool_registration_diagnostic(result)
             return Ok(result)
         except asyncio.CancelledError:
             raise
@@ -2388,14 +4085,14 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 "Hearthstone LLM tool registry check failed code=%s",
                 type(exc).__name__,
             )
-            return Ok(
-                {
-                    "healthy": False,
-                    "reason": "registry_unavailable",
-                    "error_code": type(exc).__name__,
-                    "retry_after_seconds": retry_after,
-                }
-            )
+            result = {
+                "healthy": False,
+                "reason": "registry_unavailable",
+                "error_code": type(exc).__name__,
+                "retry_after_seconds": retry_after,
+            }
+            self._record_tool_registration_diagnostic(result)
+            return Ok(result)
         finally:
             with self._llm_tool_health_lock:
                 self._llm_tool_health_in_flight = False
@@ -2720,22 +4417,48 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 updated = CompanionConfig.from_mapping(fail_closed_values)
                 base_errors = ("config:invalid_effective_section",)
 
-            if (
+            revocation_was_pending = bool(
                 getattr(self, "_consent_revocation_pending", False)
-                and updated.llm_data_consent
-            ):
-                fail_closed_values = updated.to_dict()
-                fail_closed_values["llm_data_consent"] = False
-                updated = CompanionConfig.from_mapping(fail_closed_values)
+            )
+            if revocation_was_pending:
+                if updated.llm_data_consent:
+                    fail_closed_values = updated.to_dict()
+                    fail_closed_values["llm_data_consent"] = False
+                    updated = CompanionConfig.from_mapping(fail_closed_values)
+                elif valid:
+                    self._consent_revocation_pending = False
+                    self._config_persist_reconcile_error_code = ""
             if previous.llm_data_consent and not updated.llm_data_consent:
                 self._consent_request_revision = int(
                     getattr(self, "_consent_request_revision", 0)
                 ) + 1
+                if not revocation_was_pending:
+                    self._consent_revocation_pending = True
 
             restore_required = self._context_restore_required(previous, updated)
             self.cfg = updated
-            if not updated.llm_data_consent:
+            if restore_required:
                 self._pending_game_lifecycle = None
+            previous_restore_pending = bool(
+                getattr(self, "_config_reconcile_restore_required", False)
+            )
+            published_context_exists = bool(
+                getattr(self, "_live_state_shared", False)
+                or getattr(
+                    getattr(self, "_state_publisher", None), "cursor", None
+                )
+                is not None
+            )
+            immediate_restore_pending = False
+            if restore_required and published_context_exists:
+                try:
+                    immediate_restore_pending = not self._restore_context()
+                except Exception as exc:
+                    immediate_restore_pending = True
+                    self.logger.warning(
+                        "Hearthstone immediate context invalidation failed code=%s",
+                        type(exc).__name__,
+                    )
             self._settings_transition = True
             self._settings_transition_revision = int(
                 getattr(self, "_settings_transition_revision", 0)
@@ -2744,9 +4467,10 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             self._config_revision = int(getattr(self, "_config_revision", 0)) + 1
             revision = self._config_revision
             self._config_reconcile_previous = previous
-            self._config_reconcile_restore_required = bool(
-                getattr(self, "_config_reconcile_restore_required", False)
-                or restore_required
+            self._config_reconcile_restore_required = (
+                immediate_restore_pending
+                if restore_required
+                else previous_restore_pending
             )
             self._config_reconcile_base_error_codes = base_errors
             if base_errors:
@@ -2844,13 +4568,14 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             with self._delivery_transition():
                 if int(getattr(self, "_config_revision", 0)) != read_config_revision:
                     return True
-                if (
-                    getattr(self, "_consent_revocation_pending", False)
-                    and updated.llm_data_consent
-                ):
-                    fail_closed_values = updated.to_dict()
-                    fail_closed_values["llm_data_consent"] = False
-                    updated = CompanionConfig.from_mapping(fail_closed_values)
+                if getattr(self, "_consent_revocation_pending", False):
+                    if updated.llm_data_consent:
+                        fail_closed_values = updated.to_dict()
+                        fail_closed_values["llm_data_consent"] = False
+                        updated = CompanionConfig.from_mapping(fail_closed_values)
+                    else:
+                        self._consent_revocation_pending = False
+                        self._config_persist_reconcile_error_code = ""
                 previous = self.cfg
                 restore_required = self._context_restore_required(previous, updated)
                 self.cfg = updated
@@ -2926,7 +4651,23 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                         previous,
                         updated,
                         restore_required=restore_required,
-                        base_errors=base_errors,
+                        base_errors=tuple(
+                            dict.fromkeys(
+                                item
+                                for item in (
+                                    *base_errors,
+                                    str(
+                                        getattr(
+                                            self,
+                                            "_config_persist_reconcile_error_code",
+                                            "",
+                                        )
+                                        or ""
+                                    ),
+                                )
+                                if item
+                            )
+                        ),
                     )
 
                 with self._ownership_lock:
@@ -3234,7 +4975,6 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 monitor=monitor,
                 source_generation=source_generation,
             )
-            self._ensure_query_ledger().clear()
 
     def _monitor_actions(self) -> asyncio.Lock:
         lock = getattr(self, "_monitor_action_lock", None)
@@ -3252,7 +4992,6 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
 
     def _begin_startup(self) -> int:
         task = asyncio.current_task()
-        self._ensure_query_ledger().clear()
         with self._delivery_transition():
             generation = int(getattr(self, "_lifecycle_generation", 0)) + 1
             self._lifecycle_generation = generation
@@ -3337,7 +5076,6 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             self._pending_game_lifecycle = None
             startup_task = getattr(self, "_startup_task", None)
             reconcile_task = getattr(self, "_config_reconcile_task", None)
-        self._ensure_query_ledger().clear()
         if (
             startup_task is not None
             and startup_task is not current_task
@@ -3480,9 +5218,6 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         ).strip()[:80]
         if isinstance(context, Mapping):
             target = str(context.get("lanlan_name") or "").strip()[:80]
-            if target and (not configured_target or target == configured_target):
-                with self._delivery_transition():
-                    self._session_target = target
         if target and (not configured_target or target == configured_target):
             with self._ownership_lock:
                 self._last_user_chat_at = time.time()
@@ -3509,20 +5244,14 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
 
     def _delivery_target(self) -> str:
         with self._ownership_lock:
-            configured = self._stable_target()
-            if configured:
-                return configured
-            captured = str(getattr(self, "_session_target", "") or "").strip()
-            if captured:
-                return captured[:80]
-            return ""
+            return self._stable_target()
 
     def _ensure_state_publisher(self) -> LiveStatePublisher:
         publisher = getattr(self, "_state_publisher", None)
         if publisher is None:
             publisher = LiveStatePublisher(
                 push_message=self._publish_sdk_message,
-                build_segments=build_atomic_live_state_segment,
+                build_segments=build_live_state_segments,
                 logger=getattr(self, "logger", None),
                 max_prompt_bytes=_LIVE_STATE_DELIVERY_MAX_BYTES,
                 refresh_seconds=_LIVE_STATE_REFRESH_SECONDS,
@@ -3644,10 +5373,6 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             if blocked or not source_snapshot_valid():
                 return False
 
-            cursor = self._ensure_state_publisher().cursor
-            if cursor is not None and cursor.game_number != snapshot.game_number:
-                self._ensure_query_ledger().clear()
-
             def delivery_valid() -> bool:
                 current_reason, _current_revision = _live_state_access(self)
                 with self._ownership_lock:
@@ -3696,9 +5421,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
 
     def _restore_context(self) -> bool:
         with self._delivery_guard():
-            self._ensure_query_ledger().clear()
             with self._ownership_lock:
-                self._session_target = ""
                 self._pending_game_lifecycle = None
             return self._expire_live_state(reason="context_invalidated")
 
@@ -3764,8 +5487,12 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
 
     @staticmethod
     def _game_lifecycle_key(target: str, identity: str) -> str:
-        target_digest = hashlib.sha256(target.encode("utf-8")).hexdigest()[:16]
-        return f"hearthstone:lifecycle:{target_digest}:{identity}"
+        owner = (
+            hashlib.sha256(target.encode("utf-8")).hexdigest()[:16]
+            if target
+            else "active-session"
+        )
+        return f"hearthstone:lifecycle:{owner}:{identity}"
 
     def _queue_game_lifecycle(
         self,
@@ -3832,6 +5559,15 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
     ) -> bool:
         if source_generation is None:
             return True
+        with self._ownership_lock:
+            monitor = getattr(self, "_monitor", None)
+        if monitor is None:
+            return False
+        # Monitors with the atomic generation guard validate immediately
+        # around push_message(). A zero-timeout capture here can lose a benign
+        # lock race and must not be treated as a changed log source.
+        if callable(getattr(monitor, "run_if_source_generation", None)):
+            return True
         return self._current_game_lifecycle_source_generation() == source_generation
 
     def _submit_game_lifecycle(
@@ -3856,13 +5592,44 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
 
             game_number = int(snapshot.game_number or event.details.get("game_number") or 0)
             if game_number <= 0:
+                _record_route_diagnostic(
+                    self,
+                    "lifecycle",
+                    status="ignored",
+                    reason="invalid_game_number",
+                    mode=snapshot.mode,
+                    focus=stage,
+                )
                 return False
             identity = f"{epoch}:{game_number}:{stage}"
 
             if hard_disabled:
+                reason = (
+                    "data_sharing_disabled"
+                    if not config.llm_data_consent
+                    else "plugin_not_running"
+                    if not getattr(self, "_started", False)
+                    else "monitor_dispatch_disabled"
+                )
+                _record_route_diagnostic(
+                    self,
+                    "lifecycle",
+                    status="disabled",
+                    reason=reason,
+                    mode=snapshot.mode,
+                    focus=stage,
+                )
                 self._clear_pending_game_lifecycle()
                 return False
             if snapshot.phase == "spectator":
+                _record_route_diagnostic(
+                    self,
+                    "lifecycle",
+                    status="ignored",
+                    reason="spectator_snapshot",
+                    mode=snapshot.mode,
+                    focus=stage,
+                )
                 self._clear_pending_game_lifecycle(expected=pending)
                 return False
             with self._ownership_lock:
@@ -3877,6 +5644,18 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     ):
                         return False
             if access_reason:
+                _record_route_diagnostic(
+                    self,
+                    "lifecycle",
+                    status=(
+                        "queued"
+                        if access_reason in _TRANSIENT_LIVE_STATE_ACCESS_REASONS
+                        else "blocked"
+                    ),
+                    reason=access_reason,
+                    mode=snapshot.mode,
+                    focus=stage,
+                )
                 if access_reason in _TRANSIENT_LIVE_STATE_ACCESS_REASONS:
                     self._queue_game_lifecycle(
                         stage=stage,
@@ -3891,11 +5670,27 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     self._clear_pending_game_lifecycle(expected=pending)
                 return False
             if not self._game_lifecycle_source_is_current(source_generation):
+                _record_route_diagnostic(
+                    self,
+                    "lifecycle",
+                    status="dropped",
+                    reason="source_generation_changed",
+                    mode=snapshot.mode,
+                    focus=stage,
+                )
                 self._clear_pending_game_lifecycle(expected=pending)
                 return False
             with self._ownership_lock:
                 pending_before_submit = getattr(self, "_pending_game_lifecycle", None)
                 if identity in getattr(self, "_game_lifecycle_sent", {}):
+                    _record_route_diagnostic(
+                        self,
+                        "lifecycle",
+                        status="deduplicated",
+                        reason="already_submitted",
+                        mode=snapshot.mode,
+                        focus=stage,
+                    )
                     if (
                         getattr(self, "_pending_game_lifecycle", None) is not None
                         and self._pending_game_lifecycle.identity == identity
@@ -3904,7 +5699,15 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     return False
 
             target = self._delivery_target()
-            if not target or not self._game_lifecycle_snapshot_ready(stage, snapshot):
+            if not self._game_lifecycle_snapshot_ready(stage, snapshot):
+                _record_route_diagnostic(
+                    self,
+                    "lifecycle",
+                    status="queued",
+                    reason="snapshot_not_ready",
+                    mode=snapshot.mode,
+                    focus=stage,
+                )
                 self._queue_game_lifecycle(
                     stage=stage,
                     identity=identity,
@@ -3938,6 +5741,14 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     "Hearthstone lifecycle prompt failed code=%s",
                     type(exc).__name__,
                 )
+                _record_route_diagnostic(
+                    self,
+                    "lifecycle",
+                    status="queued",
+                    reason="prompt_build_failed",
+                    mode=snapshot.mode,
+                    focus=stage,
+                )
                 self._queue_game_lifecycle(
                     stage=stage,
                     identity=identity,
@@ -3968,11 +5779,17 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     "privacy_scope": "player_visible_game_state",
                     "reply_contract": "single_short_line",
                     "max_reply_chars": config.llm_max_reply_chars,
+                    "routing_scope": (
+                        "configured_or_observed_role"
+                        if target
+                        else "single_connected_session_fallback"
+                    ),
                 },
                 "priority": event.priority,
-                "target_lanlan": target,
                 "coalesce_key": self._game_lifecycle_key(target, identity),
             }
+            if target:
+                kwargs["target_lanlan"] = target
             access_reason, _revision = _live_state_access(self)
             with self._ownership_lock:
                 delivery_hard_invalid = bool(
@@ -3984,6 +5801,26 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 )
             source_is_current = self._game_lifecycle_source_is_current(source_generation)
             if access_reason or delivery_hard_invalid or not source_is_current:
+                if access_reason:
+                    invalid_reason = access_reason
+                elif not source_is_current:
+                    invalid_reason = "source_generation_changed"
+                else:
+                    invalid_reason = "delivery_state_changed"
+                _record_route_diagnostic(
+                    self,
+                    "lifecycle",
+                    status=(
+                        "queued"
+                        if access_reason in _TRANSIENT_LIVE_STATE_ACCESS_REASONS
+                        and not delivery_hard_invalid
+                        and source_is_current
+                        else "dropped"
+                    ),
+                    reason=invalid_reason,
+                    mode=snapshot.mode,
+                    focus=stage,
+                )
                 if (
                     access_reason in _TRANSIENT_LIVE_STATE_ACCESS_REASONS
                     and not delivery_hard_invalid
@@ -4038,9 +5875,25 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 generation_current = False
                 submitted = False
             if not generation_current:
+                _record_route_diagnostic(
+                    self,
+                    "lifecycle",
+                    status="dropped",
+                    reason="source_generation_changed",
+                    mode=snapshot.mode,
+                    focus=stage,
+                )
                 self._clear_pending_game_lifecycle(expected=pending)
                 return False
             if not submitted:
+                _record_route_diagnostic(
+                    self,
+                    "lifecycle",
+                    status="rejected",
+                    reason="sdk_submission_rejected",
+                    mode=snapshot.mode,
+                    focus=stage,
+                )
                 self._queue_game_lifecycle(
                     stage=stage,
                     identity=identity,
@@ -4063,6 +5916,14 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 current_pending = getattr(self, "_pending_game_lifecycle", None)
                 if current_pending is pending_before_submit:
                     self._pending_game_lifecycle = None
+            _record_route_diagnostic(
+                self,
+                "lifecycle",
+                status="submitted",
+                reason="sdk_submission_accepted",
+                mode=snapshot.mode,
+                focus=stage,
+            )
             return True
 
     def _retry_pending_game_lifecycle(self) -> bool:
@@ -4158,382 +6019,13 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     )
             finally:
                 if snapshot.phase == "spectator" or leaving:
-                    try:
-                        self._ensure_query_ledger().clear()
-                    finally:
-                        self._expire_live_state(reason=event.kind)
+                    self._expire_live_state(reason=event.kind)
 
     @timer_interval(id="live_state_context_refresh", seconds=1, auto_start=True)
     async def live_state_context_refresh(self, **_: Any):
         self._sync_active_game_context()
         self._retry_pending_game_lifecycle()
         return Ok({"refreshed": True})
-
-    @staticmethod
-    def _user_context_payload(record: Any) -> Mapping[str, Any] | None:
-        # The public memory facade may wrap a MemoryRecord more than once
-        # (SdkBusMemoryRecord.payload["value"] -> MemoryRecord.raw). Follow
-        # only documented wrapper edges and keep the walk strictly bounded.
-        pending: list[tuple[Any, int]] = [(record, 0)]
-        seen: set[int] = set()
-        fallback: Mapping[str, Any] | None = None
-        while pending:
-            candidate, depth = pending.pop()
-            if candidate is None or depth > 6:
-                continue
-            identity = id(candidate)
-            if identity in seen:
-                continue
-            seen.add(identity)
-
-            if isinstance(candidate, Mapping):
-                message_type = str(candidate.get("type") or "").casefold()
-                if message_type == "user_message":
-                    if candidate.get("content") and candidate.get("lanlan"):
-                        return candidate
-                    fallback = fallback or candidate
-                for key in ("value", "raw", "payload"):
-                    if key in candidate:
-                        pending.append((candidate.get(key), depth + 1))
-                continue
-
-            for attribute in ("raw", "payload"):
-                try:
-                    wrapped = getattr(candidate, attribute, None)
-                except Exception:
-                    wrapped = None
-                if wrapped is not None:
-                    pending.append((wrapped, depth + 1))
-            try:
-                dump = getattr(candidate, "dump", None)
-            except Exception:
-                dump = None
-            if callable(dump):
-                try:
-                    pending.append((dump(), depth + 1))
-                except Exception:
-                    continue
-        return fallback
-
-    def _ensure_query_ledger(self) -> QueryLedger:
-        ledger = getattr(self, "_query_ledger", None)
-        if ledger is None:
-            ledger = QueryLedger()
-            self._query_ledger = ledger
-        return ledger
-
-    async def _read_recent_user_context(self) -> tuple[Any, ...]:
-        bus = getattr(getattr(self, "ctx", None), "bus", None)
-        memory = getattr(bus, "memory", None)
-        get_memory = getattr(memory, "get", None)
-        if not callable(get_memory):
-            return ()
-        kwargs = {
-            "bucket_id": "default",
-            "limit": 8,
-            "timeout": _USER_CONTEXT_READ_TIMEOUT_SECONDS,
-        }
-        if inspect.iscoroutinefunction(get_memory):
-            result = await get_memory(**kwargs)
-        else:
-            # The packaged SDK exposes memory.get as blocking ZeroMQ IPC.
-            # Keep it off the plugin event loop so timers and callbacks remain live.
-            result = await asyncio.to_thread(get_memory, **kwargs)
-        if inspect.isawaitable(result):
-            result = await result
-        is_err = getattr(result, "is_err", None)
-        if callable(is_err) and is_err():
-            return ()
-        is_ok = getattr(result, "is_ok", None)
-        if callable(is_ok) and is_ok():
-            result = getattr(result, "value", result)
-        try:
-            return tuple(result)
-        except TypeError:
-            return ()
-
-    def _observe_user_context(self, records: tuple[Any, ...]) -> int:
-        observed: list[tuple[float, str, str, bool]] = []
-        configured_target = self._stable_target()
-        for record in records:
-            try:
-                payload = self._user_context_payload(record)
-            except Exception:
-                continue
-            if payload is None:
-                continue
-            text = normalize_query_text(payload.get("content"), limit=240)
-            target = str(payload.get("lanlan") or "").strip()[:80]
-            if not text or not target:
-                continue
-            try:
-                source_timestamp = float(payload.get("_ts") or 0.0)
-            except (TypeError, ValueError):
-                source_timestamp = 0.0
-            if not math.isfinite(source_timestamp) or source_timestamp <= 0:
-                continue
-            observed.append(
-                (
-                    source_timestamp,
-                    target,
-                    text,
-                    not configured_target or target == configured_target,
-                )
-            )
-
-        observed.sort(key=lambda item: item[0])
-        ledger = self._ensure_query_ledger()
-        accepted = 0
-        query_observations: list[tuple[float, str, str, str]] = []
-        for source_timestamp, target, text, target_allowed in observed:
-            if not target_allowed:
-                continue
-            signature = ledger.signature(text, target)
-            with self._delivery_transition():
-                watermark = float(
-                    getattr(self, "_last_user_context_timestamp", 0.0) or 0.0
-                )
-                watermark_signatures = set(
-                    getattr(self, "_last_user_context_signatures", set()) or set()
-                )
-                if source_timestamp < watermark or (
-                    source_timestamp == watermark
-                    and signature in watermark_signatures
-                ):
-                    is_new = False
-                else:
-                    is_new = True
-                    if source_timestamp > watermark:
-                        watermark_signatures = {signature}
-                    else:
-                        watermark_signatures.add(signature)
-                    self._last_user_context_timestamp = source_timestamp
-                    self._last_user_context_signatures = watermark_signatures
-                if is_new and target_allowed:
-                    self._session_target = target
-                    self._last_user_chat_at = max(
-                        float(getattr(self, "_last_user_chat_at", 0.0) or 0.0),
-                        source_timestamp,
-                    )
-            if not is_new:
-                continue
-            accepted += 1
-            intent = classify_live_query(text)
-            if intent is not None:
-                query_observations.append(
-                    (source_timestamp, target, text, intent.focus)
-                )
-        # A memory window may contain an older and the current identical
-        # utterance when a role-scoped Agent has already created a provisional
-        # claim. Bind the newest record first; older replay then cannot steal it.
-        for source_timestamp, target, text, intent in reversed(query_observations):
-            ledger.observe(
-                text,
-                target=target,
-                source_timestamp=source_timestamp,
-                intent=intent,
-            )
-        return accepted
-
-    @staticmethod
-    def _live_query_key(target: str, signature: str) -> str:
-        owner = hashlib.sha256(target.encode("utf-8")).hexdigest()[:16]
-        return f"hearthstone:query:{owner}:{signature[:16]}"
-
-    async def _dispatch_live_query_fallback(self, claim: Any) -> bool:
-        ledger = self._ensure_query_ledger()
-        acquired = ledger.claim(
-            owner="fallback",
-            text=claim.text,
-            target=claim.target,
-        )
-        if acquired is None:
-            return False
-
-        try:
-            access_reason, transition_revision = _live_state_access(self)
-            with self._ownership_lock:
-                lifecycle_generation = int(
-                    getattr(self, "_lifecycle_generation", 0) or 0
-                )
-                expected_monitor = getattr(self, "_monitor", None)
-                blocked = bool(
-                    access_reason
-                    or not getattr(self, "_started", False)
-                    or not getattr(self, "_monitor_dispatch_enabled", False)
-                    or (
-                        self._stable_target()
-                        and self._stable_target() != acquired.target
-                    )
-                )
-            if blocked or not acquired.target:
-                ledger.release(acquired, owner="fallback")
-                return False
-
-            intent = classify_live_query(acquired.text)
-            if intent is None:
-                ledger.release(acquired, owner="fallback")
-                return False
-            selected_mode, payload = await self._resolve_live_query_payload(
-                mode=intent.mode_hint,
-                topic="current_strategy",
-            )
-            selected_focus = intent.focus
-            if (
-                selected_mode == "constructed"
-                and selected_focus not in _CONSTRUCTED_TOOL_FOCUSES
-            ):
-                selected_focus = "strategy"
-            if (
-                selected_mode == "battlegrounds"
-                and selected_focus not in _BATTLEGROUNDS_TOOL_FOCUSES
-            ):
-                selected_focus = "strategy"
-            focused = _focused_llm_tool_result(
-                payload,
-                mode=selected_mode,
-                focus=selected_focus,
-                opponent_relation=intent.opponent_relation,
-            )
-            encoded = json.dumps(
-                focused,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            prefix = (
-                f"{HEARTHSTONE_CONTEXT_INSTRUCTIONS}\n\n"
-                "# 当前炉石问题\n"
-                f"{{MASTER_NAME}}刚刚问：{acquired.text}\n"
-                "请直接依据下面这一刻的公开状态回答；不要说正在查询或提到插件。"
-                "若 available=false 或证据不完整，明确说明缺什么，不得用旧局势补猜。\n"
-                "当前聚焦状态 JSON："
-            )
-            if len(prefix) + len(encoded) > _LIVE_QUERY_FALLBACK_MAX_CHARS:
-                reduced = {
-                    "format": focused.get("format"),
-                    "mode": focused.get("mode"),
-                    "focus": focused.get("focus"),
-                    "available": focused.get("available"),
-                    "reason": focused.get("reason"),
-                    "views": list(focused.get("views") or ())[:1],
-                    "truncated": True,
-                }
-                encoded = json.dumps(
-                    reduced,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-            kwargs: dict[str, Any] = {
-                "visibility": [],
-                "ai_behavior": "respond",
-                "parts": [{"type": "text", "text": prefix + encoded}],
-                "source": "hearthstone_companion",
-                "metadata": {
-                    "kind": "live_query_fallback",
-                    "context_type": "hearthstone_companion_live_query",
-                    "privacy_scope": "filtered_player_visible_live_state",
-                    "query_signature": acquired.signature[:16],
-                    "focus": selected_focus,
-                    "mode": selected_mode,
-                },
-                "priority": 7,
-                "coalesce_key": self._live_query_key(
-                    acquired.target,
-                    acquired.signature,
-                ),
-                "target_lanlan": acquired.target,
-            }
-            with self._delivery_guard():
-                current_reason, _current_revision = _live_state_access(
-                    self,
-                    expected_transition_revision=transition_revision,
-                )
-                with self._ownership_lock:
-                    delivery_still_valid = not bool(
-                        current_reason
-                        or not ledger.owns(acquired, owner="fallback")
-                        or not getattr(self, "_started", False)
-                        or not getattr(self, "_monitor_dispatch_enabled", False)
-                        or int(getattr(self, "_lifecycle_generation", 0) or 0)
-                        != lifecycle_generation
-                        or getattr(self, "_monitor", None) is not expected_monitor
-                        or (
-                            self._stable_target()
-                            and self._stable_target() != acquired.target
-                        )
-                    )
-                if not delivery_still_valid:
-                    ledger.release(acquired, owner="fallback")
-                    return False
-                submitted = ledger.commit(
-                    acquired,
-                    owner="fallback",
-                    submit=lambda: _submitted(self.push_message(**kwargs)),
-                )
-            if not submitted:
-                ledger.release(acquired, owner="fallback")
-            return submitted
-        except asyncio.CancelledError:
-            ledger.release(acquired, owner="fallback")
-            raise
-        except Exception as exc:
-            ledger.release(acquired, owner="fallback")
-            self.logger.warning(
-                "Hearthstone live-query fallback failed code=%s",
-                type(exc).__name__,
-            )
-            return False
-
-    @timer_interval(id="live_query_watch", seconds=1, auto_start=True)
-    async def live_query_watch(self, **_: Any):
-        access_reason, _transition_revision = _live_state_access(self)
-        if access_reason:
-            self._ensure_query_ledger().clear()
-            return Ok(
-                {
-                    "observed": 0,
-                    "pending_queries": 0,
-                    "fallback_submitted": False,
-                }
-            )
-        try:
-            records = await self._read_recent_user_context()
-            observed = self._observe_user_context(records)
-        except Exception as exc:
-            self.logger.debug(
-                "Hearthstone user-context read unavailable code=%s",
-                type(exc).__name__,
-            )
-            return Ok({"observed": 0, "fallback_submitted": False})
-
-        now = time.time()
-        pending = self._ensure_query_ledger().pending(
-            now=now,
-            min_age=_LIVE_QUERY_FALLBACK_DELAY_SECONDS,
-        )
-        submitted = False
-        for claim in reversed(pending):
-            age = now - claim.source_timestamp
-            if age > _LIVE_QUERY_FALLBACK_MAX_AGE_SECONDS:
-                self._ensure_query_ledger().claim(
-                    owner="expired",
-                    text=claim.text,
-                    target=claim.target,
-                    now=now,
-                )
-                continue
-            submitted = await self._dispatch_live_query_fallback(claim)
-            if submitted:
-                break
-        return Ok(
-            {
-                "observed": observed,
-                "pending_queries": len(pending),
-                "fallback_submitted": submitted,
-            }
-        )
 
     def _sync_active_game_context(self) -> None:
         access_reason, transition_revision = _live_state_access(self)
@@ -4610,8 +6102,6 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 ):
                     return False
             target = self._delivery_target()
-            if not target:
-                return False
             terminal = event.kind in {"battlegrounds_game_ended", "game_ended"}
             heading = "# 本次终局事件" if terminal else "# 本次公开事件"
             prompt_budget = (
@@ -4645,6 +6135,11 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     "privacy_scope": "player_visible_game_state",
                     "reply_contract": "single_short_line",
                     "max_reply_chars": config.llm_max_reply_chars,
+                    "routing_scope": (
+                        "configured_or_observed_role"
+                        if target
+                        else "single_connected_session_fallback"
+                    ),
                 },
                 "priority": event.priority,
             }
@@ -4669,7 +6164,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
 
     def _dashboard_state(self) -> dict[str, Any]:
         monitor = self._ensure_monitor()
-        snapshot, status, _generation = _capture_monitor(monitor)
+        snapshot, status, generation = _capture_monitor(monitor)
         runtime = status.to_dict()
         game = snapshot.to_public_dict()
         stats_store_error = self._stats_store_error_code
@@ -4682,6 +6177,11 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         return {
             "runtime": runtime,
             "game": game,
+            "diagnostics": self._diagnostic_health(
+                snapshot,
+                status,
+                source_generation=generation,
+            ),
             "overlay": self._overlay.status(),
             "card_catalog": self._catalog_status(),
             "settings": self.cfg.public_dict(),
@@ -4719,6 +6219,193 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             "battlegrounds_season": dict(self._season),
         }
 
+    @staticmethod
+    def _diagnostic_age(value: Any, *, now: float) -> float | None:
+        try:
+            timestamp = float(value or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(timestamp) or timestamp <= 0:
+            return None
+        return round(max(0.0, now - timestamp), 3)
+
+    def _diagnostic_health(
+        self,
+        snapshot: GameSnapshot,
+        status: Any,
+        *,
+        source_generation: int,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        captured_at = time.time() if now is None else float(now)
+        state_age = self._diagnostic_age(
+            getattr(status, "last_state_at", 0.0),
+            now=captured_at,
+        )
+        line_age = self._diagnostic_age(
+            getattr(status, "last_line_at", 0.0),
+            now=captured_at,
+        )
+        active_snapshot = bool(
+            snapshot.game_number > 0
+            and snapshot.phase not in {"idle", "ended", "spectator"}
+        )
+        source_state = str(getattr(status, "source_state", "unknown") or "unknown")
+        log_fresh = bool(
+            getattr(status, "monitor_running", False)
+            and source_state == "watching"
+            and active_snapshot
+            and state_age is not None
+            and state_age <= LIVE_STATE_MAX_AGE_SECONDS
+        )
+        current_round = (
+            snapshot.battlegrounds.round
+            if snapshot.battlegrounds is not None
+            else snapshot.round
+        )
+        tracker = self._ensure_diagnostics().snapshot()
+        health_lock = getattr(self, "_llm_tool_health_lock", None)
+        if health_lock is None:
+            health_lock = threading.Lock()
+            self._llm_tool_health_lock = health_lock
+            self._llm_tool_health_in_flight = False
+            self._llm_tool_health_failures = 0
+            self._llm_tool_health_next_attempt_at = 0.0
+        with health_lock:
+            retry_after = max(
+                0.0,
+                float(self._llm_tool_health_next_attempt_at or 0.0)
+                - time.monotonic(),
+            )
+            check_in_flight = bool(self._llm_tool_health_in_flight)
+        tool_registration = dict(tracker["tool_registration"])
+        tool_registration.update(
+            {
+                "check_in_flight": check_in_flight,
+                "retry_after_seconds": round(retry_after, 3),
+            }
+        )
+        return {
+            "captured_at": captured_at,
+            "log": {
+                "fresh": log_fresh,
+                "line_age_seconds": line_age,
+                "state_age_seconds": state_age,
+                "freshness_limit_seconds": LIVE_STATE_MAX_AGE_SECONDS,
+            },
+            "snapshot": {
+                "source_generation": int(source_generation or 0),
+                "revision": int(getattr(status, "snapshot_revision", 0) or 0),
+                "mode": snapshot.mode,
+                "phase": snapshot.phase,
+                "game_number": snapshot.game_number,
+                "round": int(current_round or 0),
+            },
+            "tool_registration": tool_registration,
+            "routes": tracker["routes"],
+        }
+
+    @staticmethod
+    def _diagnostic_area_summary(snapshot: GameSnapshot) -> dict[str, Any]:
+        battlegrounds = snapshot.battlegrounds
+        if battlegrounds is None:
+            constructed = snapshot.constructed
+            if constructed is None:
+                return {}
+            return {
+                "player_board_count": len(constructed.player.board),
+                "opponent_board_count": len(constructed.opponent.board),
+                "own_visible_hand_count": len(constructed.player.known_hand),
+                "own_hand_identities_complete": bool(
+                    constructed.player.hand_identities_complete
+                ),
+            }
+
+        result: dict[str, Any] = {}
+        cards_by_area = {
+            "shop": battlegrounds.shop,
+            "hand": battlegrounds.hand,
+            "warband": battlegrounds.warband,
+        }
+        for name in ("shop", "hand", "warband", "economy", "choice"):
+            area = battlegrounds.areas.get(name)
+            if area is None:
+                continue
+            summary = {
+                "complete": bool(area.complete),
+                "revision": int(area.revision),
+                "round": int(area.round),
+                "phase": area.phase,
+            }
+            if name in cards_by_area:
+                summary["card_count"] = len(cards_by_area[name])
+            result[name] = summary
+        return result
+
+    def _sanitized_diagnostic_report(self) -> dict[str, Any]:
+        monitor = self._ensure_monitor()
+        snapshot, status, generation = _capture_monitor(monitor)
+        generated_at = time.time()
+        health = self._diagnostic_health(
+            snapshot,
+            status,
+            source_generation=generation,
+            now=generated_at,
+        )
+        resolved_log_path = str(getattr(status, "resolved_log_path", "") or "")
+        return {
+            "schema": _DIAGNOSTIC_SCHEMA,
+            "plugin_version": _PLUGIN_VERSION,
+            "generated_at": generated_at,
+            "runtime": {
+                "monitor_running": bool(getattr(status, "monitor_running", False)),
+                "source_state": str(getattr(status, "source_state", "unknown") or "unknown"),
+                "log_file_detected": bool(resolved_log_path),
+                "lines_seen": int(getattr(status, "lines_seen", 0) or 0),
+                "events_seen": int(getattr(status, "events_seen", 0) or 0),
+                "llm_submissions": int(getattr(status, "llm_submissions", 0) or 0),
+                "last_error_code": sanitize_diagnostic_code(
+                    getattr(status, "last_error_code", "")
+                ),
+            },
+            "health": health,
+            "public_area_summary": self._diagnostic_area_summary(snapshot),
+            "delivery": {
+                "passive_context_submitted": bool(self._live_state_shared),
+                "passive_context_targeted": bool(self._live_state_target),
+                "passive_context_segments": len(self._live_state_segments),
+                "passive_context_game_number": int(self._live_state_game_number),
+                "passive_context_submitted_at": float(self._live_state_published_at),
+            },
+            "settings": {
+                "public_state_sharing_enabled": bool(self.cfg.llm_data_consent),
+                "do_not_disturb_enabled": bool(self.cfg.llm_do_not_disturb),
+                "fixed_target_configured": bool(self.cfg.target_lanlan),
+                "card_catalog_network_enabled": bool(
+                    self.cfg.card_catalog_network_enabled
+                ),
+            },
+            "configuration": {
+                "revision": int(getattr(self, "_config_revision", 0)),
+                "reconciled_revision": int(
+                    getattr(self, "_config_reconciled_revision", 0)
+                ),
+                "restart_required": bool(
+                    getattr(self, "_config_restart_required", False)
+                ),
+                "runtime_error_codes": [
+                    code
+                    for code in (
+                        sanitize_diagnostic_code(value)
+                        for value in tuple(
+                            getattr(self, "_config_runtime_error_codes", ())
+                        )[:8]
+                    )
+                    if code
+                ],
+            },
+        }
+
     def _catalog_status(self) -> dict[str, Any]:
         catalog = getattr(self, "_catalog", None)
         if catalog is None:
@@ -4734,6 +6421,54 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
     @ui.context(id="dashboard", title=tr("panel.title", default="炉石猫娘陪玩"))
     async def dashboard_context(self):
         return self._dashboard_state()
+
+    @ui.action(
+        id="export_diagnostics",
+        label=tr("actions.export_diagnostics.label", default="导出脱敏诊断"),
+        tone="info",
+        refresh_context=False,
+    )
+    @plugin_entry(
+        id="export_diagnostics",
+        name=tr("entries.export_diagnostics.name", default="导出炉石陪玩脱敏诊断"),
+        description=tr(
+            "entries.export_diagnostics.description",
+            default="导出不含日志路径、玩家身份、角色名和原始问题的运行诊断。",
+        ),
+        input_schema={"type": "object", "properties": {}},
+        metadata={"agent_auto": False},
+    )
+    async def export_diagnostics(self, **_: Any):
+        report = self._sanitized_diagnostic_report()
+        content = json.dumps(
+            report,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        ).encode("utf-8")
+        export_lock = getattr(self, "_diagnostic_export_lock", None)
+        if export_lock is None:
+            export_lock = threading.Lock()
+            self._diagnostic_export_lock = export_lock
+        with export_lock:
+            path = Path(
+                self.data_path(
+                    "diagnostics",
+                    "hearthstone-diagnostics.json",
+                )
+            )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(".json.tmp")
+            temporary.write_bytes(content)
+            os.replace(temporary, path)
+        return Ok(
+            {
+                "path": str(path.resolve()),
+                "content_type": "application/json; charset=utf-8",
+                "filename": path.name,
+                "size_bytes": len(content),
+            }
+        )
 
     @ui.action(
         id="start_monitoring",
@@ -4960,6 +6695,22 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             raise RuntimeError(f"settings config read-back mismatch: {', '.join(sorted(mismatched))}")
         return confirmed
 
+    async def _reconcile_superseded_settings_persist(
+        self,
+        *,
+        max_attempts: int = 3,
+    ) -> CompanionConfig:
+        for _attempt in range(max_attempts):
+            with self._ownership_lock:
+                revision = int(getattr(self, "_config_revision", 0))
+                latest = self.cfg
+            await self._persist_settings_config(latest.to_dict())
+            with self._ownership_lock:
+                if int(getattr(self, "_config_revision", 0)) == revision:
+                    self._config_persist_reconcile_error_code = ""
+                    return latest
+        raise RuntimeError("settings config kept changing during reconciliation")
+
     @ui.action(
         id="save_settings",
         label=tr("actions.save_settings.label", default="保存设置"),
@@ -5023,7 +6774,8 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             if llm_data_consent is not None:
                 settings_privacy_revision += 1
                 self._consent_request_revision = settings_privacy_revision
-                self._consent_revocation_pending = llm_data_consent is False
+                if llm_data_consent is False:
+                    self._consent_revocation_pending = True
             requested_consent_revocation = bool(
                 llm_data_consent is False and self.cfg.llm_data_consent
             )
@@ -5065,6 +6817,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             context_restored = True
             updated = previous
             config_superseded = False
+            persist_reconcile_failed = False
             try:
                 fail_closed_monitor: CompanionMonitor | None = None
                 fail_closed_monitor_config: CompanionConfig | None = None
@@ -5133,7 +6886,33 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                         self.cfg = updated
                         if not updated.llm_data_consent:
                             self._pending_game_lifecycle = None
+                if config_superseded:
+                    try:
+                        updated = await self._reconcile_superseded_settings_persist()
+                    except Exception as exc:
+                        persist_reconcile_failed = True
+                        persist_error_code = (
+                            f"config_persist_reconcile:{type(exc).__name__}"
+                        )
+                        runtime_errors.append(persist_error_code)
+                        with self._ownership_lock:
+                            self._config_persist_reconcile_error_code = (
+                                persist_error_code
+                            )
+                        self.logger.warning(
+                            "Superseded Hearthstone settings reconciliation failed code=%s",
+                            type(exc).__name__,
+                        )
                 if not config_superseded:
+                    with self._ownership_lock:
+                        if (
+                            llm_data_consent is not None
+                            and int(getattr(self, "_consent_request_revision", 0))
+                            == settings_privacy_revision
+                            and updated.llm_data_consent is llm_data_consent
+                        ):
+                            self._consent_revocation_pending = False
+                            self._config_persist_reconcile_error_code = ""
                     try:
                         self._update_monitor_config(self._ensure_monitor(), updated)
                     except Exception as exc:
@@ -5180,13 +6959,22 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                         transition_revision
                     ):
                         self._settings_transition = False
-                    if (
-                        llm_data_consent is False
-                        and int(getattr(self, "_consent_request_revision", 0))
-                        == settings_privacy_revision
-                    ):
-                        self._consent_revocation_pending = False
                 self._sync_active_game_context()
+        if config_superseded:
+            with self._ownership_lock:
+                self._config_runtime_error_codes = tuple(runtime_errors)
+                self._config_restart_required = persist_reconcile_failed
+            if persist_reconcile_failed:
+                return Err(
+                    SdkError(
+                        "settings changed concurrently and persistent config reconciliation failed; retry the save"
+                    )
+                )
+            return Err(
+                SdkError(
+                    "settings changed concurrently; the latest host config was preserved, retry the save"
+                )
+            )
         if runtime_errors:
             with self._ownership_lock:
                 self._config_runtime_error_codes = tuple(runtime_errors)
@@ -5418,14 +7206,14 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             configured_target
             and context_target != configured_target
         ):
+            _record_route_diagnostic(self,
+                "agent", status="rejected", reason="target_mismatch"
+            )
             return await self.finish(
                 data={"reply": "", "status": "target_mismatch"},
                 delivery="silent",
                 meta={"agent": {"result_kind": "event", "delivery": "silent"}},
             )
-        if context_target:
-            with self._delivery_transition():
-                self._session_target = context_target
         explicit_selection = bool(
             focus != "auto"
             or mode != "auto"
@@ -5433,24 +7221,11 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             or opponent_relation != "auto"
         )
         if not query_text and not explicit_selection:
+            _record_route_diagnostic(self,
+                "agent", status="rejected", reason="query_correlation_required"
+            )
             return await self.finish(
                 data={"reply": "", "status": "query_correlation_required"},
-                delivery="silent",
-                meta={"agent": {"result_kind": "event", "delivery": "silent"}},
-            )
-        ledger = self._ensure_query_ledger() if context_target else None
-        acquired_claim = None
-        if ledger is not None and query_text:
-            acquired_claim = ledger.claim(
-                owner="agent",
-                text=query_text,
-                target=context_target,
-                preempt_owners=("fallback",),
-                new_if_handled=True,
-            )
-        if ledger is not None and query_text and acquired_claim is None:
-            return await self.finish(
-                data={"reply": "", "status": "query_already_handled"},
                 delivery="silent",
                 meta={"agent": {"result_kind": "event", "delivery": "silent"}},
             )
@@ -5474,7 +7249,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 focus=focus,
                 opponent_relation=opponent_relation,
             )
-            return await self.finish(
+            result = await self.finish(
                 data={"reply": reply, "payload": payload},
                 delivery="proactive",
                 meta={
@@ -5485,9 +7260,27 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                     }
                 },
             )
-        except BaseException:
-            if ledger is not None and acquired_claim is not None:
-                ledger.release(acquired_claim, owner="agent")
+            _record_route_diagnostic(self,
+                "agent",
+                status="callback_succeeded",
+                reason="proactive_result_returned",
+                mode=selected_mode,
+                focus=focus,
+                fact_sha256=canonical_fact_fingerprint(reply),
+            )
+            return result
+        except BaseException as exc:
+            _record_route_diagnostic(self,
+                "agent",
+                status="cancelled" if isinstance(exc, asyncio.CancelledError) else "failed",
+                reason=(
+                    "task_cancelled"
+                    if isinstance(exc, asyncio.CancelledError)
+                    else f"exception:{type(exc).__name__}"
+                ),
+                mode=locals().get("selected_mode", ""),
+                focus=focus,
+            )
             raise
 
     @llm_tool(
@@ -5496,6 +7289,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             "用户询问当前/现在/第几回合、回合数、轮到谁或谁的回合时调用。"
             "这是无参数实时查询，返回此刻玩家可见快照中的 round、行动方和 phase；"
             "回答第几回合必须使用 round，不能把 action_turn 当作回合数。"
+            "工具成功结果是可直接回答的实时事实文本，最终回答必须以其中的完整回合数为准。"
         ),
         parameters={
             "type": "object",
@@ -5505,11 +7299,32 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
         timeout=5.0,
     )
     async def hearthstone_current_turn(self, **_: Any) -> dict[str, Any]:
-        selected_mode, payload = await self._resolve_live_query_payload(
-            mode="auto",
-            topic="current_strategy",
-        )
-        return _current_turn_llm_tool_result(payload, mode=selected_mode)
+        try:
+            selected_mode, payload = await self._resolve_live_query_payload(
+                mode="auto",
+                topic="current_strategy",
+            )
+            result = _current_turn_llm_tool_result(payload, mode=selected_mode)
+            _record_route_diagnostic(self,
+                "llm_tool",
+                status="callback_succeeded",
+                reason=("state_available" if result.get("available") else str(result.get("reason") or "state_unavailable")),
+                mode=selected_mode,
+                focus="round",
+            )
+            return _model_text_tool_result(result)
+        except BaseException as exc:
+            _record_route_diagnostic(self,
+                "llm_tool",
+                status="cancelled" if isinstance(exc, asyncio.CancelledError) else "failed",
+                reason=(
+                    "task_cancelled"
+                    if isinstance(exc, asyncio.CancelledError)
+                    else f"exception:{type(exc).__name__}"
+                ),
+                focus="round",
+            )
+            raise
 
     @llm_tool(
         name="hearthstone_live_state",
@@ -5517,7 +7332,9 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             "用户询问当前炉石传说或酒馆战棋的双方场面、手牌、Choice、商店、酒馆法术、"
             "战团、金币、实际费用、升本、刷新、冻结、对手、买什么、怎么出牌或怎么站位时调用。"
             "只问回合数或轮到谁时改用 hearthstone_current_turn。query 可省略；若传入，"
-            "应使用用户原问题，插件会自动识别模式和聚焦。"
+            "应使用用户原问题，插件会自动识别模式和聚焦。工具成功结果是可直接回答的"
+            "实时事实文本；其中每组 CardID、实际费用、金色和关键词"
+            "不得省略或猜测。"
         ),
         parameters={
             "type": "object",
@@ -5549,27 +7366,67 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 mode = intent.mode_hint
             if opponent_relation == "auto":
                 opponent_relation = intent.opponent_relation
-        selected_mode, payload = await self._resolve_live_query_payload(
-            mode=mode,
-            topic=topic,
-        )
+        selected_mode = ""
         selected_focus = focus if focus != "auto" else "strategy"
-        if (
-            selected_mode == "constructed"
-            and selected_focus not in _CONSTRUCTED_TOOL_FOCUSES
-        ):
-            selected_focus = "strategy"
-        if (
-            selected_mode == "battlegrounds"
-            and selected_focus not in _BATTLEGROUNDS_TOOL_FOCUSES
-        ):
-            selected_focus = "strategy"
-        return _focused_llm_tool_result(
-            payload,
-            mode=selected_mode,
-            focus=selected_focus,
-            opponent_relation=opponent_relation,
-        )
+        try:
+            selected_mode, payload = await self._resolve_live_query_payload(
+                mode=mode,
+                topic=topic,
+            )
+            if (
+                selected_mode == "constructed"
+                and selected_focus not in _CONSTRUCTED_TOOL_FOCUSES
+            ):
+                selected_focus = "strategy"
+            if (
+                selected_mode == "battlegrounds"
+                and selected_focus not in _BATTLEGROUNDS_TOOL_FOCUSES
+            ):
+                selected_focus = "strategy"
+            result = _focused_llm_tool_result(
+                payload,
+                mode=selected_mode,
+                focus=selected_focus,
+                opponent_relation=opponent_relation,
+            )
+            _record_route_diagnostic(self,
+                "llm_tool",
+                status="callback_succeeded",
+                reason=("state_available" if result.get("available") else str(result.get("reason") or "state_unavailable")),
+                mode=selected_mode,
+                focus=selected_focus,
+            )
+            return _model_text_tool_result(
+                result,
+                output=_focused_model_output(
+                    payload,
+                    result,
+                    mode=selected_mode,
+                    focus=selected_focus,
+                    opponent_relation=opponent_relation,
+                    include_advice=(
+                        not query_text or requests_live_advice(query_text)
+                    ),
+                    include_catalog_rules=(
+                        not query_text
+                        or requests_live_advice(query_text)
+                        or requests_live_rules(query_text)
+                    ),
+                ),
+            )
+        except BaseException as exc:
+            _record_route_diagnostic(self,
+                "llm_tool",
+                status="cancelled" if isinstance(exc, asyncio.CancelledError) else "failed",
+                reason=(
+                    "task_cancelled"
+                    if isinstance(exc, asyncio.CancelledError)
+                    else f"exception:{type(exc).__name__}"
+                ),
+                mode=selected_mode,
+                focus=selected_focus,
+            )
+            raise
 
     async def hearthstone_current_state(
         self, focus: str | None = None, **_: Any

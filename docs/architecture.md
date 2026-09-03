@@ -6,8 +6,8 @@ N.E.K.O 的核心是关系与陪伴。插件负责理解游戏现场，不负责
 
 1. 本地层只做公开事实提炼、情绪信号、节奏仲裁和隐私过滤；
 2. 所有主动可见台词由当前 N.E.K.O 角色通过 `ai_behavior="respond"` 生成；
-3. 新鲜对局只在本机维护一份权威状态；单条原子 `read` 快照以固定 `coalesce_key` 持续覆盖当前会话，同轮 `@llm_tool` 查询提供更完整、按问题聚焦的事实；
-4. `bus.memory` 只识别最近明确的炉石问题和实际角色，未被可信角色级 Agent 认领时才定向触发一次 `respond` 兜底；无角色工具只读快照，不抑制定向兜底；
+3. 新鲜对局只在本机维护一份权威状态；逻辑原子的同 revision `part=i/n` 被动分段包以每个 segment 独立的稳定 `coalesce_key` 持续覆盖当前会话，同轮 `@llm_tool` 查询提供更完整、按问题聚焦的事实；
+4. 普通问答可使用新鲜、完整、同 revision 的被动分段包、官方 `@llm_tool` 同轮 callback 或 Agent 入口；工具 callback 没有可信角色、会话或 turn 身份，插件不会另发 tool-result `respond`；
 5. 面板和独立浮层只承担透明诊断，不参与自动陪伴输出。
 
 ```text
@@ -30,12 +30,7 @@ CompanionMonitor single-owner pipeline
         +--> authoritative immutable snapshot
                              |
                              +--> current_turn/live_state @llm_tool --> current NEKO turn
-                             +--> query_hearthstone_live_state Agent --> post-turn fallback
-
-Recent user utterance --> bus.memory bounded polling --> explicit Hearthstone intent
-        |
-        +--> role/query ledger --> unclaimed after delay --> targeted [] + respond
-        +--> claimed by role-scoped Agent ---------------> no duplicate fallback
+                             +--> query_hearthstone_live_state Agent --> Agent result
 
 Constructed or Battlegrounds question --> same-turn dedicated live tool
         |
@@ -49,7 +44,11 @@ hsbg.cards public API --> fixed-origin background GET --> atomic cache --> obser
 
 `PowerLogTailer` 以 100 ms 周期增量跟随最新 `Power.log`，处理轮换、截断和首次接入上限。首次恢复默认且最多读取末尾 64 MiB，并从窗口内最新的完整 `GameState CREATE_GAME` 边界开始，兼容 LF 与 CRLF；恢复字节只在本机逐行解析，不会进入模型请求。`PowerLogParser` 解析实体和 tag 变化，`CompanionMonitor` 是状态唯一写入者；UI、工具和统计只取得不可变快照。LLM 工具对监控锁使用 50 ms 有界读取：大日志初始化尚未提交完整快照时立即 fail-closed 为 `state_refresh_in_progress`，不会等待到宿主 5 秒超时，也不会退回上一代来源。Hosted UI 打开时每 500 ms 串行拉取一次不可变状态，刷新失败不会覆盖用户尚未保存的草稿。
 
-每次日志换源、读取器重建或停止后重启都会进入新的 source generation，并清空上一代的行/事件时间。bootstrap 只恢复当前公开状态，不重放主动解说、终局事件或统计；日志超过实时窗口或活动对局切入旁观后，查询会 fail-closed，只有同一代来源重新出现新鲜的活动对局数据才恢复。工具、Agent 和定向兜底使用同一套新鲜度判定，并以不可变 `GameSnapshot` 的实际变化时间为准；无关日志增长只更新 `last_line_at`，不会给旧商店或旧战团续命。
+每次日志换源、读取器重建或停止后重启都会进入新的 source generation，并清空上一代的行/事件时间。bootstrap 只恢复当前公开状态，不重放主动解说、终局事件或统计；日志超过实时窗口或活动对局切入旁观后，查询会 fail-closed，只有同一代来源重新出现新鲜的活动对局数据才恢复。工具和 Agent 使用同一套新鲜度判定，并以不可变 `GameSnapshot` 的实际变化时间为准；无关日志增长只更新 `last_line_at`，不会给旧商店或旧战团续命。
+
+监控状态维护单调的 `snapshot_revision`：只有权威 `GameSnapshot` 实际变化时递增，换 source generation 时归零。Hosted UI 以 source generation、revision、状态年龄，以及工具、Agent 和生命周期的稳定状态码展示链路证据。诊断导出复用同一不可变快照，只输出 allowlist 中的计数、完整度和状态码；它不增加新的 LLM 工具或查询路径。
+
+开发验证分成两层：精确真实日志检查点直接运行生产解析器和两个工具 serializer；隔离 E2E 再由正式插件子进程注册同一内存快照的官方工具，并用浏览器观察真实模型回答。官方注册表、精确一次 callback、被动包完整性、生命周期提交、环境稳定和资源清理组成 source-bound 发布证据；模型是否选择工具、最终回答是否完整则单独记录为诊断，不参与 tag 门禁。该探针不修改宿主源码、磁盘配置、已安装插件或运行时查询架构，只连接已确认的隔离实例，并在结束时清理正式插件子进程和临时文件。
 
 实时链路按日志职责合并而不是二选一：`PowerTaskList.DebugPrintPower` 是动态实体、tag 和 block 的权威实时流；`GameState.DebugPrintGame` 提供模式元数据；`GameState.DebugPrintPower` 只提供最早的新局边界、受限静态实体补全和 `STATE=COMPLETE`/终局 `PLAYSTATE`。新局静态包先进入隔离暂存区，直到 PowerTaskList 确认 `CREATE_GAME` 后才提交；进行中的静态补全只能填空，不能覆盖 PowerTaskList 已观察字段，也不能恢复被 `HIDE_ENTITY` 撤销的可见性。
 
@@ -65,7 +64,7 @@ hsbg.cards public API --> fixed-origin background GET --> atomic cache --> obser
 
 ## 陪伴调度
 
-生命周期协调器独立处理 `game_started -> started`、bootstrap `state_ready -> resumed`、过期后的 `state_resumed -> resumed`，以及两个终局事件 `-> ended`。身份由日志源 epoch、局数和阶段组成；每个阶段只提交一次。开始与恢复必须使用同局的稳定活跃快照，终局则携带最终结果或酒馆名次，并在提交后才清理查询账本和被动上下文。未知目标或 SDK 暂时拒绝时只在内存保留一条最多 30 秒的待投递；权限撤销、换源、停机、旁观和过期会清除。bootstrap 永远不会重放历史 `game_started`，所以接入已有对局只会表达“重新接上”。
+生命周期协调器独立处理 `game_started -> started`、bootstrap `state_ready -> resumed`、过期后的 `state_resumed -> resumed`，以及两个终局事件 `-> ended`。身份由日志源 epoch、局数和阶段组成；每个阶段只提交一次。开始与恢复必须使用同局的稳定活跃快照，终局则携带最终结果或酒馆名次，并在提交后覆盖被动上下文。配置目标时定向提交；未配置目标时提交 targetless 请求，仅依赖宿主恰好一个在线会话时的路由。SDK 暂时拒绝或宿主无法路由时只在内存保留一条最多 30 秒的待投递；权限撤销、换源、停机、旁观和过期会清除。bootstrap 永远不会重放历史 `game_started`，所以接入已有对局只会表达“重新接上”。
 
 `CommentaryArbiter` 只仲裁 LLM 请求，不生成任何可见文本。中局主动事件必须同时满足：
 
@@ -82,13 +81,13 @@ hsbg.cards public API --> fixed-origin background GET --> atomic cache --> obser
 
 同轮只读工具保持两个清晰入口：无参数 `hearthstone_current_turn` 专门回答当前完整轮次、行动方和阶段；`hearthstone_live_state` 回答公开场面、具体手牌、Choice、商店、战团、经济或决策，只保留可选的用户原始 `query`。两者每次都重新读取权威快照，不能依赖主动短评或更早聊天历史；`round` 是用户口语中的完整轮次，`action_turn` 只是交替行动计数。
 
-普通对战支持 `overview/board/hand/opponent/choice/strategy`，酒馆额外支持 `shop/economy`；对手查询可声明 `current/next/last`。插件先在本机建立完整事实和 capability，再只把所问视图、对应 evidence gate 与相关卡牌规则编码为 `hearthstone_compact_v1`。聚焦 JSON 限制为 4096 bytes，超限时明确标记 `truncated` 并进一步收敛。`complete_legal_actions` 固定为 `false`，防止把局势分析说成完整求解器结论。
+普通对战支持 `overview/board/hand/opponent/choice/strategy`，酒馆额外支持 `shop/economy`；对手查询可声明 `current/next/last`。插件先在本机建立完整事实和 capability，再把所问视图提升为浅层 canonical 字段：当前回合/经济、区域完整度、槽位数、逐组 CardID、名称、类型、实际费用、攻血、星级、金色状态和完整当前关键词。canonical 聚焦结果和正式模型文本均限制为 4096 bytes，超限时先去掉重复表示，再按完整卡组逐组装箱并记录 `delivered/omitted group/card count`；任何不能完整传给模型的牌区都会显式标记 `transport.complete=0`，并把依赖该牌区的 capability 降为不可用。序列化器不按原始 UTF-8 字节截断半条事实，异常数量或非法身份会 fail-closed。正式 `@llm_tool` handler 按官方成功 envelope 将同源确定性文本作为 `output` 返回：事实查询包含完整所问事实，建议查询额外包含对应 capability、相关公共规则、当前购买判断和决策护栏，`strategy` 包含当前阶段所需的多视图。user-plugin-server 只把 `output/is_error/error` 送入宿主，因此模型不依赖会被丢弃的额外 envelope 字段。额外 `_canonical` 只用于插件进程内验证，不进入正式模型结果。`complete_legal_actions` 固定为 `false`，防止把局势分析说成完整求解器结论。
 
-`query_hearthstone_live_state` 是唯一 Agent 入口，复用同一快照构建和紧凑 serializer。Agent 属于主回答后的独立路由，因此不能代替同轮工具，只作为模型未调用工具时的第二路径。宿主会给 Agent 注入可信的 `_ctx.lanlan_name`，query ledger 只用这个角色、原问题、意图和时间窗关联 Agent 与 memory 兜底。普通 `@llm_tool` 回调没有可信角色身份，只读取调用时的权威快照，既不认领角色级查询，也不被兜底反向阻断。
+`query_hearthstone_live_state` 是唯一 Agent 入口，复用同一快照构建和紧凑 serializer。Agent 属于独立路由，因此不能冒充同轮工具 callback；它在被 Agent 选择时返回当刻结果。普通 `@llm_tool` callback 只收到工具参数，没有可信 `lanlan_name`、conversation ID 或 turn ID。插件因此不尝试把工具调用关联到某个角色级对话，也不在工具返回后创建另一条主动 `respond`。原工具 continuation 是否已经形成可见回答只能由宿主管理，公开插件 SDK 没有对应回执。
 
-`live_query_watch` 每秒通过官方 `bus.memory.get(bucket_id="default")` 有界读取近期用户话语，同步 IPC 在线程中执行，不阻塞插件事件循环。它只接受明确的炉石查询，按记录中的实际 `lanlan` 路由；配置固定 `target_lanlan` 时过滤其他角色。超过 4 秒选择窗口且仍未被可信角色级 Agent 认领的查询，才通过 `visibility=[] + ai_behavior="respond"` 发送包含当刻聚焦快照的定向兜底。无角色工具无法安全取消它，所以此处选择 fail-open；SDK 回执只确认本地提交，不证明模型已生成回答，验收必须检查最终角色回复。
+真实宿主诊断把工具能力、用户回答和生命周期分开记录。工具能力从官方 `/api/tools` 核对本插件的远程注册与 loopback callback，再直接发送标准 callback 请求，并以隔离 epoch 证明装饰器 handler 精确执行一次、成功返回对应事实；它不依赖模型是否选择工具。固定问题的可见回答和生命周期台词用于观察真实宿主与模型表现，不能反向要求插件增加私有关联、重试或提示协议。Agent 路由继续作为独立可用查询路径和诊断信号。
 
-普通被动上下文只发布一条最多 4096 UTF-8 bytes、单 coalesce key 的原子快照。显式或聊天角色已知时携带 `target_lanlan` 并按 30 秒续租；冷启动无角色时省略目标并使用 `active-session` key，宿主仅在恰好一个连接会话时路由，零个或多个会话直接丢弃。由于 SDK 提交回执不是宿主消费确认，无目标游标只租约 1 秒，直到角色明确或状态失效。原子快照不会出现新 revision 的 core 与旧 revision 的商店/战团混合，但 `ai_behavior="read"` 在活动语音会话中仍依赖宿主下一次自然 hot-swap，因此只承担背景上下文，不能代替同轮工具。
+普通被动上下文发布逻辑原子的 `hearthstone_live_segment_v2` 分段包。每段是独立完整 JSON，以 `bundle=<base36 revision>@i/n` 绑定整包，经真实宿主 parser 后不超过 180 tokens；整包恰有一个 `contract` 和一个 `schema`，缺段、混版、v1 或 tombstone 均 fail-closed。酒馆卡牌行显式包含 CardID、名称、站位、攻血、星级、实际费用、类型、金色状态、关键词完整度和 `keyword_set_index`；规范关键词名在 schema 的去重 `keyword_sets` 中。招募阶段被动包优先完整商店、战团和手牌，战斗阶段优先当前对手、战团和手牌；其他对手详情由正式查询工具提供。整包按当前阶段控制在宿主 3000-token selector 预算内。每个 segment 使用目标加 segment 名组成的稳定 `coalesce_key`；publisher 仅在全段提交成功后更新 cursor，提交失败、权限撤销、换源或分段集合缩减时会对旧/新 key 并集发送 tombstone。显式配置角色时携带 `target_lanlan` 并按 30 秒续租；未配置角色时省略目标并使用 `active-session` key，宿主仅在恰好一个在线会话时路由，零个或多个在线会话直接丢弃。由于 SDK 提交回执不是宿主消费确认，无目标游标只租约 1 秒，直到状态失效或目标被显式配置。激活后、用户提交前观察到且未被后续状态作废的新鲜、完整、同 revision 分段包可以支撑当前提问，但 `ai_behavior="read"` 在活动语音会话中仍依赖宿主下一次自然 hot-swap，因此不能冒充同轮工具 callback，也不能证明工具能力。
 
 公开 SDK 的 push receipt 只确认提交，不确认宿主已消费、生成或播放，也没有返回最终角色文本的正式回调。因此独立浮层不能承接自动角色台词，也不会自动显示解析器事件；它只接受用户显式触发的诊断文本。
 
@@ -108,11 +107,13 @@ hsbg.cards public API --> fixed-origin background GET --> atomic cache --> obser
 
 酒馆卡牌快照保存日志实际观测的 `card_type`、`current_cost`、`premium`、当前位置、冻结和当前关键词；刷新/升本费用优先读取对应 `GAME_MODE_BUTTON_SLOT` 按钮实体。客户端不会在每个招募阶段重发恒定按钮费用，因此当前可见 `PLAY` 按钮只要同一实体在本轮本阶段有明确 tag observation，或完成了当前 GameState 基线，就可沿用其持久 `COST`；该规则不放宽玩家经济 tag、隐藏按钮或已移出场按钮。完整实体包中的 boolean 标签缺失按默认 false，包尚未收尾时保持 `null`，防止截断包伪装成完整状态，也防止旧冻结/金色/关键词续命。商店、手牌、战团、经济和 Choice 分别携带完整度、revision、回合、阶段与观测时间；金币、刷新费用和升本费用还分别保存自己的 observation。金币以当前 `RESOURCES` 建立基线；历史 `RESOURCES_USED/TEMP_RESOURCES` 会过期并按未发生处理，只有同回合同阶段重报后才加入当前值。未观测或已过期的动态值保持 `null`，不使用公共目录或默认规则补猜。`CHANGE_ENTITY` 真正换 CardID 时先撤销旧类型、费用、攻血、星级、金色和关键词，直到新身份重新提供证据。购买拆为 `shop_card_priority_advice`、`purchase_affordability` 和 `specific_purchase_advice`：费用缺失不污染已经具备完整实时商店与规则证据的定性选牌，但会让可负担性与精确购买顺序降为 `partial`。工具结果最前面的 `current_recruit_decision` 按卡标记 `known_affordable`、`known_unaffordable` 或 `unknown_cost_may_be_zero`，并将整店可负担性保持为 `unknown`；`decision_guardrails` 再提供完整证据边界，禁止模型因金币为 0 就把未知费用卡牌判为买不起。升本可负担性、升本策略、刷新、Choice 与站位也有独立 capability，角色必须按被问事项检查对应状态，不能因一个子能力不可用而覆盖另一个已可用能力。
 
-两个 `@llm_tool` 由公开 SDK 在插件构造时自动注册并排队提交给宿主，可在生成首答的同一轮调用。`plugin.toml` 使用 `passive=false`，让用户插件 Agent 在模型未选择工具时仍能发现唯一查询入口。设置、监听、浮层和清空统计入口继续以 `metadata.agent_auto=false` 隐藏。原子 `read` 使用单键覆盖，语义变化立即更新、完全相同的状态每 30 秒续租；目标只能来自显式配置或官方近期话语记录，无法解析目标时 fail-closed。三条查询链路互补，不假设模型必然调用某个工具，也不把 Agent 的后置结果冒充首答工具结果。
+两个 `@llm_tool` 由公开 SDK 在插件构造时自动注册并排队提交给宿主，可在生成首答的同一轮调用。`plugin.toml` 使用 `passive=false`，让用户插件 Agent 在模型未选择工具时仍能发现唯一查询入口。设置、监听、浮层和清空统计入口继续以 `metadata.agent_auto=false` 隐藏。被动分段包按 segment 独立覆盖，语义变化立即更新、完全相同的状态每 30 秒续租；目标只来自显式配置，未配置时走宿主限定的 targetless 单在线会话路由。三条官方链路互补，不假设模型必然调用某个工具，也不把 Agent 的独立结果冒充首答工具结果。
+
+发布门禁只检查插件可确定控制的结果：测试、静态检查、固定 SDK、Hosted UI、版本元数据、source-bound 真实宿主链路证据和官方打包验证。证据绑定当前源码，并验证实际 N.E.K.O runtime 与 CPython 环境在单次矩阵执行期间保持稳定；嵌套的模型回答观察允许失败。
 
 官方工具文档明确说明 `/api/tools` 注册只存在于当前角色的 `LLMSessionManager` 内，主服务重启、首启竞态或会话管理器重建后不会由 `@llm_tool` 自动回灌。插件因此使用官方 `@timer_interval` 在独立定时线程里读取公开的 `GET /api/tools`：只有某个当前角色缺少本插件的远程工具，或 source、loopback callback、remote 标志不一致时，才通过公开 `unregister_llm_tool()` / `register_llm_tool()` 原子持锁恢复并再次确认；健康注册不做任何变更。官方 SDK 会拒绝同名重复注册，因此不能省略本地注销步骤。失败使用有界退避且只记录脱敏错误码，缓存的本地 schema 允许后续定时器再次恢复。这能自动收敛运行期注册丢失，但定时检查仍存在最多一个检查间隔的窗口，不能冒充宿主提供的逐 turn 前同步保证。
 
-卡牌目录不做流派评分、胜率排序或本地推荐。远端 `rules_text` 经过 HTML 清洗和长度限制，仍被标记为不可信参考数据；角色必须核对 provider、patch、checked_at、stale 和覆盖率。常规 `*_G` 金卡会映射到金色规则，少量旧式或不规则 CardID 会进入 `missing_ids`，角色不得猜测缺失元数据。目录不可用不会令实时局势整体不可用。
+卡牌目录不做流派评分、胜率排序或本地推荐。正式模型文本用 `catalog_meta` 携带 provider、patch、checked_at、stale 和不可信参考标记，用查询作用域内的 `catalog_coverage` 区分三类缺口：`missing_ids` 是 provider 已查询但未命中，`lookup_omitted_ids` 是目录 40-ID 查询门限没有查到，`output_omitted_ids` 是已有规则因 4096-byte 输出预算没有发送；`catalog_global_lookup_omitted_unlisted` 只描述目录全局未列出的截断量，不冒充当前查询缺口。`catalog_rules[view]` 按商店、战团、手牌等视图轮转抽取，规则正文缩短时同时给出 `text_truncated_ids`。远端 `rules_text` 经过 HTML 清洗和长度限制后仍是数据而不是指令；规则缺失、陈旧、未发送或正文截断时，依赖完整规则的建议 capability 必须降级，但纯实时费用判断可保持独立。常规 `*_G` 金卡会映射到金色规则，少量旧式或不规则 CardID 会进入 `missing_ids`，角色不得猜测缺失元数据。目录不可用不会令实时局势整体不可用。
 
 ## 持久化与线程
 
@@ -130,13 +131,13 @@ Plugin Store 长期只保存赛季/模式/英雄维度的聚合计数。N.E.K.O 
 | --- | --- | --- |
 | `monitor_on_start` | `true` | 启动后监听日志 |
 | `initial_read_max_bytes` | `67108864` | 首次本地恢复最多读取 64 MiB |
-| `llm_data_consent` | `true` | 允许工具、Agent、明确问题兜底和生命周期回应使用过滤后的玩家可见局势；用户可显式关闭 |
+| `llm_data_consent` | `true` | 允许被动分段包、工具、Agent、生命周期和主动解说使用过滤后的玩家可见局势；用户可显式关闭 |
 | `llm_do_not_disturb` | `false` | 开启后抑制中局主动解说；默认允许角色在对局中途低频回应 |
 | `llm_min_priority` | `5` | 主动事件最低优先级 |
 | `llm_cooldown_seconds` | `25` | 普通主动解说冷却 |
 | `llm_critical_cooldown_seconds` | `8` | 关键主动解说冷却 |
 | `user_chat_quiet_window_seconds` | `30` | 用户聊天后的安静时间 |
-| `target_lanlan` | 空 | 空时查询兜底使用 memory 记录的实际角色；非空时只处理和定向该角色，主动事件也使用该显式目标 |
+| `target_lanlan` | 空 | 非空时定向该角色；空时被动上下文、生命周期和主动解说只依赖宿主恰好一个在线会话的 targetless 路由 |
 | `card_catalog_network_enabled` | `true` | 每日更新公共卡牌目录；关闭后只读旧缓存 |
 | `card_catalog_refresh_hours` | `24` | 公共卡牌目录刷新间隔（6-168 小时） |
 | `overlay_auto_start` | `false` | 诊断浮层默认不自动启动 |

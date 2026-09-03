@@ -29,6 +29,15 @@ from hearthstone_companion_under_test.models import (
     SideSnapshot,
 )
 
+_ATOMIC_JSON_MARKER = "过滤后的实时局势 JSON："
+
+
+def _atomic_payload(prompt: str) -> dict[str, object]:
+    payload = json.loads(prompt.split(_ATOMIC_JSON_MARKER, 1)[1])
+    assert isinstance(payload, dict)
+    assert list(payload)[-1] == "answer_checklist"
+    return payload
+
 
 def event(*, priority: int = 5, suffix: str = "") -> GameEvent:
     return GameEvent("hero_damaged", priority, f"受到伤害{suffix}", 100.0, {"amount": 3, "side": "player"})
@@ -59,9 +68,439 @@ def test_atomic_live_state_is_one_bounded_replaceable_context() -> None:
     assert len(segments[0][1].encode("utf-8")) <= 900
     assert '"round":11' in segments[0][1]
     assert '"turn":21' in segments[0][1]
-    assert "第几回合" in segments[0][1]
-    assert "只用round" in segments[0][1]
-    assert "禁用turn" in segments[0][1]
+    assert "证据完整的字段可直接回答" in segments[0][1]
+    assert "不得仅因本轮未调用工具而拒答" in segments[0][1]
+    assert "禁止用旧对话或公共目录补猜当前事实" in segments[0][1]
+    assert "answer_checklist 是唯一回答清单" in segments[0][1]
+    assert "delivery=full 时须覆盖全部 group 与 slot" in segments[0][1]
+    assert "hearthstone_current_turn" in segments[0][1]
+    assert "hearthstone_live_state" in segments[0][1]
+
+
+def test_atomic_constructed_state_leads_with_direct_round_and_opponent_facts() -> None:
+    snapshot = GameSnapshot(
+        mode="constructed",
+        phase="playing",
+        game_number=4,
+        turn=21,
+        round=11,
+        active_side="player",
+        opponent=SideSnapshot(board_count=1),
+        constructed=ConstructedSnapshot(
+            player=ConstructedSideSnapshot(board_identities_complete=True),
+            opponent=ConstructedSideSnapshot(
+                board=(
+                    ConstructedCardSnapshot(
+                        card_id="OPPONENT_PUBLIC_1",
+                        name="公开对手随从",
+                        card_type="MINION",
+                        zone_position=1,
+                        attack=6,
+                        health=7,
+                        keywords=("taunt", "divine_shield"),
+                        keywords_complete=True,
+                    ),
+                ),
+                board_identities_complete=True,
+            ),
+        ),
+    )
+
+    prompt = build_atomic_live_state_segment(
+        snapshot,
+        observed_at=1235.0,
+        max_prompt_bytes=4096,
+    )[0][1]
+
+    payload = _atomic_payload(prompt)
+    checklist = payload["answer_checklist"]
+    assert isinstance(checklist, dict)
+    assert checklist["current"] == {
+        "round": 11,
+        "action_turn": 21,
+        "action_turn_is_not_round": True,
+        "active_side": "player",
+        "phase": "playing",
+    }
+    opponent = checklist["areas"]["opponent_board"]
+    assert opponent["delivery"] == "full"
+    assert opponent["slot_count"] == 1
+    assert opponent["group_count"] == 1
+    assert opponent["completion_check"] == {"groups": "1/1", "slots": "1/1"}
+    assert opponent["groups"] == [
+        {
+            "ordinal": "1/1",
+            "positions": [1],
+            "count": 1,
+            "card_id": "OPPONENT_PUBLIC_1",
+            "name": "公开对手随从",
+            "card_type": "MINION",
+            "card_type_zh": "随从",
+            "current_cost": None,
+            "attack": 6,
+            "health": 7,
+            "tier": None,
+            "premium": None,
+            "keywords_complete": True,
+            "active_keywords": ["嘲讽", "圣盾"],
+        }
+    ]
+
+
+def test_atomic_constructed_state_does_not_claim_unknown_keyword_baseline() -> None:
+    snapshot = GameSnapshot(
+        mode="constructed",
+        phase="playing",
+        game_number=4,
+        turn=21,
+        round=11,
+        constructed=ConstructedSnapshot(
+            opponent=ConstructedSideSnapshot(
+                board=(
+                    ConstructedCardSnapshot(
+                        card_id="OPPONENT_PARTIAL",
+                        name="观测未完成的随从",
+                        card_type="MINION",
+                        zone_position=1,
+                        attack=2,
+                        health=3,
+                    ),
+                ),
+                board_identities_complete=True,
+            ),
+        ),
+    )
+
+    prompt = build_atomic_live_state_segment(
+        snapshot,
+        observed_at=1235.0,
+        max_prompt_bytes=4096,
+    )[0][1]
+
+    group = _atomic_payload(prompt)["answer_checklist"]["areas"]["opponent_board"][
+        "groups"
+    ][0]
+    assert group["keywords_complete"] is False
+    assert group["active_keywords"] == []
+
+
+def test_atomic_battlegrounds_state_leads_with_direct_shop_and_economy_facts() -> None:
+    observed = BattlegroundsAreaSnapshot(
+        complete=True,
+        revision=1,
+        observed_at=1234.0,
+        round=3,
+        phase="recruit",
+    )
+    snapshot = GameSnapshot(
+        mode="battlegrounds",
+        phase="recruit",
+        game_number=5,
+        round=3,
+        battlegrounds=BattlegroundsSnapshot(
+            round=3,
+            phase="recruit",
+            gold=5,
+            max_gold=5,
+            refresh_cost=1,
+            upgrade_cost=3,
+            shop=(
+                BattlegroundsCardSnapshot(
+                    card_id="BG_SPELL_DIRECT",
+                    name="测试酒馆法术",
+                    card_type="BATTLEGROUND_SPELL",
+                    position=1,
+                    current_cost=1,
+                    premium=False,
+                    keywords={"divine_shield": False},
+                ),
+                BattlegroundsCardSnapshot(
+                    card_id="BG_GOLDEN_DIRECT",
+                    name="金色圣盾随从",
+                    card_type="MINION",
+                    attack=8,
+                    health=9,
+                    tier=3,
+                    position=2,
+                    current_cost=3,
+                    premium=True,
+                    keywords={"divine_shield": True},
+                ),
+            ),
+            warband=(),
+            economy=BattlegroundsEconomySnapshot(
+                upgrade_cost=3,
+                refresh_cost=1,
+                revision=1,
+                observed_at=1234.0,
+                gold_observation=observed,
+                refresh_observation=observed,
+                upgrade_observation=observed,
+            ),
+            areas={
+                "shop": observed,
+                "warband": observed,
+                "economy": observed,
+            },
+        ),
+    )
+
+    prompt = build_atomic_live_state_segment(
+        snapshot,
+        observed_at=1235.0,
+        max_prompt_bytes=4096,
+    )[0][1]
+
+    payload = _atomic_payload(prompt)
+    checklist = payload["answer_checklist"]
+    assert isinstance(checklist, dict)
+    assert checklist["current"] == {"round": 3, "phase": "recruit"}
+    assert checklist["economy"] == {
+        "source_complete": True,
+        "gold": 5,
+        "refresh_actual_cost": 1,
+        "upgrade_actual_cost": 3,
+        "can_upgrade": True,
+        "remaining_after_upgrade": 2,
+        "remaining_status": "applicable",
+    }
+    shop = checklist["areas"]["shop"]
+    assert shop["delivery"] == "full"
+    assert shop["slot_count"] == 2
+    assert shop["group_count"] == 2
+    assert shop["completion_check"] == {"groups": "2/2", "slots": "2/2"}
+    assert [group["ordinal"] for group in shop["groups"]] == ["1/2", "2/2"]
+    assert shop["groups"][0]["card_type_zh"] == "酒馆法术"
+    assert shop["groups"][0]["current_cost"] == 1
+    assert shop["groups"][1]["premium"] is True
+    assert shop["groups"][1]["active_keywords"] == ["圣盾"]
+
+    blocked_snapshot = GameSnapshot(
+        mode="battlegrounds",
+        phase="recruit",
+        game_number=6,
+        round=3,
+        battlegrounds=BattlegroundsSnapshot(
+            round=3,
+            phase="recruit",
+            gold=5,
+            refresh_cost=1,
+            upgrade_cost=6,
+            economy=BattlegroundsEconomySnapshot(
+                upgrade_cost=6,
+                refresh_cost=1,
+                revision=1,
+                observed_at=1234.0,
+                gold_observation=observed,
+                refresh_observation=observed,
+                upgrade_observation=observed,
+            ),
+            areas={"economy": observed},
+        ),
+    )
+    blocked_prompt = build_atomic_live_state_segment(
+        blocked_snapshot,
+        observed_at=1235.0,
+        max_prompt_bytes=4096,
+    )[0][1]
+    blocked = _atomic_payload(blocked_prompt)["answer_checklist"]
+    assert isinstance(blocked, dict)
+    assert blocked["economy"]["can_upgrade"] is False
+    assert blocked["economy"]["remaining_after_upgrade"] is None
+    assert blocked["economy"]["remaining_status"] == (
+        "not_applicable_insufficient_gold"
+    )
+
+
+def test_atomic_battlegrounds_rejects_stale_and_invalid_observations() -> None:
+    def snapshot(observed_at: float) -> GameSnapshot:
+        observed = BattlegroundsAreaSnapshot(
+            complete=True,
+            revision=1,
+            observed_at=observed_at,
+            round=3,
+            phase="recruit",
+        )
+        return GameSnapshot(
+            mode="battlegrounds",
+            phase="recruit",
+            round=3,
+            battlegrounds=BattlegroundsSnapshot(
+                round=3,
+                phase="recruit",
+                gold=5,
+                refresh_cost=1,
+                upgrade_cost=3,
+                shop=(BattlegroundsCardSnapshot(card_id="BG_FRESHNESS_CARD", position=1),),
+                economy=BattlegroundsEconomySnapshot(
+                    refresh_cost=1,
+                    upgrade_cost=3,
+                    revision=1,
+                    observed_at=observed_at,
+                    gold_observation=observed,
+                    refresh_observation=observed,
+                    upgrade_observation=observed,
+                ),
+                areas={"shop": observed, "economy": observed},
+            ),
+        )
+
+    boundary = _atomic_payload(
+        build_atomic_live_state_segment(
+            snapshot(100.0),
+            observed_at=400.0,
+            max_prompt_bytes=4096,
+        )[0][1]
+    )["answer_checklist"]
+    stale = _atomic_payload(
+        build_atomic_live_state_segment(
+            snapshot(100.0),
+            observed_at=400.001,
+            max_prompt_bytes=4096,
+        )[0][1]
+    )["answer_checklist"]
+    invalid = _atomic_payload(
+        build_atomic_live_state_segment(
+            snapshot(float("nan")),
+            observed_at=400.0,
+            max_prompt_bytes=4096,
+        )[0][1]
+    )["answer_checklist"]
+
+    assert boundary["areas"]["shop"]["delivery"] == "full"
+    assert boundary["economy"]["source_complete"] is True
+    for checklist in (stale, invalid):
+        assert checklist["areas"]["shop"]["delivery"] == "missing_evidence"
+        assert checklist["areas"]["shop"]["groups"] == []
+        assert checklist["economy"]["source_complete"] is False
+        assert checklist["economy"]["gold"] is None
+        assert checklist["economy"]["refresh_actual_cost"] is None
+        assert checklist["economy"]["upgrade_actual_cost"] is None
+
+
+def test_atomic_shop_uses_complete_dynamic_groups_without_duplicate_card_rows() -> None:
+    observed = BattlegroundsAreaSnapshot(
+        complete=True,
+        revision=8,
+        observed_at=1234.0,
+        round=6,
+        phase="recruit",
+    )
+    repeated = dict(
+        card_id="BG_REPEAT",
+        name="重复随从",
+        card_type="MINION",
+        attack=4,
+        health=5,
+        tier=2,
+        current_cost=3,
+        premium=False,
+        keywords={"taunt": True, "divine_shield": False},
+    )
+    snapshot = GameSnapshot(
+        mode="battlegrounds",
+        phase="recruit",
+        game_number=9,
+        round=6,
+        battlegrounds=BattlegroundsSnapshot(
+            round=6,
+            phase="recruit",
+            shop=(
+                BattlegroundsCardSnapshot(position=1, **repeated),
+                BattlegroundsCardSnapshot(position=2, **{**repeated, "current_cost": 2}),
+                BattlegroundsCardSnapshot(position=3, **repeated),
+                BattlegroundsCardSnapshot(
+                    card_id="BG_SPELL_OTHER",
+                    name="另一法术",
+                    card_type="BATTLEGROUND_SPELL",
+                    position=4,
+                    current_cost=1,
+                    premium=False,
+                    keywords={"taunt": False},
+                ),
+            ),
+            hand=(
+                BattlegroundsCardSnapshot(
+                    card_id="BG_HAND_VISIBLE",
+                    position=1,
+                    card_type="MINION",
+                    current_cost=3,
+                    premium=False,
+                    keywords={"reborn": True},
+                ),
+            ),
+            areas={"shop": observed, "hand": observed},
+        ),
+    )
+
+    prompt = build_atomic_live_state_segment(
+        snapshot,
+        observed_at=1235.0,
+        max_prompt_bytes=4096,
+    )[0][1]
+    payload = _atomic_payload(prompt)
+    checklist = payload["answer_checklist"]
+    assert isinstance(checklist, dict)
+    shop = checklist["areas"]["shop"]
+
+    assert shop["delivery"] == "full"
+    assert shop["slot_count"] == 4
+    assert shop["group_count"] == 3
+    assert shop["completion_check"] == {"groups": "3/3", "slots": "4/4"}
+    assert [group["ordinal"] for group in shop["groups"]] == ["1/3", "2/3", "3/3"]
+    assert shop["groups"][0]["card_id"] == "BG_REPEAT"
+    assert shop["groups"][0]["positions"] == [1, 3]
+    assert shop["groups"][0]["count"] == 2
+    assert shop["groups"][1]["card_id"] == "BG_REPEAT"
+    assert shop["groups"][1]["positions"] == [2]
+    assert shop["groups"][1]["current_cost"] == 2
+    assert shop["groups"][2]["card_id"] == "BG_SPELL_OTHER"
+    assert prompt.count('"card_id":"BG_REPEAT"') == 2
+    assert checklist["areas"]["hand"]["delivery"] == "full"
+    assert checklist["areas"]["hand"]["groups"][0]["card_id"] == "BG_HAND_VISIBLE"
+
+
+def test_atomic_tight_budget_marks_card_details_tool_required_without_partial_groups() -> None:
+    observed = BattlegroundsAreaSnapshot(
+        complete=True,
+        revision=1,
+        observed_at=1234.0,
+        round=2,
+        phase="recruit",
+    )
+    snapshot = GameSnapshot(
+        mode="battlegrounds",
+        phase="recruit",
+        round=2,
+        battlegrounds=BattlegroundsSnapshot(
+            round=2,
+            phase="recruit",
+            shop=tuple(
+                BattlegroundsCardSnapshot(
+                    card_id=f"BG_LONG_CARD_{index}",
+                    name="预算测试长名称",
+                    card_type="MINION",
+                    position=index,
+                    current_cost=3,
+                    keywords={"taunt": index % 2 == 0},
+                )
+                for index in range(1, 8)
+            ),
+            areas={"shop": observed},
+        ),
+    )
+
+    prompt = build_atomic_live_state_segment(
+        snapshot,
+        observed_at=1235.0,
+        max_prompt_bytes=900,
+    )[0][1]
+    payload = _atomic_payload(prompt)
+    checklist = payload["answer_checklist"]
+    assert isinstance(checklist, dict)
+    assert len(prompt.encode("utf-8")) <= 900
+    assert checklist.get("details") == "tool_required:hearthstone_live_state"
+    assert "BG_LONG_CARD_1" not in prompt
 
 
 def test_llm_prompt_omits_incomplete_battlegrounds_regions_and_economy() -> None:
@@ -110,6 +549,61 @@ def test_llm_prompt_omits_incomplete_battlegrounds_regions_and_economy() -> None
     assert '"gold":null' in prompt
     assert '"refresh_cost":null' in prompt
     assert '"upgrade_cost":null' in prompt
+
+
+def test_llm_prompt_redacts_complete_but_stale_battlegrounds_facts() -> None:
+    observed = BattlegroundsAreaSnapshot(
+        complete=True,
+        revision=1,
+        observed_at=100.0,
+        round=4,
+        phase="recruit",
+    )
+    snapshot = GameSnapshot(
+        mode="battlegrounds",
+        phase="recruit",
+        round=4,
+        battlegrounds=BattlegroundsSnapshot(
+            round=4,
+            phase="recruit",
+            gold=5,
+            refresh_cost=1,
+            upgrade_cost=4,
+            shop=(BattlegroundsCardSnapshot(card_id="BG_STALE_ACTIVE_CARD", position=1),),
+            areas={"shop": observed, "economy": observed},
+            economy=BattlegroundsEconomySnapshot(
+                refresh_cost=1,
+                upgrade_cost=4,
+                revision=1,
+                observed_at=100.0,
+                gold_observation=observed,
+                refresh_observation=observed,
+                upgrade_observation=observed,
+            ),
+        ),
+    )
+
+    def prompt_at(timestamp: float) -> str:
+        return build_llm_prompt(
+            GameEvent(
+                "battlegrounds_recruit_started",
+                7,
+                "招募开始",
+                timestamp,
+                {"round": 4},
+            ),
+            snapshot,
+            max_prompt_chars=10_000,
+        )
+
+    boundary = prompt_at(400.0)
+    stale = prompt_at(400.001)
+
+    assert "BG_STALE_ACTIVE_CARD" in boundary
+    assert "BG_STALE_ACTIVE_CARD" not in stale
+    assert '"gold":null' in stale
+    assert '"refresh_cost":null' in stale
+    assert '"upgrade_cost":null' in stale
 
 
 def config(**overrides: object) -> CompanionConfig:
@@ -629,6 +1123,7 @@ def test_live_constructed_delivery_includes_turn_owner_and_public_boards() -> No
                         card_id="PRIVATE_PLAYER_HAND",
                         name="私有手牌",
                         card_type="SPELL",
+                        keywords_complete=True,
                     ),
                 ),
                 hand_identities_complete=True,
@@ -641,6 +1136,7 @@ def test_live_constructed_delivery_includes_turn_owner_and_public_boards() -> No
                         attack=4,
                         health=5,
                         keywords=("taunt", "divine_shield"),
+                        keywords_complete=True,
                     ),
                 ),
                 board_identities_complete=True,
@@ -685,7 +1181,8 @@ def test_live_constructed_delivery_includes_turn_owner_and_public_boards() -> No
 
     assert set(by_segment) == {
         "core",
-        "status",
+        "contract",
+        "schema",
         "opponent_board_1",
         "player_board_1",
         "player_hand_1",
@@ -694,7 +1191,7 @@ def test_live_constructed_delivery_includes_turn_owner_and_public_boards() -> No
     assert by_segment["core"]["action_turn"] == 7
     assert by_segment["core"]["round"] == 4
     assert by_segment["core"]["active_side"] == "opponent"
-    assert by_segment["status"]["choice"] == {
+    assert by_segment["core"]["choice"] == {
         "type": "discover",
         "min": 0,
         "max": 0,
@@ -708,6 +1205,7 @@ def test_live_constructed_delivery_includes_turn_owner_and_public_boards() -> No
         2,
         4,
         5,
+        True,
         "td",
         "",
     ]
@@ -717,9 +1215,12 @@ def test_live_constructed_delivery_includes_turn_owner_and_public_boards() -> No
         1,
         3,
         4,
+        False,
         "rs",
         "",
     ]
+    assert by_segment["player_hand_1"]["cards"][0][5] is True
+    assert "keywords_complete" in by_segment["schema"]["card_columns"]
     assert "私有手牌" in serialized
     assert "PRIVATE_OPPONENT_HAND" not in serialized
     assert "PRIVATE_CHOICE" not in serialized
@@ -737,8 +1238,8 @@ def test_live_constructed_delivery_does_not_mark_unknown_empty_sides_complete() 
     payloads = [json.loads(prompt.split(":", 1)[1]) for prompt in prompts]
     core = next(payload for payload in payloads if payload["segment"] == "core")
 
-    assert "player_board" not in core["complete_areas"]
-    assert "opponent_board" not in core["complete_areas"]
+    assert "player_board" not in core["complete_counts"]
+    assert "opponent_board" not in core["complete_counts"]
     assert not any(
         payload["segment"].startswith(("player_board_", "opponent_board_"))
         for payload in payloads
@@ -798,11 +1299,15 @@ def test_live_constructed_delivery_keeps_full_public_board_under_byte_limit() ->
 
     payloads = [json.loads(prompt.split(":", 1)[1]) for prompt in prompts]
     segment_names = {payload["segment"] for payload in payloads}
-    assert {"core", "status"} <= segment_names
-    assert sum(name.startswith("opponent_board_") for name in segment_names) > 1
-    assert sum(name.startswith("player_board_") for name in segment_names) > 1
+    assert "core" in segment_names
+    assert any(name.startswith("opponent_board_") for name in segment_names)
+    assert any(name.startswith("player_board_") for name in segment_names)
     assert all(len(prompt.encode("utf-8")) <= 900 for prompt in prompts)
-    assert all(len(payload.get("cards", [])) <= 7 for payload in payloads)
+    assert all(
+        not isinstance(payload.get("cards"), list)
+        or len(payload["cards"]) <= 7
+        for payload in payloads
+    )
     assert all(f"PLAYER_BOARD_{index}" in serialized for index in range(7))
     assert all(f"OPPONENT_BOARD_{index}" in serialized for index in range(7))
     assert oversized_name not in serialized
@@ -812,12 +1317,14 @@ def test_live_constructed_delivery_keeps_full_public_board_under_byte_limit() ->
         for card in payload.get("cards", [])
     ]
     rows_by_id = {card[0]: card for card in rows}
-    assert rows_by_id["PLAYER_BOARD_0"][1]
+    assert rows_by_id["PLAYER_BOARD_0"][1] is None
     assert rows_by_id["PLAYER_BOARD_0"][2] == 1
     assert rows_by_id["PLAYER_BOARD_6"][2] == 12
-    assert rows_by_id["PLAYER_BOARD_0"][5] == "tlu"
-    assert rows_by_id["PLAYER_BOARD_0"][6] == "fs?"
-    assert rows_by_id["OPPONENT_BOARD_0"][5] == "drc"
+    assert rows_by_id["PLAYER_BOARD_0"][5] is False
+    assert rows_by_id["PLAYER_BOARD_0"][6] == "tlu"
+    assert rows_by_id["PLAYER_BOARD_0"][7] == "fs?"
+    assert rows_by_id["OPPONENT_BOARD_0"][5] is False
+    assert rows_by_id["OPPONENT_BOARD_0"][6] == "drc"
 
 
 def test_live_state_context_is_valid_json_and_respects_host_safe_hard_limit() -> None:
@@ -980,7 +1487,11 @@ def test_live_state_contexts_survive_packaged_host_byte_fallback_with_dynamic_st
         "hand_1",
         "warband_1",
     }
-    assert all(len(payload.get("cards", [])) <= 10 for payload in payloads)
+    assert all(
+        not isinstance(payload.get("cards"), list)
+        or len(payload["cards"]) <= 10
+        for payload in payloads
+    )
     serialized = json.dumps(payloads, ensure_ascii=False)
     assert "BG_RUNTIME_CARD" in serialized
     assert oversized not in serialized
@@ -995,10 +1506,15 @@ def test_live_state_contexts_survive_packaged_host_byte_fallback_with_dynamic_st
     ]
     runtime_rows = [card for card in rows if card[0] == "BG_RUNTIME_CARD_0"]
     assert runtime_rows
-    assert all(card[1] for card in runtime_rows)
+    assert all(card[1] is None for card in runtime_rows)
+    assert all(f"BG_RUNTIME_CARD_{index}" in serialized for index in range(10))
     assert all(card[2] == 1 for card in runtime_rows)
-    assert any(card[7].startswith("sg") for card in runtime_rows)
-    assert any("D" in card[7] for card in runtime_rows)
+    assert any(card[7] == "tavern_spell" and card[8] is True for card in runtime_rows)
+    schema = next(payload for payload in payloads if payload["segment"] == "schema")
+    assert any(
+        "divine_shield" in schema["keyword_sets"][card[10]]
+        for card in runtime_rows
+    )
 
 
 def test_live_state_contexts_change_with_mode_and_observation_time() -> None:
@@ -1040,11 +1556,11 @@ def test_live_state_contexts_change_with_mode_and_observation_time() -> None:
     assert '"turn":5' in constructed_prompt
     assert "PRIVATE_RUNTIME_CARD" in "\n".join(battlegrounds_prompts)
     revisions = {
-        json.loads(prompt.split(":", 1)[1])["revision"]
+        json.loads(prompt.split(":", 1)[1])["bundle"].split("@", 1)[0]
         for prompt in battlegrounds_prompts
     }
     assert len(revisions) == 1
-    assert next(iter(revisions)).startswith("g99:")
+    assert next(iter(revisions)).startswith("g2r:")
 
 
 def test_live_state_contexts_omit_stale_battlegrounds_areas() -> None:
@@ -1081,9 +1597,12 @@ def test_live_state_contexts_omit_stale_battlegrounds_areas() -> None:
     )
     payloads = [json.loads(text.split(":", 1)[1]) for text in contexts]
 
-    assert [payload["segment"] for payload in payloads] == ["core"]
-    assert payloads[0]["counts"]["shop"] is None
-    assert "shop" not in payloads[0]["complete_areas"]
+    assert [payload["segment"] for payload in payloads] == [
+        "core",
+        "contract",
+        "schema",
+    ]
+    assert "shop" not in payloads[0]["complete_counts"]
     assert "STALE_SHOP_CARD" not in json.dumps(payloads)
 
 
@@ -1128,11 +1647,10 @@ def test_live_state_contexts_omit_stale_battlegrounds_economy() -> None:
     )
     core = json.loads(contexts[0].split(":", 1)[1])
 
-    assert core["gold"] is None
-    assert core["max_gold"] is None
+    assert "gold" not in core
+    assert "max_gold" not in core
     assert core["tavern_tier"] == 4
-    assert core["frozen"] is None
-    assert core["refresh_actual_cost"] is None
-    assert core["upgrade_actual_cost"] is None
-    assert "shop" not in core["complete_areas"]
-    assert "economy" not in core["complete_areas"]
+    assert "frozen" not in core
+    assert "refresh_actual_cost" not in core
+    assert "upgrade_actual_cost" not in core
+    assert "shop" not in core["complete_counts"]

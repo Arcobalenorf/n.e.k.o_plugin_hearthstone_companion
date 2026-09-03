@@ -26,6 +26,8 @@ class Entity:
     realtime_fields: set[str] = field(default_factory=set)
     battlegrounds_realtime_boolean_baseline_complete: bool = False
     battlegrounds_game_state_boolean_baseline_complete: bool = False
+    realtime_keyword_baseline_complete: bool = False
+    game_state_keyword_baseline_complete: bool = False
     last_seen_at: float = 0.0
     last_revision: int = 0
     last_battlegrounds_round: int = 0
@@ -44,6 +46,13 @@ class Entity:
         return bool(
             self.battlegrounds_realtime_boolean_baseline_complete
             or self.battlegrounds_game_state_boolean_baseline_complete
+        )
+
+    @property
+    def keyword_baseline_complete(self) -> bool:
+        return bool(
+            self.realtime_keyword_baseline_complete
+            or self.game_state_keyword_baseline_complete
         )
 
     @property
@@ -135,6 +144,7 @@ class ConstructedCardSnapshot:
     durability: int | None = None
     exhausted: bool | None = None
     keywords: tuple[str, ...] = ()
+    keywords_complete: bool = False
     states: tuple[str, ...] = ()
 
     def to_public_dict(self) -> dict[str, Any]:
@@ -150,6 +160,7 @@ class ConstructedCardSnapshot:
             "durability": self.durability,
             "exhausted": self.exhausted,
             "keywords": list(self.keywords),
+            "keywords_complete": self.keywords_complete,
             "states": list(self.states),
         }
 
@@ -614,6 +625,7 @@ class RuntimeStatus:
     last_event_at: float = 0.0
     last_event_kind: str = ""
     last_error_code: str = ""
+    snapshot_revision: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -629,4 +641,5 @@ class RuntimeStatus:
             "last_event_at": self.last_event_at,
             "last_event_kind": self.last_event_kind,
             "last_error_code": self.last_error_code,
+            "snapshot_revision": self.snapshot_revision,
         }

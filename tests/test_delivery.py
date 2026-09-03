@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import threading
 from dataclasses import dataclass
 from typing import Any
 
 import pytest
 from hearthstone_companion_under_test.delivery import (
     LiveStatePublisher,
-    QueryLedger,
     semantic_snapshot_fingerprint,
 )
 
@@ -254,300 +252,296 @@ def test_partial_publish_cleanup_failure_is_retried_immediately() -> None:
     assert publisher.publish(snapshot, target="role-a", now=10.1)
     assert publisher.cursor is not None
     assert publisher.cursor.complete is True
+    assert len(calls) == 7
+
+
+def test_serialization_failure_tombstones_previous_complete_cursor() -> None:
+    calls: list[dict[str, Any]] = []
+    old = FakeSnapshot(1, {"turn": 3})
+    updated = FakeSnapshot(1, {"turn": 4})
+
+    def build(snapshot: FakeSnapshot, **_kwargs: Any) -> tuple[tuple[str, str], ...]:
+        if snapshot is updated:
+            raise ValueError("serialization failed")
+        return (("core", "old-core"), ("board", "old-board"))
+
+    publisher = LiveStatePublisher(
+        push_message=lambda **message: calls.append(message) or {"submitted": True},
+        build_segments=build,
+        logger=None,
+        max_prompt_bytes=900,
+    )
+
+    assert publisher.publish(old, target="role-a", now=10.0)
+    assert not publisher.publish(updated, target="role-a", now=11.0)
+    assert publisher.cursor is None
+    assert [call["metadata"]["context_expired"] for call in calls] == [
+        False,
+        False,
+        True,
+        True,
+    ]
+    assert [call["metadata"]["segment"] for call in calls[-2:]] == [
+        "core",
+        "board",
+    ]
+
+
+def test_empty_serialization_tombstones_previous_complete_cursor() -> None:
+    calls: list[dict[str, Any]] = []
+    old = FakeSnapshot(1, {"turn": 3})
+    updated = FakeSnapshot(1, {"turn": 4})
+
+    publisher = LiveStatePublisher(
+        push_message=lambda **message: calls.append(message) or {"submitted": True},
+        build_segments=lambda snapshot, **_kwargs: (
+            (("core", "old-core"),) if snapshot is old else ()
+        ),
+        logger=None,
+        max_prompt_bytes=900,
+    )
+
+    assert publisher.publish(old, target="role-a", now=10.0)
+    assert not publisher.publish(updated, target="role-a", now=11.0)
+    assert publisher.cursor is None
+    assert calls[-1]["metadata"]["context_expired"] is True
+    assert calls[-1]["metadata"]["segment"] == "core"
+
+
+def test_failed_serialization_tombstone_leaves_partial_cursor_for_retry() -> None:
+    outcomes = iter([True, False, True])
+    calls: list[dict[str, Any]] = []
+    old = FakeSnapshot(1, {"turn": 3})
+    updated = FakeSnapshot(1, {"turn": 4})
+
+    def push(**message: Any) -> dict[str, bool]:
+        calls.append(message)
+        return {"submitted": next(outcomes)}
+
+    def build(snapshot: FakeSnapshot, **_kwargs: Any) -> tuple[tuple[str, str], ...]:
+        if snapshot is updated:
+            raise ValueError("serialization failed")
+        return (("core", "old-core"),)
+
+    publisher = LiveStatePublisher(
+        push_message=push,
+        build_segments=build,
+        logger=None,
+        max_prompt_bytes=900,
+    )
+
+    assert publisher.publish(old, target="role-a", now=10.0)
+    assert not publisher.publish(updated, target="role-a", now=11.0)
+    assert publisher.cursor is not None
+    assert publisher.cursor.complete is False
+    assert publisher.cursor.segments == ("core",)
+
+    assert not publisher.publish(updated, target="role-a", now=11.1)
+    assert publisher.cursor is None
+    assert [call["metadata"]["context_expired"] for call in calls] == [
+        False,
+        True,
+        True,
+    ]
+
+
+def test_delivery_invalidated_before_first_segment_expires_old_bundle() -> None:
+    calls: list[dict[str, Any]] = []
+    old = FakeSnapshot(1, {"turn": 3})
+    updated = FakeSnapshot(1, {"turn": 4})
+    publisher = LiveStatePublisher(
+        push_message=lambda **message: calls.append(message) or {"submitted": True},
+        build_segments=lambda snapshot, **_kwargs: (
+            ("core", f"core-{snapshot.payload['turn']}"),
+            ("board", f"board-{snapshot.payload['turn']}"),
+        ),
+        logger=None,
+        max_prompt_bytes=900,
+    )
+
+    assert publisher.publish(old, target="role-a", now=10.0)
+    assert not publisher.publish(
+        updated,
+        target="role-a",
+        now=11.0,
+        valid=lambda: False,
+    )
+
+    assert publisher.cursor is None
+    assert [call["metadata"]["segment"] for call in calls[-2:]] == [
+        "core",
+        "board",
+    ]
+    assert all(call["metadata"]["context_expired"] for call in calls[-2:])
+
+
+def test_mid_publish_invalidation_tombstones_old_and_new_segment_union() -> None:
+    calls: list[dict[str, Any]] = []
+    validity = iter([True, False])
+    old = FakeSnapshot(1, {"turn": 3, "shop": True})
+    updated = FakeSnapshot(1, {"turn": 4, "shop": False})
+
+    def segments(snapshot: FakeSnapshot, **_kwargs: Any) -> tuple[tuple[str, str], ...]:
+        core = (("core", f"core-{snapshot.payload['turn']}"),)
+        return (*core, ("shop", "old-shop")) if snapshot.payload["shop"] else core
+
+    publisher = LiveStatePublisher(
+        push_message=lambda **message: calls.append(message) or {"submitted": True},
+        build_segments=segments,
+        logger=None,
+        max_prompt_bytes=900,
+    )
+
+    assert publisher.publish(old, target="role-a", now=10.0)
+    assert not publisher.publish(
+        updated,
+        target="role-a",
+        now=11.0,
+        valid=lambda: next(validity),
+    )
+
+    assert publisher.cursor is None
+    tombstones = [call for call in calls if call["metadata"]["context_expired"]]
+    assert [call["metadata"]["segment"] for call in tombstones] == [
+        "shop",
+        "core",
+    ]
+
+
+def test_mid_publish_invalidation_cleanup_failure_retries_full_bundle() -> None:
+    outcomes = iter([True, True, True, False, True, True, True, True])
+    calls: list[dict[str, Any]] = []
+    validity = iter([True, False])
+    old = FakeSnapshot(1, {"turn": 3})
+    updated = FakeSnapshot(1, {"turn": 4})
+
+    def push(**message: Any) -> dict[str, bool]:
+        calls.append(message)
+        return {"submitted": next(outcomes)}
+
+    publisher = LiveStatePublisher(
+        push_message=push,
+        build_segments=lambda snapshot, **_kwargs: (
+            ("core", f"core-{snapshot.payload['turn']}"),
+            ("shop", f"shop-{snapshot.payload['turn']}"),
+        ),
+        logger=None,
+        max_prompt_bytes=900,
+    )
+
+    assert publisher.publish(old, target="role-a", now=10.0)
+    assert not publisher.publish(
+        updated,
+        target="role-a",
+        now=11.0,
+        valid=lambda: next(validity),
+    )
+    assert publisher.cursor is not None
+    assert publisher.cursor.complete is False
+    assert publisher.cursor.segments == ("core", "shop")
+
+    assert publisher.publish(
+        updated,
+        target="role-a",
+        now=11.1,
+        valid=lambda: True,
+    )
+    assert publisher.cursor is not None
+    assert publisher.cursor.complete is True
     assert len(calls) == 8
 
 
-def test_query_ledger_requires_role_scope_for_observe_and_claim() -> None:
-    ledger = QueryLedger()
+def test_validity_exception_expires_deduplicated_context() -> None:
+    calls: list[dict[str, Any]] = []
+    snapshot = FakeSnapshot(1, {"turn": 3})
+    publisher = _publisher(calls, refresh_seconds=30.0)
 
-    with pytest.raises(ValueError, match="non-empty text and target"):
-        ledger.observe("现在第几回合", target="", source_timestamp=100.0)
-    assert ledger.claim(owner="tool", text="现在第几回合", target="") is None
+    assert publisher.publish(snapshot, target="role-a", now=10.0)
 
+    def invalid() -> bool:
+        raise RuntimeError("source generation unavailable")
 
-def test_role_scoped_agent_claim_correlates_with_late_memory() -> None:
-    ledger = QueryLedger()
-    provisional = ledger.claim(
-        owner="agent",
-        text="现在第几回合",
+    assert not publisher.publish(
+        snapshot,
         target="role-a",
-        now=105.0,
+        now=10.1,
+        valid=invalid,
     )
-    assert provisional is not None
-
-    observed = ledger.observe(
-        "现在第几回合",
-        target="role-a",
-        source_timestamp=100.0,
-        intent="overview",
-        now=105.1,
-    )
-
-    assert observed is provisional
-    assert observed.claimed_by == "agent"
-    assert observed.source_timestamp == 100.0
-    assert ledger.pending(now=106.0, min_age=0.0) == ()
+    assert publisher.cursor is None
+    assert calls[-1]["metadata"]["context_expired"] is True
 
 
-def test_roleless_tool_cannot_change_another_roles_pending_query() -> None:
-    ledger = QueryLedger()
-    role_a = ledger.observe(
-        "现在第几回合",
-        target="role-a",
-        source_timestamp=100.0,
-        now=100.0,
-    )
+def test_fingerprint_failure_expires_previous_context() -> None:
+    calls: list[dict[str, Any]] = []
+    publisher = _publisher(calls)
+    old = FakeSnapshot(1, {"turn": 3})
 
-    assert ledger.claim(owner="tool", text=role_a.text, target="", now=101.0) is None
-    assert role_a.claimed_by == ""
-    assert ledger.pending(now=102.0, min_age=1.0) == (role_a,)
+    class BrokenSnapshot:
+        game_number = 1
 
+        def to_public_dict(self) -> dict[str, Any]:
+            raise ValueError("snapshot unavailable")
 
-def test_claims_are_isolated_by_role_and_exact_question() -> None:
-    ledger = QueryLedger()
-    role_a = ledger.observe(
-        "现在第几回合", target="role-a", source_timestamp=100.0, now=100.0
-    )
-    role_b = ledger.observe(
-        "现在第几回合", target="role-b", source_timestamp=100.1, now=100.1
-    )
-
-    wrong_text = ledger.claim(
-        owner="agent", text="商店里有什么", target="role-a", now=101.0
-    )
-    assert wrong_text is not None
-    assert wrong_text is not role_a
-    assert ledger.claim(
-        owner="agent", text=role_b.text, target=role_b.target, now=101.1
-    ) is role_b
-    assert role_a.claimed_by == ""
+    assert publisher.publish(old, target="role-a", now=10.0)
+    assert not publisher.publish(BrokenSnapshot(), target="role-a", now=11.0)
+    assert publisher.cursor is None
+    assert calls[-1]["metadata"]["context_expired"] is True
 
 
-def test_memory_replay_preserves_committed_claim_identity() -> None:
-    ledger = QueryLedger()
-    observed = ledger.observe(
-        "现在第几回合", target="role-a", source_timestamp=100.0, now=100.0
-    )
-    fallback = ledger.claim(
-        owner="fallback", text=observed.text, target=observed.target, now=101.0
-    )
-    assert fallback is observed
-    assert ledger.commit(
-        fallback, owner="fallback", submit=lambda: True, now=101.1
+@pytest.mark.parametrize(
+    "segments",
+    [
+        (("board", "board-state"),),
+        (("core", "core-state"), ("core", "duplicate")),
+        (("", "core-state"),),
+        (("core", ""),),
+        (("core", None),),
+        (("core", "x" * 901),),
+        (("core", "core-state", "extra"),),
+    ],
+)
+def test_invalid_segment_bundle_expires_previous_context(segments: Any) -> None:
+    calls: list[dict[str, Any]] = []
+    old = FakeSnapshot(1, {"turn": 3})
+    updated = FakeSnapshot(1, {"turn": 4})
+    publisher = LiveStatePublisher(
+        push_message=lambda **message: calls.append(message) or {"submitted": True},
+        build_segments=lambda snapshot, **_kwargs: (
+            (("core", "old-core"),) if snapshot is old else segments
+        ),
+        logger=None,
+        max_prompt_bytes=900,
     )
 
-    replayed = ledger.observe(
-        "现在第几回合", target="role-a", source_timestamp=100.0, now=102.0
+    assert publisher.publish(old, target="role-a", now=10.0)
+    assert not publisher.publish(updated, target="role-a", now=11.0)
+    assert publisher.cursor is None
+    assert calls[-1]["metadata"]["context_expired"] is True
+
+
+def test_segment_generator_failure_expires_previous_context() -> None:
+    calls: list[dict[str, Any]] = []
+    old = FakeSnapshot(1, {"turn": 3})
+    updated = FakeSnapshot(1, {"turn": 4})
+
+    def build(snapshot: FakeSnapshot, **_kwargs: Any) -> Any:
+        if snapshot is old:
+            return (("core", "old-core"),)
+
+        def broken_segments() -> Any:
+            yield ("core", "new-core")
+            raise ValueError("late serialization failure")
+
+        return broken_segments()
+
+    publisher = LiveStatePublisher(
+        push_message=lambda **message: calls.append(message) or {"submitted": True},
+        build_segments=build,
+        logger=None,
+        max_prompt_bytes=900,
     )
 
-    assert replayed is observed
-    assert replayed.committed_by == "fallback"
-    assert replayed.committed_at == 101.1
-    assert ledger.pending(now=103.0, min_age=0.0) == ()
-
-
-def test_new_memory_timestamp_is_a_new_same_text_utterance_within_five_seconds() -> None:
-    ledger = QueryLedger()
-    first = ledger.observe(
-        "现在第几回合", target="role-a", source_timestamp=100.0, now=100.0
-    )
-    first_agent = ledger.claim(
-        owner="agent", text=first.text, target=first.target, now=100.1
-    )
-    assert first_agent is first
-
-    second = ledger.observe(
-        first.text,
-        target=first.target,
-        source_timestamp=100.2,
-        intent="overview",
-        now=100.2,
-    )
-    second_agent = ledger.claim(
-        owner="agent", text=second.text, target=second.target, now=100.3
-    )
-
-    assert second is not first
-    assert second_agent is second
-    assert second.claimed_by == "agent"
-    assert second.intent == "overview"
-    assert second.source_timestamp == 100.2
-    assert ledger.pending(now=101.0, min_age=0.0) == ()
-
-
-def test_trusted_agent_can_answer_same_text_again_before_memory_poll() -> None:
-    ledger = QueryLedger()
-    first = ledger.observe(
-        "现在第几回合", target="role-a", source_timestamp=100.0, now=100.0
-    )
-    assert ledger.claim(
-        owner="agent",
-        text=first.text,
-        target=first.target,
-        now=100.1,
-        new_if_handled=True,
-    ) is first
-
-    second = ledger.claim(
-        owner="agent",
-        text=first.text,
-        target=first.target,
-        now=100.2,
-        new_if_handled=True,
-    )
-
-    assert second is not None
-    assert second is not first
-    assert second.source_timestamp == 0.0
-    assert second.claimed_by == "agent"
-    assert ledger.pending(now=100.3, min_age=0.0) == ()
-
-
-def test_newer_same_text_observation_is_a_new_utterance() -> None:
-    ledger = QueryLedger()
-    old = ledger.observe(
-        "现在第几回合", target="role-a", source_timestamp=100.0, now=100.0
-    )
-    claimed = ledger.claim(
-        owner="agent", text=old.text, target=old.target, now=101.0
-    )
-    assert claimed is old
-
-    current = ledger.observe(
-        "现在第几回合", target="role-a", source_timestamp=110.0, now=110.0
-    )
-
-    assert current is not old
-    assert current.claimed_by == ""
-    assert ledger.pending(now=111.0, min_age=1.0) == (current,)
-
-
-def test_old_memory_replay_cannot_consume_new_agent_claim() -> None:
-    ledger = QueryLedger()
-    old = ledger.observe(
-        "现在第几回合", target="role-a", source_timestamp=100.0, now=100.0
-    )
-    assert ledger.claim(
-        owner="agent", text=old.text, target=old.target, now=101.0
-    ) is old
-    current = ledger.claim(
-        owner="agent", text=old.text, target=old.target, now=106.1
-    )
-    assert current is not None
-    assert current is not old
-
-    replayed_old = ledger.observe(
-        old.text, target=old.target, source_timestamp=90.0, now=106.2
-    )
-    observed_current = ledger.observe(
-        old.text, target=old.target, source_timestamp=106.0, now=106.3
-    )
-
-    assert replayed_old is current
-    assert observed_current is current
-    assert observed_current.claimed_by == "agent"
-
-
-def test_trusted_agent_can_preempt_uncommitted_same_role_fallback() -> None:
-    ledger = QueryLedger()
-    observed = ledger.observe(
-        "商店里有什么", target="role-a", source_timestamp=100.0, now=100.0
-    )
-    fallback = ledger.claim(
-        owner="fallback", text=observed.text, target=observed.target, now=101.0
-    )
-    assert fallback is observed
-
-    agent = ledger.claim(
-        owner="agent",
-        text=observed.text,
-        target=observed.target,
-        preempt_owners=("fallback",),
-        now=101.1,
-    )
-
-    assert agent is observed
-    assert observed.claimed_by == "agent"
-
-
-def test_commit_serializes_against_agent_preemption() -> None:
-    ledger = QueryLedger()
-    observed = ledger.observe(
-        "现在第几回合", target="role-a", source_timestamp=100.0, now=100.0
-    )
-    fallback = ledger.claim(
-        owner="fallback", text=observed.text, target=observed.target, now=101.0
-    )
-    assert fallback is observed
-
-    submit_entered = threading.Event()
-    allow_submit = threading.Event()
-    agent_finished = threading.Event()
-    commit_results: list[bool] = []
-    agent_results: list[object | None] = []
-
-    def submit() -> bool:
-        submit_entered.set()
-        assert allow_submit.wait(timeout=2.0)
-        return True
-
-    def commit_fallback() -> None:
-        commit_results.append(
-            ledger.commit(fallback, owner="fallback", submit=submit, now=101.1)
-        )
-
-    def claim_agent() -> None:
-        agent_results.append(
-            ledger.claim(
-                owner="agent",
-                text=observed.text,
-                target=observed.target,
-                preempt_owners=("fallback",),
-                new_if_handled=True,
-                now=101.2,
-            )
-        )
-        agent_finished.set()
-
-    commit_thread = threading.Thread(target=commit_fallback)
-    agent_thread = threading.Thread(target=claim_agent)
-    commit_thread.start()
-    assert submit_entered.wait(timeout=2.0)
-    agent_thread.start()
-    assert not agent_finished.wait(timeout=0.05)
-    allow_submit.set()
-    commit_thread.join(timeout=2.0)
-    agent_thread.join(timeout=2.0)
-
-    assert not commit_thread.is_alive()
-    assert not agent_thread.is_alive()
-    assert commit_results == [True]
-    assert agent_results == [None]
-    assert observed.committed_by == "fallback"
-
-
-def test_query_ledger_releases_failed_fallback_for_retry() -> None:
-    ledger = QueryLedger()
-    observed = ledger.observe(
-        "酒馆里有什么", target="role-a", source_timestamp=100.0, now=100.0
-    )
-    claim = ledger.claim(
-        owner="fallback", text=observed.text, target=observed.target, now=102.0
-    )
-    assert claim is observed
-    assert ledger.release(observed, owner="fallback")
-    assert ledger.pending(now=103.0, min_age=1.0) == (observed,)
-
-
-def test_query_ledger_clear_drops_pending_and_claimed_queries() -> None:
-    ledger = QueryLedger()
-    ledger.observe(
-        "现在第几回合", target="role-a", source_timestamp=100.0, now=100.0
-    )
-    ledger.claim(
-        owner="agent", text="商店里有什么", target="role-a", now=100.0
-    )
-
-    ledger.clear()
-
-    assert ledger.pending(now=101.0, min_age=0.0) == ()
+    assert publisher.publish(old, target="role-a", now=10.0)
+    assert not publisher.publish(updated, target="role-a", now=11.0)
+    assert publisher.cursor is None
+    assert calls[-1]["metadata"]["context_expired"] is True

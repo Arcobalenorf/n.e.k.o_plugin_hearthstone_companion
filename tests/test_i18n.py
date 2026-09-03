@@ -83,6 +83,15 @@ def test_panel_literal_translation_keys_exist() -> None:
     assert literal_keys <= translations.keys()
 
 
+def test_diagnostic_export_uses_the_hosted_file_bridge() -> None:
+    panel_source = (ROOT / "ui" / "panel.tsx").read_text(encoding="utf-8")
+
+    assert "FileDownload" in panel_source
+    assert "path={diagnosticExport.path}" in panel_source
+    assert "window.atob" not in panel_source
+    assert "URL.createObjectURL" not in panel_source
+
+
 def test_package_versions_match() -> None:
     with (ROOT / "plugin.toml").open("rb") as handle:
         manifest = tomllib.load(handle)
@@ -94,7 +103,10 @@ def test_package_versions_match() -> None:
     locked_project = next(
         package for package in lock["package"] if package["name"] == "hearthstone-companion"
     )
-    assert manifest["plugin"]["version"] == project["project"]["version"] == locked_project["version"]
+    version = manifest["plugin"]["version"]
+    entry_source = (ROOT / "__init__.py").read_text(encoding="utf-8")
+    assert version == project["project"]["version"] == locked_project["version"]
+    assert f'_PLUGIN_VERSION = "{version}"' in entry_source
 
 
 def test_network_user_agent_matches_package_version() -> None:
@@ -143,6 +155,18 @@ def test_panel_consent_and_do_not_disturb_controls_are_independent() -> None:
     ).read_text(encoding="utf-8")
 
 
+def test_panel_only_submits_settings_fields_changed_by_the_user() -> None:
+    panel_source = (ROOT / "ui" / "panel.tsx").read_text(encoding="utf-8")
+
+    assert "const [draftPatch, setDraftPatch] = useState<Partial<SettingsDraft>>({})" in panel_source
+    assert "const draftDirty = Object.keys(draftPatch).length > 0" in panel_source
+    assert "setDraftPatch((current) => ({ ...current, ...patch }))" in panel_source
+    assert "const submitted = { ...draftPatch }" in panel_source
+    assert '"save_settings",\n      submitted,' in panel_source
+    assert 'runAction("save_settings", draft,' not in panel_source
+    assert "if (remaining[key] === submitted[key]) delete remaining[key]" in panel_source
+
+
 def test_successful_action_is_not_reclassified_when_followup_refresh_fails() -> None:
     panel_source = (ROOT / "ui" / "panel.tsx").read_text(encoding="utf-8")
 
@@ -162,7 +186,11 @@ def test_panel_auto_refresh_is_serial_silent_and_preserves_dirty_drafts() -> Non
     assert "await refreshContext(false)" in panel_source
     assert "await refreshContext(true)" in panel_source
     assert "Background refresh is best-effort" in panel_source
-    assert "if (draftDirty) return" in panel_source
+    assert "if (draftDirty) return" not in panel_source
+    assert "...asSettingsDraft(safeState.settings),\n      ...draftPatch," in panel_source
+    assert "}, [safeState.settings, draftPatch])" in panel_source
+    assert "if (preserveDraftOnCleanRef.current)" in panel_source
+    assert "preserveDraftOnCleanRef.current = false" in panel_source
     assert "if (logPathDirty) return" in panel_source
 
 

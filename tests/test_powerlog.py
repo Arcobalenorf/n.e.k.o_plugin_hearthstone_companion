@@ -750,6 +750,7 @@ def test_constructed_snapshot_exposes_visible_local_cards_and_public_board_detai
     assert hand["CS2_029"]["cost"] == 3
     assert [card["card_type"] for card in player["board"]["minions"]] == ["MINION"]
     assert player["board"]["minions"][0]["keywords"] == ["taunt"]
+    assert player["board"]["minions"][0]["keywords_complete"] is True
     assert player["locations"][0]["durability"] == 2
     assert opponent["board"]["count"] == 1
     assert opponent["board"]["attack"] == 2
@@ -758,6 +759,40 @@ def test_constructed_snapshot_exposes_visible_local_cards_and_public_board_detai
     ]
     assert opponent["hand"]["known_cards"] == []
     assert "OPPONENT_REVOKED" not in json.dumps(public)
+
+
+def test_constructed_keywords_are_complete_only_after_full_entity_packet_closes() -> None:
+    parser = PowerLogParser()
+    feed(
+        parser,
+        "CREATE_GAME",
+        "Player EntityID=2 PlayerID=1 GameAccountId=[hi=0 lo=0]",
+        "Player EntityID=3 PlayerID=2 GameAccountId=[hi=0 lo=0]",
+        "SHOW_ENTITY - Updating Entity=[entityName=幸运币 id=40 zone=HAND "
+        "zonePos=1 cardId= player=2] CardID=GAME_005",
+    )
+    parser.feed_line(
+        "D 12:00:00.0000000 GameState.DebugPrintGame() - GameType=GT_RANKED",
+        now=100.0,
+    )
+    add_entity(parser, 21, "MINION_WITHOUT_KEYWORDS", controller=2, zone="PLAY", card_type="MINION")
+    feed(
+        parser,
+        "    tag=ZONE_POSITION value=1",
+        "    tag=ATK value=4",
+        "    tag=HEALTH value=6",
+        now=101.0,
+    )
+
+    pending = parser.snapshot().constructed.player.board[0]
+    assert pending.keywords == ()
+    assert pending.keywords_complete is False
+
+    feed(parser, "TAG_CHANGE Entity=2 tag=RESOURCES value=3", now=102.0)
+
+    complete = parser.snapshot().constructed.player.board[0]
+    assert complete.keywords == ()
+    assert complete.keywords_complete is True
 
 
 def test_constructed_local_choice_is_exposed_then_cleared_without_player_name() -> None:
@@ -2292,6 +2327,82 @@ def test_battlegrounds_shop_area_uses_oldest_entity_as_complete_observation() ->
     assert area.observed_at == 100.0
 
 
+@pytest.mark.parametrize(
+    ("zone", "area_name"),
+    [("HAND", "hand"), ("PLAY", "warband")],
+)
+def test_battlegrounds_local_area_rejects_previous_round_entities(
+    zone: str,
+    area_name: str,
+) -> None:
+    parser = recruit_parser()
+    parser.battlegrounds_round = 2
+    parser.phase = "recruit"
+    add_entity(
+        parser,
+        300,
+        "BG_STALE_LOCAL_CARD",
+        controller=3,
+        zone=zone,
+        card_type="MINION",
+    )
+    feed(parser, "    tag=ZONE_POSITION value=1", now=100.0)
+    parser.finalize_quiet_packet_baselines(now=100.1, quiet_seconds=0.0)
+
+    parser.battlegrounds_round = 3
+    feed(parser, "TAG_CHANGE Entity=8 tag=RESOURCES value=5", now=102.0)
+
+    area = parser.snapshot().battlegrounds.areas[area_name]
+    assert area.complete is False
+    assert area.round == 0
+    assert area.phase == "unknown"
+
+
+def test_battlegrounds_empty_local_areas_require_current_membership_evidence() -> None:
+    parser = recruit_parser()
+    parser.battlegrounds_round = 2
+    parser.phase = "recruit"
+    feed(parser, "TAG_CHANGE Entity=8 tag=RESOURCES value=5", now=100.0)
+
+    battlegrounds = parser.snapshot().battlegrounds
+    assert battlegrounds.areas["hand"].complete is False
+    assert battlegrounds.areas["warband"].complete is False
+
+
+@pytest.mark.parametrize(
+    ("zone", "area_name"),
+    [("HAND", "hand"), ("PLAY", "warband")],
+)
+def test_battlegrounds_local_area_accepts_observed_transition_to_empty(
+    zone: str,
+    area_name: str,
+) -> None:
+    parser = recruit_parser()
+    parser.battlegrounds_round = 2
+    parser.phase = "recruit"
+    add_entity(
+        parser,
+        300,
+        "BG_LOCAL_CARD",
+        controller=3,
+        zone=zone,
+        card_type="MINION",
+    )
+    feed(parser, "    tag=ZONE_POSITION value=1", now=100.0)
+    parser.finalize_quiet_packet_baselines(now=100.1, quiet_seconds=0.0)
+    assert parser.snapshot().battlegrounds.areas[area_name].complete is True
+
+    feed(parser, "TAG_CHANGE Entity=300 tag=ZONE value=GRAVEYARD", now=102.0)
+
+    battlegrounds = parser.snapshot().battlegrounds
+    area = battlegrounds.areas[area_name]
+    assert getattr(battlegrounds, area_name if area_name != "warband" else "warband") == ()
+    assert area.complete is True
+    assert area.round == 2
+    assert area.phase == "recruit"
+    assert area.observed_at == 102.0
+
+
 def test_battlegrounds_snapshot_exposes_only_observed_economy_costs() -> None:
     parser = PowerLogParser()
     feed(
@@ -2501,6 +2612,33 @@ def test_battlegrounds_button_cost_does_not_carry_stale_override_forward() -> No
     assert battlegrounds is not None
     assert battlegrounds.refresh_cost == 1
     assert battlegrounds.economy.refresh_observation.complete is True
+
+
+def test_battlegrounds_button_current_override_beats_later_base_cost() -> None:
+    parser = recruit_parser()
+    parser.battlegrounds_round = 3
+    parser.phase = "recruit"
+    add_entity(
+        parser,
+        50,
+        "TB_BaconShopTechUp02_Button",
+        controller=3,
+        zone="PLAY",
+        card_type="GAME_MODE_BUTTON",
+    )
+    feed(
+        parser,
+        "    tag=GAME_MODE_BUTTON_SLOT value=3",
+        "    tag=BACON_OVERRIDE_BG_COST value=2",
+        now=101.0,
+    )
+    feed(parser, "    tag=COST value=5", now=102.0)
+
+    battlegrounds = parser.snapshot().battlegrounds
+
+    assert battlegrounds is not None
+    assert battlegrounds.upgrade_cost == 2
+    assert battlegrounds.economy.upgrade_observation.complete is True
 
 
 def test_battlegrounds_gold_cannot_borrow_unrelated_player_tag_freshness() -> None:

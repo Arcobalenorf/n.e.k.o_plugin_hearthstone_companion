@@ -123,6 +123,7 @@ class CompanionMonitor:
         self._status.last_event_at = 0.0
         self._status.last_event_kind = ""
         self._status.last_error_code = ""
+        self._status.snapshot_revision = 0
 
     def _reset_reader_locked(self) -> None:
         self._parser = PowerLogParser()
@@ -346,6 +347,8 @@ class CompanionMonitor:
                             and self._snapshot.phase not in {"idle", "ended", "spectator"}
                         )
                         self._snapshot = snapshot
+                        if state_changed:
+                            self._status.snapshot_revision += 1
                         active_snapshot = bool(
                             snapshot.game_number > 0
                             and snapshot.phase not in {"idle", "ended", "spectator"}

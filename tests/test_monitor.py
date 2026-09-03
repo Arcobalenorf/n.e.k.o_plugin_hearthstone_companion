@@ -330,6 +330,12 @@ def test_active_constructed_bootstrap_notifies_state_ready_without_replaying_eve
     assert results == []
     assert monitor.status().events_seen == 0
     assert monitor.status().llm_submissions == 0
+    assert monitor.status().snapshot_revision > 0
+
+    with monitor._lock:
+        monitor._begin_source_generation_locked()
+
+    assert monitor.status().snapshot_revision == 0
 
 
 def test_live_terminal_event_replaces_state_unavailable_and_keeps_final_snapshot() -> None:

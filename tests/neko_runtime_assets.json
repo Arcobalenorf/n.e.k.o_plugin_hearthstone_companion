@@ -1,0 +1,28 @@
+{
+  "schema": "neko_chat_runtime_assets_v1",
+  "neko_revision": "50e23ac5403fcddc96e0dfb9fc78075f32a2428e",
+  "runtime": {
+    "export_method": "git_archive_tracked_files_v1",
+    "root_git_tree": "7348382871e819f3ed4a001c6f9dcf7279165ee2",
+    "source_file_count": 3734,
+    "final_file_count": 3736,
+    "final_sha256": "17afcb5dabe07ec3ba108dc9c64e43078b17ffa5c9a905fd0458bdf3a95ece5f"
+  },
+  "source": {
+    "path": "frontend/react-neko-chat",
+    "git_tree": "1964aac0c1a8462f61312f4eb047e171ad21b213",
+    "node_major": 22,
+    "install_command": "npm ci",
+    "build_command": "npm run build"
+  },
+  "assets": {
+    "neko-chat-window.iife.js": {
+      "bytes": 1265456,
+      "sha256": "49199ff350ae39bc4e25c060fcf1c9bee09e554cc61c3e8705fd8b30fb04e59f"
+    },
+    "neko-chat-window.css": {
+      "bytes": 1613784,
+      "sha256": "2726f1f91ba23eda0ca2ab060c2f5a89b279a4237108b47728c2074f8c0184d1"
+    }
+  }
+}

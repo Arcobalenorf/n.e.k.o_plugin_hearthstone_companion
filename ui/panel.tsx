@@ -1,6 +1,7 @@
 import {
   Alert,
   Button,
+  FileDownload,
   ButtonGroup,
   Card,
   DataTable,
@@ -68,9 +69,51 @@ type RuntimeState = {
   events_seen?: number
   llm_submissions?: number
   last_line_at?: number
+  last_state_at?: number
   last_event_at?: number
   last_event_kind?: string
   last_error_code?: string
+  snapshot_revision?: number
+}
+
+type RouteDiagnosticState = {
+  status?: string
+  reason?: string
+  observed_at?: number
+  mode?: string
+  focus?: string
+}
+
+type DiagnosticHealthState = {
+  log?: {
+    fresh?: boolean
+    line_age_seconds?: number | null
+    state_age_seconds?: number | null
+    freshness_limit_seconds?: number
+  }
+  snapshot?: {
+    source_generation?: number
+    revision?: number
+    mode?: string
+    phase?: string
+    game_number?: number
+    round?: number
+  }
+  tool_registration?: {
+    status?: string
+    reason?: string
+    checked_at?: number
+    missing?: string[]
+    recovered_count?: number
+    error_code?: string
+    check_in_flight?: boolean
+    retry_after_seconds?: number
+  }
+  routes?: {
+    agent?: RouteDiagnosticState
+    lifecycle?: RouteDiagnosticState
+    llm_tool?: RouteDiagnosticState
+  }
 }
 
 type GameState = {
@@ -248,6 +291,7 @@ type DashboardState = {
     degraded_reason?: string
     dataset?: { provider?: string; patch?: string; checked_at?: number; stale?: boolean }
   }
+  diagnostics?: DiagnosticHealthState
 }
 
 type SettingsDraft = {
@@ -296,9 +340,9 @@ function asSettingsDraft(value?: SettingsState): SettingsDraft {
 }
 
 function stateTone(value: string): Tone {
-  if (["watching", "playing", "running"].includes(value)) return "success"
-  if (["degraded", "unavailable", "error"].includes(value)) return "danger"
-  if (["waiting", "waiting_for_log", "starting", "mulligan"].includes(value)) return "warning"
+  if (["watching", "playing", "running", "healthy", "submitted", "callback_succeeded", "fresh"].includes(value)) return "success"
+  if (["degraded", "unavailable", "error", "unhealthy", "failed"].includes(value)) return "danger"
+  if (["waiting", "waiting_for_log", "starting", "mulligan", "skipped", "rejected", "not_checked", "never"].includes(value)) return "warning"
   if (["bootstrap_incomplete", "spectator", "ended"].includes(value)) return "info"
   return "default"
 }
@@ -341,6 +385,14 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
   const catalog = safeState.card_catalog || {}
   const catalogDataset = catalog.dataset || {}
   const privacy = safeState.privacy || {}
+  const diagnostics = safeState.diagnostics || {}
+  const diagnosticSnapshot = diagnostics.snapshot || {}
+  const diagnosticLog = diagnostics.log || {}
+  const toolRegistration = diagnostics.tool_registration || {}
+  const diagnosticRoutes = diagnostics.routes || {}
+  const agentDiagnostic = diagnosticRoutes.agent || {}
+  const lifecycleDiagnostic = diagnosticRoutes.lifecycle || {}
+  const llmToolDiagnostic = diagnosticRoutes.llm_tool || {}
   const player = game.player || {}
   const opponent = game.opponent || {}
   const playerBoard = player.board || {}
@@ -348,7 +400,8 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
   const toast = useToast()
   const confirm = useConfirm()
   const [draft, setDraft] = useState<SettingsDraft>(() => asSettingsDraft(safeState.settings))
-  const [draftDirty, setDraftDirty] = useState(false)
+  const [draftPatch, setDraftPatch] = useState<Partial<SettingsDraft>>({})
+  const draftDirty = Object.keys(draftPatch).length > 0
   const [logPathDraft, setLogPathDraft] = useState(() => String(safeState.settings?.log_path || ""))
   const [logPathDirty, setLogPathDirty] = useState(false)
   const [logPathNotice, setLogPathNotice] = useState("")
@@ -357,6 +410,7 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
   const [notice, setNotice] = useState("")
   const [failure, setFailure] = useState("")
   const [refreshWarning, setRefreshWarning] = useState("")
+  const [diagnosticExport, setDiagnosticExport] = useState<{ path: string; filename: string } | null>(null)
   const [manualRefreshBusy, setManualRefreshBusy] = useState(false)
   const preserveDraftOnCleanRef = useRef(false)
   const preserveLogPathOnCleanRef = useRef(false)
@@ -401,13 +455,15 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
   }, [])
 
   useEffect(() => {
-    if (draftDirty) return
     if (preserveDraftOnCleanRef.current) {
       preserveDraftOnCleanRef.current = false
       return
     }
-    setDraft(asSettingsDraft(safeState.settings))
-  }, [safeState.settings, draftDirty])
+    setDraft({
+      ...asSettingsDraft(safeState.settings),
+      ...draftPatch,
+    })
+  }, [safeState.settings, draftPatch])
 
   useEffect(() => {
     if (logPathDirty) return
@@ -484,6 +540,7 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
     const known: Record<string, string[]> = {
       "status.source": ["watching", "waiting", "waiting_for_log", "bootstrap_incomplete", "degraded", "stopped", "unknown"],
       "status.phase": ["idle", "starting", "mulligan", "playing", "hero_select", "recruit", "combat", "spectator", "ended", "unknown"],
+      "status.mode": ["constructed", "battlegrounds", "unknown"],
       "status.side": ["player", "opponent", "unknown"],
       "status.result": ["won", "placed", "lost", "tied", "conceded", "unknown"],
       "status.overlayReason": ["overlay_disabled", "windows_required", "tkinter_unavailable", "python_probe_failed", "unknown"],
@@ -494,6 +551,11 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
   function timestamp(value?: number): string {
     if (!value || value <= 0) return t("common.never")
     return new Date(value * 1000).toLocaleString(props.locale)
+  }
+
+  function ageLabel(value?: number | null): string {
+    if (value == null || !Number.isFinite(value)) return t("common.notAvailable")
+    return t("diagnostics.seconds", { value: Math.round(value * 10) / 10 })
   }
 
   function yesNo(value?: boolean): string {
@@ -554,7 +616,7 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
 
   function updateDraft(patch: Partial<SettingsDraft>) {
     setDraft((current) => ({ ...current, ...patch }))
-    setDraftDirty(true)
+    setDraftPatch((current) => ({ ...current, ...patch }))
   }
 
   async function runAction(
@@ -652,15 +714,25 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
   }
 
   async function saveSettings() {
-    const successKey = !draft.llm_data_consent
-      ? "messages.savedLocalOnly"
-      : !draft.llm_do_not_disturb
-        ? "messages.savedWithoutDoNotDisturb"
-        : "messages.savedWithDoNotDisturb"
-    const outcome = await runAction("save_settings", draft, successKey)
+    const submitted = { ...draftPatch }
+    const outcome = await runAction(
+      "save_settings",
+      submitted,
+      (result) => result.lifecycle_enabled === false
+        ? "messages.savedLocalOnly"
+        : result.do_not_disturb === true
+          ? "messages.savedWithDoNotDisturb"
+          : "messages.savedWithoutDoNotDisturb",
+    )
     if (outcome.ok) {
       preserveDraftOnCleanRef.current = !outcome.refreshed
-      setDraftDirty(false)
+      setDraftPatch((current) => {
+        const remaining = { ...current }
+        for (const key of Object.keys(submitted) as (keyof SettingsDraft)[]) {
+          if (remaining[key] === submitted[key]) delete remaining[key]
+        }
+        return remaining
+      })
     }
   }
 
@@ -681,17 +753,31 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
   }
 
   function setConsent(enabled: boolean) {
-    setDraft((current) => ({
-      ...current,
-      llm_data_consent: enabled,
-    }))
-    setDraftDirty(true)
+    updateDraft({ llm_data_consent: enabled })
     setFailure("")
   }
 
   function setDoNotDisturb(enabled: boolean) {
     updateDraft({ llm_do_not_disturb: enabled })
     setFailure("")
+  }
+
+  async function exportDiagnostics() {
+    const outcome = await runAction(
+      "export_diagnostics",
+      {},
+      "messages.diagnosticsExported",
+    )
+    if (!outcome.ok) return
+    const path = String(outcome.result.path || "")
+    const filename = String(outcome.result.filename || "hearthstone-diagnostics.json")
+    if (!path) {
+      const message = t("errors.diagnosticsExportEmpty")
+      setFailure(message)
+      toast.error(message)
+      return
+    }
+    setDiagnosticExport({ path, filename })
   }
 
   const sourceState = String(runtime.source_state || "unknown")
@@ -1166,6 +1252,63 @@ export default function HearthstoneCompanionPanel(props: PluginSurfaceProps<Dash
           <StatCard label={t("metrics.events")} value={runtime.events_seen ?? 0} />
           <StatCard label={t("metrics.llmSubmissions")} value={runtime.llm_submissions ?? 0} />
         </Grid>
+        <Card title={t("sections.deliveryDiagnostics.title")}>
+          <Stack>
+            <Inline>
+              <StatusBadge
+                tone={stateTone(diagnosticLog.fresh ? "fresh" : "unavailable")}
+                label={diagnosticLog.fresh ? t("diagnostics.logFresh") : t("diagnostics.logNotFresh")}
+              />
+              <StatusBadge
+                tone={stateTone(String(toolRegistration.status || "not_checked"))}
+                label={t("diagnostics.toolRegistrationStatus", { value: toolRegistration.status || "not_checked" })}
+              />
+            </Inline>
+            <KeyValue
+              items={[
+                { key: "mode", label: t("diagnostics.mode"), value: localized("status.mode", diagnosticSnapshot.mode) },
+                { key: "phase", label: t("diagnostics.phase"), value: localized("status.phase", diagnosticSnapshot.phase) },
+                { key: "round", label: t("diagnostics.round"), value: diagnosticSnapshot.round ?? 0 },
+                { key: "generation", label: t("diagnostics.sourceGeneration"), value: diagnosticSnapshot.source_generation ?? 0 },
+                { key: "revision", label: t("diagnostics.snapshotRevision"), value: diagnosticSnapshot.revision ?? 0 },
+                { key: "lineAge", label: t("diagnostics.lineAge"), value: ageLabel(diagnosticLog.line_age_seconds) },
+                { key: "stateAge", label: t("diagnostics.stateAge"), value: ageLabel(diagnosticLog.state_age_seconds) },
+                { key: "toolReason", label: t("diagnostics.toolRegistrationReason"), value: toolRegistration.reason || t("common.none") },
+                { key: "missingTools", label: t("diagnostics.missingTools"), value: toolRegistration.missing?.join(", ") || t("common.none") },
+                { key: "lastTool", label: t("diagnostics.lastTool"), value: `${llmToolDiagnostic.status || "never"} · ${llmToolDiagnostic.mode || "-"} · ${llmToolDiagnostic.focus || "-"}` },
+                { key: "lastToolReason", label: t("diagnostics.lastToolReason"), value: llmToolDiagnostic.reason || t("common.none") },
+                { key: "lastAgent", label: t("diagnostics.lastAgent"), value: `${agentDiagnostic.status || "never"} · ${agentDiagnostic.mode || "-"} · ${agentDiagnostic.focus || "-"}` },
+                { key: "lastAgentReason", label: t("diagnostics.lastAgentReason"), value: agentDiagnostic.reason || t("common.none") },
+                { key: "lastLifecycle", label: t("diagnostics.lastLifecycle"), value: `${lifecycleDiagnostic.status || "never"} · ${lifecycleDiagnostic.mode || "-"} · ${lifecycleDiagnostic.focus || "-"}` },
+                { key: "lastLifecycleReason", label: t("diagnostics.lastLifecycleReason"), value: lifecycleDiagnostic.reason || t("common.none") },
+              ]}
+            />
+            {!diagnosticLog.fresh && diagnosticSnapshot.game_number ? (
+              <Warning>{t("diagnostics.logNotFreshHelp")}</Warning>
+            ) : null}
+            {toolRegistration.status === "unhealthy" ? (
+              <InlineError
+                title={t("diagnostics.toolRegistrationUnhealthy")}
+                details={toolRegistration.error_code || toolRegistration.reason || t("common.unknown")}
+              />
+            ) : null}
+            <Button
+              tone="info"
+              disabled={Boolean(busyAction) || !actionAvailable("export_diagnostics")}
+              onClick={exportDiagnostics}
+            >
+              {t("actions.export_diagnostics.label")}
+            </Button>
+            {diagnosticExport ? (
+              <FileDownload
+                path={diagnosticExport.path}
+                filename={diagnosticExport.filename}
+                label={t("actions.open_diagnostics.label")}
+                tone="default"
+              />
+            ) : null}
+          </Stack>
+        </Card>
         <Grid cols={2}>
           <Card title={t("sections.runtime.title")}>
             <Stack>

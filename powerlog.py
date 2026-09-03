@@ -236,6 +236,15 @@ _BATTLEGROUNDS_BOOLEAN_BASELINE_TAGS = frozenset(
         *(tag for tag, _public_name in _BATTLEGROUNDS_KEYWORD_TAGS),
     }
 )
+_KEYWORD_BASELINE_TAGS = frozenset(
+    {
+        *(tag for tag, _public_name in _CONSTRUCTED_KEYWORD_TAGS),
+        *(tag for tag, _public_name in _BATTLEGROUNDS_KEYWORD_TAGS),
+    }
+)
+_CARD_BOOLEAN_BASELINE_TAGS = frozenset(
+    {*_BATTLEGROUNDS_BOOLEAN_BASELINE_TAGS, *_KEYWORD_BASELINE_TAGS}
+)
 _CARD_IDENTITY_TAGS = frozenset(
     {
         "CARDTYPE",
@@ -436,6 +445,11 @@ class PowerLogParser:
         self._shop_membership_key: tuple[int, int, str] | None = None
         self._shop_visible_entity_ids: frozenset[int] = frozenset()
         self._empty_shop_observation = BattlegroundsAreaSnapshot()
+        self._local_area_membership_keys: dict[str, tuple[int, int, str]] = {}
+        self._local_area_visible_entity_ids: dict[str, frozenset[int]] = {}
+        self._empty_local_area_observations: dict[
+            str, BattlegroundsAreaSnapshot
+        ] = {}
         self._last_recruit_warband: tuple[BattlegroundsCardSnapshot, ...] = ()
         self._last_recruit_warband_area = BattlegroundsAreaSnapshot()
         self._last_recruit_warband_observed_at = 0.0
@@ -502,6 +516,9 @@ class PowerLogParser:
         self._shop_membership_key = None
         self._shop_visible_entity_ids = frozenset()
         self._empty_shop_observation = BattlegroundsAreaSnapshot()
+        self._local_area_membership_keys.clear()
+        self._local_area_visible_entity_ids.clear()
+        self._empty_local_area_observations.clear()
         self._last_recruit_warband = ()
         self._last_recruit_warband_area = BattlegroundsAreaSnapshot()
         self._last_recruit_warband_observed_at = 0.0
@@ -525,6 +542,7 @@ class PowerLogParser:
         timestamp = time.time() if now is None else float(now)
         events = self._feed_line(line, now=timestamp)
         self._observe_battlegrounds_shop_membership(timestamp)
+        self._observe_battlegrounds_local_area_membership(timestamp)
         return events
 
     def _feed_line(self, line: str, *, now: float | None = None) -> list[GameEvent]:
@@ -1171,7 +1189,9 @@ class PowerLogParser:
         self._pending_realtime_baseline_entity = None
         entity.battlegrounds_realtime_boolean_baseline_complete = False
         entity.battlegrounds_game_state_boolean_baseline_complete = False
-        for tag in _BATTLEGROUNDS_BOOLEAN_BASELINE_TAGS:
+        entity.realtime_keyword_baseline_complete = False
+        entity.game_state_keyword_baseline_complete = False
+        for tag in _CARD_BOOLEAN_BASELINE_TAGS:
             self._drop_entity_tag(entity, tag, discard_realtime=True)
         self._pending_realtime_baseline_entity = entity
 
@@ -1179,7 +1199,8 @@ class PowerLogParser:
         self._pending_game_state_baseline_entity = None
         self._pending_game_state_baseline_card_id = ""
         entity.battlegrounds_game_state_boolean_baseline_complete = False
-        for tag in _BATTLEGROUNDS_BOOLEAN_BASELINE_TAGS:
+        entity.game_state_keyword_baseline_complete = False
+        for tag in _CARD_BOOLEAN_BASELINE_TAGS:
             if tag not in entity.realtime_fields:
                 self._drop_entity_tag(entity, tag)
         self._pending_game_state_baseline_entity = entity
@@ -1215,9 +1236,11 @@ class PowerLogParser:
             self._pending_realtime_baseline_entity = None
         entity.battlegrounds_realtime_boolean_baseline_complete = False
         entity.battlegrounds_game_state_boolean_baseline_complete = False
-        for tag in _BATTLEGROUNDS_BOOLEAN_BASELINE_TAGS:
+        entity.realtime_keyword_baseline_complete = False
+        entity.game_state_keyword_baseline_complete = False
+        for tag in _CARD_BOOLEAN_BASELINE_TAGS:
             self._drop_entity_tag(entity, tag)
-        entity.realtime_fields.update(_BATTLEGROUNDS_BOOLEAN_BASELINE_TAGS)
+        entity.realtime_fields.update(_CARD_BOOLEAN_BASELINE_TAGS)
 
     def _invalidate_card_identity(self, entity: Entity) -> None:
         self._invalidate_realtime_baseline(entity)
@@ -1236,11 +1259,12 @@ class PowerLogParser:
             or not entity.card_id
         ):
             return
-        for tag in _BATTLEGROUNDS_BOOLEAN_BASELINE_TAGS:
+        for tag in _CARD_BOOLEAN_BASELINE_TAGS:
             if tag not in entity.realtime_fields:
                 entity.tags.pop(tag, None)
                 entity.realtime_fields.add(tag)
         entity.battlegrounds_realtime_boolean_baseline_complete = True
+        entity.realtime_keyword_baseline_complete = True
         self._touch_entity(entity, timestamp)
 
     def _finalize_pending_game_state_baseline(self, timestamp: float) -> None:
@@ -1258,6 +1282,7 @@ class PowerLogParser:
         ):
             return
         entity.battlegrounds_game_state_boolean_baseline_complete = True
+        entity.game_state_keyword_baseline_complete = True
         self._touch_entity(entity, timestamp)
 
     def finalize_quiet_packet_baselines(
@@ -2560,6 +2585,7 @@ class PowerLogParser:
             durability=durability,
             exhausted=exhausted,
             keywords=keywords,
+            keywords_complete=entity.keyword_baseline_complete,
             states=states,
         )
 
@@ -2662,8 +2688,17 @@ class PowerLogParser:
         warband_area = self._battlegrounds_area(
             warband_entities,
             current_warband,
-            allow_empty=self.phase in {"recruit", "combat", "ended"},
+            allow_empty=False,
+            require_current_observation=True,
+            compatible_phases=(
+                frozenset(("recruit", "combat"))
+                if self.phase == "recruit"
+                else None
+            ),
         )
+        empty_warband_area = self._current_empty_local_area_observation("warband")
+        if not warband_entities and empty_warband_area is not None:
+            warband_area = empty_warband_area
         if not visible_warband and self.phase in {"combat", "ended"}:
             visible_warband = self._last_recruit_warband
             warband_area = self._last_recruit_warband_area
@@ -2705,8 +2740,8 @@ class PowerLogParser:
             "hand": self._battlegrounds_area(
                 hand_entities,
                 hand_cards,
-                allow_empty=local_player is not None and self.phase == "recruit",
-                fallback=local_player,
+                allow_empty=False,
+                require_current_observation=True,
             ),
             "warband": warband_area,
             "choice": choice_area,
@@ -2722,6 +2757,9 @@ class PowerLogParser:
                 phase=self.phase if economy_complete else "unknown",
             ),
         }
+        empty_hand_area = self._current_empty_local_area_observation("hand")
+        if not hand_entities and empty_hand_area is not None:
+            areas["hand"] = empty_hand_area
 
         mechanics: dict[str, Any] = {}
         game = self.entities.get(self.game_entity_id or -1)
@@ -2873,6 +2911,75 @@ class PowerLogParser:
                 phase=self.phase,
             )
         self._shop_visible_entity_ids = visible_ids
+
+    def _observe_battlegrounds_local_area_membership(self, timestamp: float) -> None:
+        active_areas: dict[str, frozenset[int]] = {}
+        if (
+            self.mode == "battlegrounds"
+            and self.local_controller is not None
+            and self.phase in {"recruit", "combat", "ended"}
+        ):
+            active_areas["warband"] = frozenset(
+                entity.entity_id
+                for entity in self._battlegrounds_board_entities(self.local_controller)
+            )
+            if self.phase == "recruit":
+                active_areas["hand"] = frozenset(
+                    entity.entity_id
+                    for entity in self.entities.values()
+                    if self._controller(entity) == self.local_controller
+                    and entity.zone == "HAND"
+                    and self._is_battlegrounds_visible_card(
+                        entity,
+                        maximum_position=10,
+                    )
+                    and not entity.hidden
+                )
+
+        for area_name in ("hand", "warband"):
+            if area_name not in active_areas:
+                self._local_area_membership_keys.pop(area_name, None)
+                self._local_area_visible_entity_ids.pop(area_name, None)
+                self._empty_local_area_observations.pop(area_name, None)
+                continue
+            key = (self.game_number, self.battlegrounds_round, self.phase)
+            visible_ids = active_areas[area_name]
+            if self._local_area_membership_keys.get(area_name) != key:
+                self._local_area_membership_keys[area_name] = key
+                self._local_area_visible_entity_ids[area_name] = visible_ids
+                self._empty_local_area_observations.pop(area_name, None)
+                continue
+            previous_ids = self._local_area_visible_entity_ids.get(
+                area_name,
+                frozenset(),
+            )
+            if visible_ids:
+                self._empty_local_area_observations.pop(area_name, None)
+            elif previous_ids:
+                self._empty_local_area_observations[area_name] = (
+                    BattlegroundsAreaSnapshot(
+                        complete=True,
+                        revision=max(1, self._public_revision),
+                        observed_at=timestamp if timestamp > 0 else None,
+                        round=self.battlegrounds_round,
+                        phase=self.phase,
+                    )
+                )
+            self._local_area_visible_entity_ids[area_name] = visible_ids
+
+    def _current_empty_local_area_observation(
+        self,
+        area_name: str,
+    ) -> BattlegroundsAreaSnapshot | None:
+        observation = self._empty_local_area_observations.get(area_name)
+        if (
+            observation is not None
+            and observation.complete
+            and observation.round == self.battlegrounds_round
+            and observation.phase == self.phase
+        ):
+            return observation
+        return None
 
     def _battlegrounds_card_cost(self, entity: Entity) -> int | None:
         for tag in (
@@ -3300,6 +3407,7 @@ class PowerLogParser:
                 needle in identifier for needle in needles
             ):
                 continue
+            entity_candidates: list[tuple[int, BattlegroundsAreaSnapshot]] = []
             for tag in ("BACON_OVERRIDE_BG_COST", "COST"):
                 if tag in entity.tags and (value := _int(entity.tags.get(tag))) is not None:
                     cost_observation = self._battlegrounds_tag_observation(
@@ -3363,12 +3471,18 @@ class PowerLogParser:
                                 round=self.battlegrounds_round,
                                 phase=self.phase,
                             )
-                    candidates.append(
+                    entity_candidates.append(
                         (
                             max(0, value),
                             cost_observation,
                         )
                     )
+                    # A current override is the effective button price. COST can
+                    # be written later in the same packet but remains the base.
+                    if tag == "BACON_OVERRIDE_BG_COST" and cost_observation.complete:
+                        break
+            if entity_candidates:
+                candidates.append(self._select_economy_observation(entity_candidates))
         return self._select_economy_observation(candidates)
 
     def _battlegrounds_area(
@@ -3379,6 +3493,7 @@ class PowerLogParser:
         allow_empty: bool,
         fallback: Entity | None = None,
         require_current_observation: bool = False,
+        compatible_phases: frozenset[str] | None = None,
     ) -> BattlegroundsAreaSnapshot:
         visible_entities = [entity for entity in entities if not entity.hidden]
         observed_entities = [*visible_entities]
@@ -3403,7 +3518,8 @@ class PowerLogParser:
                 observed_entities
                 and all(
                     entity.last_battlegrounds_round == self.battlegrounds_round
-                    and entity.last_battlegrounds_phase == self.phase
+                    and entity.last_battlegrounds_phase
+                    in (compatible_phases or frozenset((self.phase,)))
                     for entity in observed_entities
                 )
             )
@@ -3507,8 +3623,12 @@ class PowerLogParser:
         self._last_recruit_warband_area = self._battlegrounds_area(
             entities,
             cards,
-            allow_empty=True,
+            allow_empty=False,
+            require_current_observation=True,
         )
+        empty_area = self._current_empty_local_area_observation("warband")
+        if not entities and empty_area is not None:
+            self._last_recruit_warband_area = empty_area
 
     @staticmethod
     def _is_battlegrounds_gameplay_entity(entity: Entity) -> bool:

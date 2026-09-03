@@ -34,6 +34,7 @@ def test_runtime_status_exposes_source_modified_time() -> None:
     status = RuntimeStatus(source_modified_at=123.5)
 
     assert status.to_dict()["source_modified_at"] == 123.5
+    assert status.to_dict()["snapshot_revision"] == 0
 
 
 def test_unobserved_battlegrounds_card_fields_remain_null() -> None:

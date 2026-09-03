@@ -22,7 +22,7 @@ Get-ChildItem "$env:LOCALAPPDATA\Blizzard\Hearthstone" -Filter Power.log -Recurs
 
 ## 有日志但没有角色主动说话
 
-若缺少开场、重连或结算回应，先确认 `llm_data_consent=true`，并确认当前角色已通过固定目标或官方聊天上下文明确。生命周期没有独立开关。未知目标时插件不会广播；超过 30 秒的待投递生命周期也会丢弃。接入已经开始的对局应说“重新接上”，不会重放开场。
+若缺少开场、重连或结算回应，先确认 `llm_data_consent=true`。生命周期没有独立开关。配置 `target_lanlan` 时会定向投递；未配置目标时只依赖宿主恰好一个在线会话的 targetless 路由，零个或多个在线会话都不会投递。超过 30 秒的待投递生命周期会丢弃。接入已经开始的对局应说“重新接上”，不会重放开场。
 
 若希望获得中局主动陪伴，再依次检查：
 
@@ -38,17 +38,21 @@ Get-ChildItem "$env:LOCALAPPDATA\Blizzard\Hearthstone" -Filter Power.log -Recurs
 
 ## 开启免打扰后还能问酒馆问题吗
 
-可以。保持 `llm_data_consent=true`；模型可在首答同一轮调用 `hearthstone_current_turn` 或 `hearthstone_live_state`，也可由统一 Agent/明确问题兜底承接。`llm_do_not_disturb` 只抑制中局主动事件；开场、重连和结算始终随局势共享生效。
+可以。保持 `llm_data_consent=true`；模型可在首答同一轮调用 `hearthstone_current_turn` 或 `hearthstone_live_state`，也可由统一 Agent 入口读取同一权威快照。`llm_do_not_disturb` 只抑制中局主动事件；开场、重连和结算始终随局势共享生效。
 
-若查询返回 `llm_data_sharing_not_authorized`，说明数据共享未开启。若状态为空，确认已经进入酒馆且日志正在增长。若面板已有商店/战团但角色仍声称没有炉石能力，依次确认目标角色的 `/api/tools` 已注册 `hearthstone_current_turn` 和 `hearthstone_live_state`、模型请求携带对应 schema、tool callback 返回 `hearthstone_current_turn_v1` 或 `hearthstone_compact_v1`；再检查 Agent 是否能发现 `query_hearthstone_live_state`，以及 `live_query_watch` 是否从 memory 识别查询并提交定向 `respond`。插件必须保持 `passive=false`，否则 Agent 会跳过查询入口，但同轮工具与 memory 兜底仍是独立链路。
+若查询返回 `llm_data_sharing_not_authorized`，说明数据共享未开启。若状态为空，确认已经进入酒馆且日志正在增长。若面板已有商店/战团但角色仍声称没有炉石能力，依次确认目标角色的 `/api/tools` 已注册 `hearthstone_current_turn` 和 `hearthstone_live_state`、模型请求携带对应 schema、tool callback 返回 `is_error=false` 且 `output` 是非空实时事实文本；再检查 Agent 是否能发现 `query_hearthstone_live_state`。插件必须保持 `passive=false`，否则 Agent 会跳过查询入口。工具 callback 没有可信角色、会话或 turn 字段，因此插件不会从 callback 另起一次主动回复。
 
 ## 为什么候选英雄不完整或不能给出具体出牌
 
 候选列表只显示 `Power.log` 明确归属于本地玩家、未隐藏且未锁定的英雄。日志尚未建立本地 controller、某个选项未公开或选择阶段已经结束时，列表可能为空；插件不会根据常见候选数或卡池补猜。列表可用时，统一工具可以结合公共英雄规则和本机样本供角色比较，但不会提供没有来源的全局胜率。“哪张更值得考虑”等定性酒馆建议要求工具当次读到招募阶段、正在更新的完整商店和规则证据；个别费用缺失不会关闭定性比较。若询问可负担性、剩余金币或购买顺序，当前金币和商店所有卡牌的实际费用也必须完整，角色不得用默认 3 费补算，也不得在金币为 0 时把未知费用卡牌直接判为买不起。战斗阶段或缓存状态只能解释已观察信息。
 
-普通对战可在用户主动提问时同轮调用实时工具，共享当前轮次或本地玩家当前可见的具体手牌。若角色仍答不出回合或手牌，先确认局势问答授权已开启、状态为实时，再核对 `/api/tools` 中的两个注册项、对应 tool call 和 callback；没有 tool call 时检查 memory 兜底是否向问题所属角色提交了 `respond`。这类当前问题应重新查询，不能沿用较早对话。工具不会提供完整合法操作与目标枚举；字段缺失时应如实说明。对手隐藏手牌、奥秘身份和牌序是永久边界，重新配置日志也不会开放。
+普通对战可在用户主动提问时同轮调用实时工具，共享当前轮次或本地玩家当前可见的具体手牌。若角色仍答不出回合或手牌，先确认局势问答授权已开启、状态为实时，再核对 `/api/tools` 中的两个注册项、对应 tool call 和 callback；没有 tool call 时检查 Agent 入口是否可发现，并重新提问触发当前快照查询，不能沿用较早对话。工具不会提供完整合法操作与目标枚举；字段缺失时应如实说明。对手隐藏手牌、奥秘身份和牌序是永久边界，重新配置日志也不会开放。
 
-排查模型链路时分别核对五项：`/api/tools` 中目标角色可见两个实时工具；模型请求实际携带工具 schema；模型产生对应 tool call；user-plugin-server callback 返回 `is_error=false` 和正确 format；没有调用工具时，明确问题能被 memory 兜底定向提交并生成最终角色回答。模型选择工具本身是概率行为，验收重点是链路可用、明确问题能正常取得对应视图，而不是要求所有自由表达都 100% 触发。
+排查模型链路时分别核对五项：被动上下文是否收到最新、完整、同 revision 的 `part=i/n` 分段包，且 core 含 guard、当前模式/轮次/阶段和完整 part manifest；`/api/tools` 中目标角色是否可见两个实时工具；模型请求是否携带工具 schema 并产生 tool call；user-plugin-server callback 是否返回 `is_error=false` 和非空纯文本 `output`；Agent 是否能读取同一权威快照。canonical format 与逐组字段只在插件进程内预检，不能要求它们出现在官方 callback 的模型可见结果中。模型选择工具本身是概率行为，验收重点是链路可用、明确问题能正常取得对应视图，而不是要求所有自由表达都 100% 触发。
+
+面板“局势查询链路健康”把这些环节分开显示：日志必须为新鲜，`snapshot revision` 应随实际局势变化增长；同轮工具注册应为 `healthy`；`callback_succeeded` 只表示工具 callback 正常返回，Agent 的同名状态只表示 Agent callback 成功，生命周期的 `submitted` 只表示 SDK 本地提交路径已接管请求。它们都不证明模型已经生成、显示或播放最终回答。出现问题时点击“导出脱敏诊断”，优先提交该 JSON 和对应对话截图，不要提交完整 `Power.log`。
+
+需要观察真实模型行为时，可由隔离矩阵启动 `tests/neko_answer_probe.py --enable-real-e2e`。`SKIP` 表示诊断环境不完整；`answer_timeout`、未调用工具或遗漏事实记录模型/宿主表现，但不自动归因于插件。插件链路应分别以真实日志检查点、官方注册表、精确一次 callback、完整被动包和生命周期提交判断。不要为让模型回答通过而增加私有对话关联、额外重试或提示协议，也不要为绕过 `tool_name_conflict` 停用或覆盖用户正在使用的插件。
 
 ## 为什么没有全服胜率
 
@@ -76,7 +80,7 @@ Get-ChildItem "$env:LOCALAPPDATA\Blizzard\Hearthstone" -Filter Power.log -Recurs
 
 ## 状态或卡牌不准确
 
-游戏更新可能改变日志格式。记录插件/N.E.K.O 版本、模式、阶段、`source_state`、`lines_seen`、`last_event_kind`、`last_error_code` 和是否发生日志轮换。不要直接上传完整 `Power.log`；按[隐私说明](privacy-security.md#问题报告与合规)裁剪并脱敏。
+游戏更新可能改变日志格式。记录插件/N.E.K.O 版本、模式、阶段、`source_state`、`lines_seen`、`last_event_kind`、`last_error_code` 和是否发生日志轮换，或直接导出面板提供的脱敏诊断。不要直接上传完整 `Power.log`；按[隐私说明](privacy-security.md#问题报告与合规)裁剪并脱敏。
 
 ## 恢复 log.config
 

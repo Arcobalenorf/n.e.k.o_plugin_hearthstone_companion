@@ -29,6 +29,37 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Validate tag and release metadata
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import tomllib
+
+          plugin = tomllib.loads(pathlib.Path("plugin.toml").read_text(encoding="utf-8"))
+          project = tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))
+          plugin_version = str(plugin["plugin"]["version"])
+          project_version = str(project["project"]["version"])
+          expected_tag = f"v{plugin_version}"
+          actual_tag = os.environ["RELEASE_TAG"]
+          if project_version != plugin_version:
+              raise SystemExit("plugin.toml and pyproject.toml versions differ")
+          if actual_tag != expected_tag:
+              raise SystemExit(f"release tag must be {expected_tag}, got {actual_tag}")
+          notes = pathlib.Path(".github/release-notes") / f"{actual_tag}.md"
+          if not notes.is_file() or not notes.read_text(encoding="utf-8").strip():
+              raise SystemExit(f"release notes missing for {actual_tag}")
+          PY
+      - name: Require deterministic real N.E.K.O chain evidence
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: >-
+          python tests/release_evidence.py
+          --project-root .
+          --evidence ".github/e2e-evidence/${RELEASE_TAG}.json"
+          --tag "$RELEASE_TAG"
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
         with:
