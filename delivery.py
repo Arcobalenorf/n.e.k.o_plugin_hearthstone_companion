@@ -10,7 +10,7 @@ from typing import Any, Callable, Mapping
 from .models import GameSnapshot
 
 _SEMANTICALLY_VOLATILE_KEYS = frozenset({"observed_at", "revision"})
-LIVE_STATE_WIRE_FORMAT = "hearthstone_live_segment_v2"
+LIVE_STATE_WIRE_FORMAT = "hearthstone_summary_v1"
 
 
 class _NullLogger:

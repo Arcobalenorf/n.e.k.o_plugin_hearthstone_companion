@@ -6,8 +6,8 @@
 
 ## 陪伴体验
 
-- 监听到新鲜对局后，本机持续维护一份权威结构化快照；状态变化会覆盖一个不可见、逻辑原子的 `hearthstone_live_segment_v2` 被动分段包，不生成可见聊天消息。每段用 `bundle=<revision>@i/n` 绑定同一包，并且整包只有一个回答契约和一个字段 schema；酒馆卡牌显式携带类型、实际费用、金色状态、关键词完整度和可无损解码的当前关键词集合。每段经真实宿主 parser 后不超过 180 tokens，并以目标和 segment 组成稳定 `coalesce_key`；整包按当前阶段控制在宿主 3000-token selector 预算内。v1、缺段、混合 revision 或 tombstone 后不得作为当前事实。显式配置目标时定向发布；未配置目标时省略 `target_lanlan`，宿主只会在恰好一个连接会话时接收，零个或多个会话都会丢弃。
-- 当前事实只通过三条官方链路到达角色：逻辑原子的 revisioned passive segment bundle、两个职责清晰的首答同轮 `@llm_tool`，以及单一 Agent 查询入口。LLM 工具 callback 不携带可信角色、会话或 turn 身份，插件只返回当刻快照结果，不会再另发一条 tool-result `respond`；这避免把独立主动 turn 误当作原回答的可靠续写。
+- 监听到新鲜对局后，本机持续维护一份权威快照。后台只发送单条不可见概况，包含模式、轮次、阶段和查询提示；商店、手牌、场面及动态费用通过实时工具按需查询，不再用分段包常驻传输。未配置目标角色时，仅依赖宿主恰好一个在线会话的路由。
+- 当前概况通过被动 read 到达角色；详细事实通过两个同轮 `@llm_tool` 或单一 Agent 查询入口取得，两类查询复用同源结果生成逻辑。工具 callback 只返回原调用，不另发 tool-result `respond`。
 - 三连、低血量、升本、逐轮战果与最终名次等公开事实会形成结构化情绪信号；真正的台词始终由当前 N.E.K.O 角色生成。
 - 新对局开始、插件重新接上进行中的对局和最终结算属于独立生命周期：默认各回应一次，不受中局解说冷却或聊天静默窗影响；未配置目标时只提交 targetless 请求，并仅依赖宿主恰好一个在线会话时的路由，零个或多个在线会话都不会投递。
 - 免打扰模式默认关闭；中局解说仍只选择稀疏且有情绪价值的事件，并受普通/关键冷却与 30 秒用户聊天静默窗约束；希望安静游玩时可随时开启免打扰。
@@ -20,7 +20,7 @@
 
 ## 酒馆战棋支持
 
-`v0.4.0` 支持普通对战与单排/双排酒馆的可验证公开状态：
+`v0.4.1` 支持普通对战与单排/双排酒馆的可验证公开状态：
 
 - 战棋模式、Bob、本地玩家与最多八名英雄；
 - 英雄选择阶段实际观测到的本地候选、选择完成后的我方英雄、招募/战斗阶段、逐轮胜负、回合、当前对手；
@@ -105,10 +105,10 @@ uv run python tests/neko_answer_isolated_matrix.py `
   --case bg_upgrade_affordable_v1 <line-number> <battlegrounds-Power.log> `
   --lifecycle-edge constructed_started_v1 458 1143 <constructed-lifecycle-Power.log> `
   --lifecycle-edge constructed_ended_v1 20346 20347 <constructed-lifecycle-Power.log> `
-  --evidence-output .github/e2e-evidence/v0.4.0.json
+  --evidence-output .github/e2e-evidence/v0.4.1.json
 ```
 
-支持的固定查询用例为 `constructed_round_v1`、`constructed_opponent_v1`、`bg_shop_v1`、`bg_upgrade_blocked_v1` 和 `bg_upgrade_affordable_v1`，固定生命周期边界为 `constructed_started_v1` 与 `constructed_ended_v1`。完整矩阵只接受 release workflow 固定的干净 N.E.K.O commit；runner 从该 commit 的 Git 对象导出允许的 tracked 文件，ignored、untracked 或已修改的工作树字节不会进入一次性 runtime。`--runtime-assets-dir` 必须提供与 `tests/neko_runtime_assets.json` 中固定 commit、前端 Git tree、大小和 SHA-256 全部匹配的预构建 `neko-chat-window.iife.js` 与 `neko-chat-window.css`；外部目录自带的 revision 或 manifest 不受信任。runner 不修改宿主工作树，也不会自行构建前端。缺少隔离环境、真实日志、角色或浏览器时报告 `SKIP`。每个 case 的 `answer_observation_status` 可以因模型未回答、未选择工具或遗漏事实而是 `FAIL`，但日志检查点、SDK 注册、精确一次 callback、被动包完整性、生命周期提交、固定宿主 revision、环境稳定和清理结果决定矩阵顶层状态。
+支持的固定查询用例为 `constructed_round_v1`、`constructed_opponent_v1`、`bg_shop_v1`、`bg_upgrade_blocked_v1` 和 `bg_upgrade_affordable_v1`，固定生命周期边界为 `constructed_started_v1` 与 `constructed_ended_v1`。完整矩阵只接受 release workflow 固定的干净 N.E.K.O commit；runner 从该 commit 的 Git 对象导出允许的 tracked 文件，ignored、untracked 或已修改的工作树字节不会进入一次性 runtime。`--runtime-assets-dir` 必须提供与 `tests/neko_runtime_assets.json` 中固定 commit、前端 Git tree、大小和 SHA-256 全部匹配的预构建 `neko-chat-window.iife.js` 与 `neko-chat-window.css`；外部目录自带的 revision 或 manifest 不受信任。runner 不修改宿主工作树，也不会自行构建前端。缺少隔离环境、真实日志、角色或浏览器时报告 `SKIP`。每个 case 的 `answer_observation_status` 可以因模型未回答、未选择工具或遗漏事实而是 `FAIL`，但日志检查点、SDK 注册、精确一次 callback、被动概况合规性、生命周期提交、固定宿主 revision、环境稳定和清理结果决定矩阵顶层状态。
 
 正式发布门禁覆盖可确定验证的插件职责：全量 Python 测试、Ruff、字节码编译、固定 SDK 生命周期、Hosted UI 编译、版本/tag/说明一致性、source-bound 真实宿主链路证据，以及官方 `check`、`build`、`inspect`、`verify`。证据验证器只检查注册、callback、被动包、生命周期提交、环境稳定和清理，不检查模型最终措辞或工具选择。
 
@@ -134,7 +134,7 @@ uv run python -m plugin.neko_plugin_cli.cli verify "<plugin-repo>\dist\hearthsto
 
 ## English summary
 
-Hearthstone Catgirl Companion is a read-only N.E.K.O plugin for constructed Hearthstone and Battlegrounds. It maintains one authoritative local snapshot and exposes a zero-argument `hearthstone_current_turn` tool, a compact `hearthstone_live_state` tool, and one Agent entry. Its supported answer paths are a logically atomic `hearthstone_live_segment_v2` passive bundle, the official same-turn `@llm_tool` callback, and the Agent entry. Every v2 segment is independently parseable, uses `bundle=<revision>@i/n`, and stays at or below 180 host tokens; one complete same-revision bundle contains exactly one answer contract and one schema and remains within the host's 3000-token selector budget. Tool callbacks contain no trusted role, conversation, or turn identity, so the plugin returns the current snapshot inline and never emits a separate tool-result `respond`. Passive context, lifecycle messages, and sparse commentary are targetless when no role is configured and therefore depend on the host having exactly one online session; zero or multiple online sessions are not routed. An SDK `submitted` receipt is not proof of host consumption or a final answer. Users can disable data sharing without disabling local log monitoring. Do Not Disturb is off by default, allowing sparse mid-match commentary; users can turn it on without disabling on-demand answers or match lifecycle reactions. It supports Power.log-observed local hero choices, solo and Duos Battlegrounds state, per-combat outcomes, aggregate-only local results, and versioned official season rules. N.E.K.O owns the actual character response; the separate transparent overlay is diagnostic-only because the public SDK does not return generated reply text. The plugin never claims access to unlicensed global win-rate telemetry.
+Hearthstone Catgirl Companion is a read-only N.E.K.O plugin for constructed Hearthstone and Battlegrounds. One authoritative local snapshot feeds a small passive overview, two same-turn tools, and a thin Agent adapter. Detailed cards and economy are queried on demand with an explicit focus; passive delivery is not evidence of detailed-state delivery. Tool results return through the original callback without a separate respond message. Do Not Disturb is off by default and only suppresses mid-match commentary, not queries or lifecycle reactions. No host changes, memory reads, packet capture, automated gameplay, or claims of global win-rate telemetry.
 
 ## 许可证
 

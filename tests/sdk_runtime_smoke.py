@@ -293,8 +293,13 @@ async def _exercise_lifecycle(plugin: Any, unwrap_or: Any, host_ctx: _HostContex
                 raise RuntimeError(f"Agent query lost realtime expiry: {result!r}")
             if agent_meta.get("delivery") != "proactive":
                 raise RuntimeError(f"Agent query result did not reach the active role: {result!r}")
-            if not str(result.get("data", {}).get("reply") or "").startswith("HS_QUERY "):
-                raise RuntimeError(f"Agent query returned no compact reply: {result!r}")
+            reply = str(result.get("data", {}).get("reply") or "")
+            if (
+                "available=0" not in reply
+                or "reason=no_live_game_state" not in reply
+                or len(reply.encode("utf-8")) > 4096
+            ):
+                raise RuntimeError("Agent query lost bounded unavailable-state result")
         saved = unwrap_or(
             await plugin.save_settings(
                 llm_data_consent=True,

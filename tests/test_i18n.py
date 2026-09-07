@@ -119,17 +119,19 @@ def test_network_user_agent_matches_package_version() -> None:
 
 def test_primary_setup_is_offline_first_and_keeps_log_details_in_diagnostics() -> None:
     panel_source = (ROOT / "ui" / "panel.tsx").read_text(encoding="utf-8")
-    setup_start = panel_source.index('<Card title={t("sections.setup.title")}>')
-    setup_end = panel_source.index('{game.mode === "battlegrounds"', setup_start)
+    setup_start = panel_source.index('<Heading as="h3">{t("sections.setup.title")}</Heading>')
+    setup_end = panel_source.index('<Accordion id="hs-match-details"', setup_start)
     setup_source = panel_source[setup_start:setup_end]
 
-    assert 't("setup.offlineHelp")' in setup_source
+    assert 't("settings.targetLanlan")' in setup_source
     assert 'actionAvailable("save_settings")' in setup_source
     assert "monitorReady" not in setup_source
     assert "prepare_power_log" not in setup_source
     assert "settings.logPath" not in setup_source
-    assert "actions.enable_companion.withDoNotDisturb" in panel_source
-    assert "actions.enable_companion.withoutDoNotDisturb" in panel_source
+    assert 't("actions.save_settings.label")' in setup_source
+    for section in ("hs-match-details", "hs-display-settings", "hs-privacy", "hs-diagnostics"):
+        assert re.search(rf'<Accordion\s+id="{section}"[^>]+open=\{{false\}}', panel_source)
+    assert panel_source.index('id="hs-diagnostics"') < panel_source.index('t("diagnostics.snapshotRevision")')
     assert "llm_data_consent: true" in panel_source
     assert "llm_do_not_disturb: false" in panel_source
     assert "value?.llm_do_not_disturb === true" in panel_source
@@ -162,7 +164,7 @@ def test_panel_only_submits_settings_fields_changed_by_the_user() -> None:
     assert "const draftDirty = Object.keys(draftPatch).length > 0" in panel_source
     assert "setDraftPatch((current) => ({ ...current, ...patch }))" in panel_source
     assert "const submitted = { ...draftPatch }" in panel_source
-    assert '"save_settings",\n      submitted,' in panel_source
+    assert re.search(r'"save_settings",\s*submitted,', panel_source)
     assert 'runAction("save_settings", draft,' not in panel_source
     assert "if (remaining[key] === submitted[key]) delete remaining[key]" in panel_source
 
@@ -200,7 +202,7 @@ def test_panel_surfaces_observed_hero_choices_and_duos_teammate() -> None:
     assert "hero_choices?: BattlegroundsHeroChoice[]" in panel_source
     assert '(battlegrounds.phase || phase) === "hero_select" || heroChoiceRows.length > 0' in panel_source
     assert 't("battlegroundsHeroChoices.observedHelp")' in panel_source
-    assert 'row.is_teammate ? t("battlegroundsLobby.teammate")' in panel_source
+    assert re.search(r'row\.is_teammate\s*\?\s*t\("battlegroundsLobby.teammate"\)', panel_source)
 
 
 def test_custom_log_path_has_an_independent_save_action_in_diagnostics() -> None:

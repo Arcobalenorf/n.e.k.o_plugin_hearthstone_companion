@@ -6,6 +6,7 @@ from copy import deepcopy
 import pytest
 from hearthstone_companion_under_test.commentary import build_live_state_segments
 from hearthstone_companion_under_test.models import (
+    BattlegroundsSnapshot,
     ConstructedCardSnapshot,
     ConstructedSideSnapshot,
     ConstructedSnapshot,
@@ -21,7 +22,9 @@ from neko_answer_eval import (
     evaluate_delivery,
     evaluate_passive_context,
     evaluate_passive_context_segments,
+    evaluate_passive_context_summary,
     inspect_passive_context_segment,
+    inspect_passive_context_summary,
 )
 
 
@@ -31,6 +34,28 @@ class Snapshot:
 
     def to_public_dict(self) -> dict:
         return deepcopy(self.value)
+
+
+@pytest.mark.parametrize("mode", ["constructed", "battlegrounds"])
+def test_summary_inspector_accepts_production_unknown_round(mode) -> None:
+    snapshot = GameSnapshot(
+        mode=mode, phase="hero_select", game_number=1,
+        battlegrounds=BattlegroundsSnapshot(phase="hero_select") if mode == "battlegrounds" else None,
+    )
+    text = build_live_state_segments(snapshot, observed_at=1788760000)[0][1]
+    assert json.loads(text[3:])["round"] is None
+    assert inspect_passive_context_summary(text)["passed"] is True
+    case = build_answer_case("constructed_round_v1", _constructed_snapshot())
+    assert evaluate_passive_context_summary(case, [text])["passed"] is False
+
+
+@pytest.mark.parametrize("round_value", [-1, True, False, "2", 2.5, [], {}])
+def test_summary_inspector_rejects_invalid_round(round_value) -> None:
+    snapshot = GameSnapshot(mode="constructed", phase="playing", game_number=1, round=2)
+    text = build_live_state_segments(snapshot, observed_at=1788760000)[0][1]
+    payload = json.loads(text[3:])
+    payload["round"] = round_value
+    assert inspect_passive_context_summary("HS:" + json.dumps(payload))["passed"] is False
 
 
 def _constructed_snapshot() -> Snapshot:
@@ -242,12 +267,52 @@ def test_segment_evaluator_accepts_the_production_constructed_contract() -> None
     ]
 
     for case_id in ("constructed_round_v1", "constructed_opponent_v1"):
-        result = evaluate_passive_context_segments(
+        result = evaluate_passive_context_summary(
             build_answer_case(case_id, snapshot),
             texts,
         )
         assert result["passed"] is True
         assert result["reason_codes"] == []
+        assert result["fact_scope"] == "overview_only"
+
+
+def test_overview_evidence_rejects_detail_payload_and_historical_bundle() -> None:
+    case = build_answer_case("constructed_round_v1", _constructed_snapshot())
+    assert evaluate_passive_context_summary(case, _segmented_round_texts())["passed"] is False
+    payload = {
+        "kind": "hearthstone_summary", "segment": "core", "mode": "constructed",
+        "phase": "playing", "game_number": 1, "round": 11,
+        "active_side": "player", "observed_at": 1000.0,
+        "query_tools": ["hearthstone_current_turn", "hearthstone_live_state"],
+    }
+    text = "HS:" + json.dumps(payload)
+    assert inspect_passive_context_summary(text)["passed"] is True
+    assert evaluate_passive_context_summary(case, [text])["fact_scope"] == "overview_only"
+    payload["cards"] = ["not-a-summary-field"]
+    assert inspect_passive_context_summary("HS:" + json.dumps(payload))["passed"] is False
+
+
+@pytest.mark.parametrize(
+    "case_id,snapshot_factory,mode,round_number,phase",
+    (
+        ("constructed_opponent_v1", _constructed_snapshot, "constructed", 11, "playing"),
+        ("bg_shop_v1", _shop_snapshot, "battlegrounds", 2, "recruit"),
+    ),
+)
+def test_detail_cases_passive_evidence_proves_only_overview(
+    case_id, snapshot_factory, mode, round_number, phase,
+) -> None:
+    case = build_answer_case(case_id, snapshot_factory())
+    text = "HS:" + json.dumps({
+        "kind": "hearthstone_summary", "segment": "core", "mode": mode,
+        "phase": phase, "game_number": 1, "round": round_number,
+        "active_side": "player", "observed_at": 1000.0,
+        "query_tools": ["hearthstone_current_turn", "hearthstone_live_state"],
+    })
+    result = evaluate_passive_context_summary(case, [text])
+    assert result["passed"] is True
+    assert result["fact_count"] == 3
+    assert result["fact_scope"] == "overview_only"
 
 
 def test_passive_segment_bundle_accepts_one_complete_revision() -> None:

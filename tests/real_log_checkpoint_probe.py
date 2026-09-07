@@ -13,7 +13,7 @@ import types
 from pathlib import Path
 from typing import Any, Mapping
 
-from neko_answer_eval import build_answer_case, evaluate_passive_context_segments
+from neko_answer_eval import build_answer_case, evaluate_passive_context_summary
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_NAME = "hearthstone_companion_checkpoint_probe"
@@ -282,7 +282,7 @@ def _production_passive_evidence(
     host_selection = _host_select_push_texts(texts)
     host_texts = [str(item.get("parsed") or "") for item in host_results]
     evaluations = {
-        case_id: evaluate_passive_context_segments(
+        case_id: evaluate_passive_context_summary(
             build_answer_case(case_id, snapshot),
             host_texts,
         )
@@ -326,14 +326,14 @@ async def _evaluate(
         observed_at=observed_at,
     )
     checks: list[dict[str, Any]] = []
-    _check(checks, "passive_segments_observed", passive["segment_count"] > 0)
+    _check(checks, "passive_single_summary_observed", passive["segment_count"] == 1)
     _check(checks, "passive_host_parser_kept_every_segment", passive["host_exact"] is True)
     _check(checks, "passive_host_selector_kept_every_segment", passive["host_selected_all"] is True)
     _check(checks, "passive_segments_below_host_limit", passive["max_tokens"] <= 180)
     for case_id, evaluation in passive["evaluations"].items():
         _check(
             checks,
-            f"passive_bundle_{case_id}",
+            f"passive_overview_{case_id}",
             evaluation.get("passed") is True,
         )
     facts: dict[str, Any] = {

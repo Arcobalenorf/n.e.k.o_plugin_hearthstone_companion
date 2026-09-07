@@ -48,7 +48,7 @@ Get-ChildItem "$env:LOCALAPPDATA\Blizzard\Hearthstone" -Filter Power.log -Recurs
 
 普通对战可在用户主动提问时同轮调用实时工具，共享当前轮次或本地玩家当前可见的具体手牌。若角色仍答不出回合或手牌，先确认局势问答授权已开启、状态为实时，再核对 `/api/tools` 中的两个注册项、对应 tool call 和 callback；没有 tool call 时检查 Agent 入口是否可发现，并重新提问触发当前快照查询，不能沿用较早对话。工具不会提供完整合法操作与目标枚举；字段缺失时应如实说明。对手隐藏手牌、奥秘身份和牌序是永久边界，重新配置日志也不会开放。
 
-排查模型链路时分别核对五项：被动上下文是否收到最新、完整、同 revision 的 `part=i/n` 分段包，且 core 含 guard、当前模式/轮次/阶段和完整 part manifest；`/api/tools` 中目标角色是否可见两个实时工具；模型请求是否携带工具 schema 并产生 tool call；user-plugin-server callback 是否返回 `is_error=false` 和非空纯文本 `output`；Agent 是否能读取同一权威快照。canonical format 与逐组字段只在插件进程内预检，不能要求它们出现在官方 callback 的模型可见结果中。模型选择工具本身是概率行为，验收重点是链路可用、明确问题能正常取得对应视图，而不是要求所有自由表达都 100% 触发。
+排查模型链路时分别核对：单条概况是否收到；目标角色是否可见两个工具及其 schema；模型是否发起 tool call；官方 callback 是否返回非空 output 或明确错误；Agent 是否读取同源快照。概况不能证明商店、手牌等详细事实已送达，SDK 提交也不证明最终回复。模型是否选择工具单独观测，不用重复主动补答掩盖未调用问题。
 
 面板“局势查询链路健康”把这些环节分开显示：日志必须为新鲜，`snapshot revision` 应随实际局势变化增长；同轮工具注册应为 `healthy`；`callback_succeeded` 只表示工具 callback 正常返回，Agent 的同名状态只表示 Agent callback 成功，生命周期的 `submitted` 只表示 SDK 本地提交路径已接管请求。它们都不证明模型已经生成、显示或播放最终回答。出现问题时点击“导出脱敏诊断”，优先提交该 JSON 和对应对话截图，不要提交完整 `Power.log`。
 

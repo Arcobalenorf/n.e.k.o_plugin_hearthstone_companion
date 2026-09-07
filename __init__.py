@@ -106,7 +106,7 @@ _LLM_TOOL_HANDLER_NAMES = {
     "hearthstone_live_state": "hearthstone_live_state",
 }
 _DIAGNOSTIC_SCHEMA = "hearthstone_companion_diagnostics_v1"
-_PLUGIN_VERSION = "0.4.0"
+_PLUGIN_VERSION = "0.4.1"
 _OVERLAY_RUNTIME_FIELDS = (
     "overlay_enabled",
     "overlay_window_titles",
@@ -835,13 +835,6 @@ def _agent_reply_fits(value: str) -> bool:
     return estimated_tokens <= _AGENT_REPLY_ESTIMATED_MAX_TOKENS
 
 
-def _agent_identity_reply_fits(value: str) -> bool:
-    if len(value) > _AGENT_REPLY_MAX_CHARS:
-        return False
-    ascii_count = sum(ord(char) < 128 for char in value)
-    non_ascii_count = len(value) - ascii_count
-    estimated_tokens = int(ascii_count * 0.60 + non_ascii_count + 0.999)
-    return estimated_tokens <= _AGENT_REPLY_ESTIMATED_MAX_TOKENS
 
 
 def _focused_tool_state_fits(value: str) -> bool:
@@ -907,87 +900,6 @@ def _agent_compact_battlegrounds_cards(
     return ",".join(encoded) if encoded else "-", used_keywords
 
 
-def _agent_sparse_battlegrounds_cards(
-    value: Any,
-    *,
-    limit: int,
-    name_limit: int,
-) -> tuple[str, str, str, set[str]]:
-    if not isinstance(value, list):
-        return "?", "?/?/?", "", set()
-    keyword_codes = {
-        name: code for code, name in _AGENT_CONSTRUCTED_KEYWORD_CODES
-    }
-    encoded: list[str] = []
-    types: list[str] = []
-    costs: list[str] = []
-    goldens: list[str] = []
-    keyword_sets: list[str] = []
-    used_keywords: set[str] = set()
-    for raw_card in value[:limit]:
-        card = raw_card if isinstance(raw_card, Mapping) else {}
-        card_id = _catalog_card_id(card.get("card_id")) or "?"
-        name = _agent_atom(card.get("name"), limit=name_limit) if name_limit else ""
-        identity = card_id if not name or name == card_id else f"{card_id}~{name}"
-        raw_type = str(card.get("card_type") or "").upper()
-        card_type = {
-            "MINION": "M",
-            "SPELL": "S",
-            "BATTLEGROUND_SPELL": "BS",
-            "TAVERN_SPELL": "BS",
-        }.get(raw_type, raw_type or "?")
-        active_keywords, keyword_unknown = _agent_keyword_state(card.get("keywords"))
-        keyword_text = "".join(
-            keyword_codes[name]
-            for name in active_keywords
-            if name in keyword_codes
-        )
-        used_keywords.update(active_keywords)
-        if keyword_unknown:
-            keyword_text = f"{keyword_text}?" if keyword_text else "?"
-        encoded.append(
-            "/".join(
-                (
-                    identity,
-                    _agent_scalar(card.get("attack")),
-                    _agent_scalar(card.get("health")),
-                    _agent_scalar(card.get("tier")),
-                )
-            )
-        )
-        types.append(card_type)
-        costs.append(_agent_scalar(card.get("current_cost", card.get("cost"))))
-        goldens.append(_agent_scalar(card.get("premium")))
-        keyword_sets.append(keyword_text or "-")
-
-    def most_common(items: list[str]) -> str:
-        if not items:
-            return "?"
-        counts = {item: items.count(item) for item in items}
-        return max(counts, key=lambda item: (counts[item], -items.index(item)))
-
-    defaults = (
-        most_common(types),
-        most_common(costs),
-        most_common(goldens),
-        most_common(keyword_sets),
-    )
-    overrides: list[str] = []
-    for position, values in enumerate(
-        zip(types, costs, goldens, keyword_sets),
-        start=1,
-    ):
-        for field, value, default in zip(("T", "C", "G", "K"), values, defaults):
-            if value != default:
-                overrides.append(f"{position}{field}:{value}")
-    if len(value) > limit:
-        overrides.append(f"more:{len(value) - limit}")
-    return (
-        ",".join(encoded) if encoded else "-",
-        "/".join(defaults),
-        ",".join(overrides),
-        used_keywords,
-    )
 
 
 def _agent_side_summary(side: Any) -> str:
@@ -1004,11 +916,10 @@ def _agent_side_summary(side: Any) -> str:
     return ",".join(parts)
 
 
-def _agent_constructed_reply(
+def _constructed_query_text(
     payload: Mapping[str, Any],
     *,
     focus: str = "auto",
-    focused_tool: bool = False,
 ) -> str:
     if not payload.get("available"):
         return f"HS_QUERY mode=constructed;available=0;reason={_agent_text(payload.get('reason') or 'no_live_game_state')}"
@@ -1047,7 +958,7 @@ def _agent_constructed_reply(
         name: code for code, name in _AGENT_CONSTRUCTED_KEYWORD_CODES
     }
     state_codes = {name: code for code, name in _AGENT_STATE_CODES}
-    reply_fits = _focused_tool_state_fits if focused_tool else _agent_reply_fits
+    reply_fits = _focused_tool_state_fits
 
     def compact_cards(
         value: Any,
@@ -1204,11 +1115,7 @@ def _agent_constructed_reply(
             f"q={_agent_scalar(target_board.get('identities_complete'))}",
         ]
 
-    variants = (
-        ((24, True), (12, False), (8, False), (4, False), (0, False))
-        if focused_tool
-        else ((12, True), (8, False), (4, False))
-    )
+    variants = ((24, True), (12, False), (8, False), (4, False), (0, False))
     for name_limit, include_legends in variants:
         rendered, used_keywords, used_states = compact_cards(
             cards,
@@ -1581,12 +1488,11 @@ def _agent_capabilities(payload: Mapping[str, Any]) -> str:
     return result
 
 
-def _agent_battlegrounds_reply(
+def _battlegrounds_query_text(
     payload: Mapping[str, Any],
     *,
     focus: str = "auto",
     opponent_relation: str = "auto",
-    focused_tool: bool = False,
 ) -> str:
     topic = str(payload.get("topic") or "current_strategy")
     state = (
@@ -1603,10 +1509,8 @@ def _agent_battlegrounds_reply(
             "HS_QUERY mode=battlegrounds;available=0;"
             f"reason={_agent_text(payload.get('reason') or 'no_live_battlegrounds_state')}"
         )
-    reply_fits = _focused_tool_state_fits if focused_tool else _agent_reply_fits
-    identity_reply_fits = (
-        _focused_tool_state_fits if focused_tool else _agent_identity_reply_fits
-    )
+    reply_fits = _focused_tool_state_fits
+    identity_reply_fits = _focused_tool_state_fits
     if topic != "current_strategy":
         selected = {
             "season_meta": payload.get("season_rules"),
@@ -1802,44 +1706,7 @@ def _agent_battlegrounds_reply(
     completeness = f"q={_agent_scalar(completeness_value)}"
     gate = evidence_gate()
 
-    target_count = len(target_cards) if isinstance(target_cards, list) else 0
-    if target_count > 3 and not focused_tool:
-        compact_label = {
-            "shop": "S",
-            "hand": "H",
-            "warband": "W",
-            "current_opponent_board": "O",
-            "next_opponent_board": "O",
-            "last_opponent_board": "O",
-            "choice": "C",
-        }.get(target_label, target_label)
-        for name_limit in (12, 8, 4):
-            rendered, defaults, overrides, _used_keywords = (
-                _agent_sparse_battlegrounds_cards(
-                    target_cards,
-                    limit=limit,
-                    name_limit=name_limit,
-                )
-            )
-            parts = [
-                *core,
-                *extra,
-                completeness,
-                *gate,
-                f"{compact_label}={rendered}",
-                f"D={defaults}",
-            ]
-            if overrides:
-                parts.append(f"X={overrides}")
-            candidate = ";".join(parts)
-            if reply_fits(candidate):
-                return candidate
-
-    variants = (
-        ((24, True), (12, False), (8, False), (4, False), (0, False))
-        if focused_tool
-        else (((12, True), (8, False), (4, False)) if target_count <= 3 else ())
-    )
+    variants = ((24, True), (12, False), (8, False), (4, False), (0, False))
     for name_limit, include_legend in variants:
         ordered_shop = selected_focus == "shop"
         rendered, used_keywords = _agent_compact_battlegrounds_cards(
@@ -1932,75 +1799,12 @@ def _agent_battlegrounds_reply(
     return "HS_BG;available=1;omitted=oversize_identities"
 
 
-def _bound_agent_reply(value: str) -> str:
-    text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
-    if _agent_reply_fits(text) or (
-        "[id~name]=" in text and _agent_identity_reply_fits(text)
-    ):
-        return text
-    suffix = ";omitted=tail"
-    prefix = text[: _AGENT_REPLY_MAX_CHARS - len(suffix)]
-    while prefix:
-        boundary = prefix.rfind(";")
-        if boundary <= 0:
-            break
-        candidate = prefix[:boundary].rstrip(";|, ") + suffix
-        if _agent_reply_fits(candidate):
-            return candidate
-        prefix = prefix[:boundary]
-    return "HS_QUERY;available=?;omitted=oversize_reply"
 
 
-def _agent_focus_from_request(value: Any) -> str:
-    text = str(value or "").casefold()
-    focus_terms = (
-        ("opponent", ("对手", "对面", "下一家", "opponent")),
-        ("choice", ("英雄选择", "候选英雄", "发现", "选哪个", "choice")),
-        ("hand", ("手牌", "hand")),
-        (
-            "board",
-            ("站位", "阵容", "战团", "战斗", "稳血", "position", "board", "combat"),
-        ),
-        (
-            "shop",
-            ("商店", "买", "升本", "刷新", "冻结", "酒馆法术", "shop", "buy", "refresh"),
-        ),
-    )
-    for focus, terms in focus_terms:
-        if any(term in text for term in terms):
-            return focus
-    return "auto"
 
 
-def _agent_opponent_relation_from_request(value: Any) -> str:
-    text = str(value or "").casefold()
-    relation_terms = (
-        ("last", ("上一轮", "上轮", "上一位", "上一家", "刚才的对手", "last opponent", "previous opponent")),
-        ("next", ("下一轮", "下轮", "下一位", "下一家", "next opponent")),
-        ("current", ("当前对手", "战斗对手", "正在打", "current opponent")),
-    )
-    for relation, terms in relation_terms:
-        if any(term in text for term in terms):
-            return relation
-    return "auto"
 
 
-def _agent_query_reply(
-    payload: Mapping[str, Any],
-    *,
-    mode: str,
-    focus: str = "auto",
-    opponent_relation: str = "auto",
-) -> str:
-    if mode == "battlegrounds":
-        return _bound_agent_reply(
-            _agent_battlegrounds_reply(
-                payload,
-                focus=focus,
-                opponent_relation=opponent_relation,
-            )
-        )
-    return _bound_agent_reply(_agent_constructed_reply(payload, focus=focus))
 
 
 def _focused_tool_query_reply(
@@ -2011,16 +1815,14 @@ def _focused_tool_query_reply(
     opponent_relation: str = "auto",
 ) -> str:
     if mode == "battlegrounds":
-        return _agent_battlegrounds_reply(
+        return _battlegrounds_query_text(
             payload,
             focus=focus,
             opponent_relation=opponent_relation,
-            focused_tool=True,
         )
-    return _agent_constructed_reply(
+    return _constructed_query_text(
         payload,
         focus=focus,
-        focused_tool=True,
     )
 
 
@@ -3708,6 +3510,60 @@ def _model_text_tool_result(
         # exposing duplicate facts to the model.
         "_canonical": canonical_copy,
     }
+
+
+def _live_query_tool_result(
+    payload: Mapping[str, Any],
+    *,
+    mode: str,
+    focus: str,
+    opponent_relation: str = "auto",
+    query: str = "",
+) -> tuple[str, dict[str, Any]]:
+    """Project one public payload identically for callback and Agent delivery."""
+    allowed = (
+        _BATTLEGROUNDS_TOOL_FOCUSES
+        if mode == "battlegrounds"
+        else _CONSTRUCTED_TOOL_FOCUSES
+    )
+    selected_focus = focus if focus in allowed else "strategy"
+    result = _focused_llm_tool_result(
+        payload,
+        mode=mode,
+        focus=selected_focus,
+        opponent_relation=opponent_relation,
+    )
+    # Advice availability is narrower than fresh, player-visible BG facts.
+    # Rejected payloads (consent, stale source, etc.) contain no public state.
+    public_state = payload.get("current_public_state")
+    has_public_facts = bool(
+        mode == "battlegrounds"
+        and payload.get("topic", "current_strategy") == "current_strategy"
+        and isinstance(public_state, Mapping)
+        and public_state
+    )
+    if not result.get("available") and not has_public_facts:
+        return selected_focus, _model_text_tool_result(
+            result,
+            output=(
+                "当前实时局势不可用；available=0;reason="
+                + _agent_text(result.get("reason") or "no_live_game_state")
+            ),
+        )
+    return selected_focus, _model_text_tool_result(
+        result,
+        output=_focused_model_output(
+            payload,
+            result,
+            mode=mode,
+            focus=selected_focus,
+            opponent_relation=opponent_relation,
+            include_advice=not query or requests_live_advice(query),
+            include_catalog_rules=(
+                not query or requests_live_advice(query) or requests_live_rules(query)
+            ),
+        ),
+    )
 
 
 def _sanitize_constructed_tool_state(state: dict[str, Any]) -> dict[str, Any]:
@@ -7243,14 +7099,40 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 mode=mode,
                 topic=topic,
             )
-            reply = _agent_query_reply(
-                payload,
-                mode=selected_mode,
-                focus=focus,
-                opponent_relation=opponent_relation,
+            selected_topic = str(payload.get("topic") or "current_strategy")
+            topic_query = (
+                selected_mode == "battlegrounds"
+                and selected_topic != "current_strategy"
             )
+            if topic_query:
+                reply = _battlegrounds_query_text(payload)
+            else:
+                focus, query_result = _live_query_tool_result(
+                    payload,
+                    mode=selected_mode,
+                    focus=focus,
+                    opponent_relation=opponent_relation,
+                    query=query_text,
+                )
+                reply = query_result["output"]
+            truncated = not _agent_reply_fits(reply) or (
+                topic_query and "omitted=oversize_topic_payload" in reply
+            )
+            if truncated and topic_query:
+                reply = (
+                    f"topic={_agent_text(selected_topic)}；主题数据已省略（Agent 返回长度限制）；"
+                    "不能依据省略的数据作出结论。"
+                )
+            elif truncated:
+                # Agent events have a smaller host summary budget than tools.
+                # Keep the same facts, or explicitly omit details as a whole.
+                turn = _current_turn_llm_tool_result(payload, mode=selected_mode)
+                reply = (
+                    str(turn.get("summary") or "")
+                    + f"\n详细局势已省略（Agent 返回长度限制）；请调用 hearthstone_live_state，focus={focus}，query 保留原问题。"
+                )
             result = await self.finish(
-                data={"reply": reply, "payload": payload},
+                data={"reply": reply, "payload": payload, "truncated": truncated},
                 delivery="proactive",
                 meta={
                     "agent": {
@@ -7332,7 +7214,8 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
             "用户询问当前炉石传说或酒馆战棋的双方场面、手牌、Choice、商店、酒馆法术、"
             "战团、金币、实际费用、升本、刷新、冻结、对手、买什么、怎么出牌或怎么站位时调用。"
             "只问回合数或轮到谁时改用 hearthstone_current_turn。query 可省略；若传入，"
-            "应使用用户原问题，插件会自动识别模式和聚焦。工具成功结果是可直接回答的"
+            "应使用用户原问题。优先用 focus 明确选择查询区域，未指定时才由原问题辅助聚焦。"
+            "工具成功结果是可直接回答的"
             "实时事实文本；其中每组 CardID、实际费用、金色和关键词"
             "不得省略或猜测。"
         ),
@@ -7342,6 +7225,12 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 "query": {
                     "type": "string",
                     "description": "可选；用户当前关于炉石的原问题，不要改写。",
+                },
+                "focus": {
+                    "type": "string",
+                    "enum": ["auto", "overview", "shop", "economy", "board", "hand", "choice", "opponent", "strategy"],
+                    "default": "auto",
+                    "description": "查询区域；显式选择优先于 query。board 为己方场面或战团，opponent 为对手。",
                 },
             },
             "additionalProperties": False,
@@ -7373,21 +7262,12 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 mode=mode,
                 topic=topic,
             )
-            if (
-                selected_mode == "constructed"
-                and selected_focus not in _CONSTRUCTED_TOOL_FOCUSES
-            ):
-                selected_focus = "strategy"
-            if (
-                selected_mode == "battlegrounds"
-                and selected_focus not in _BATTLEGROUNDS_TOOL_FOCUSES
-            ):
-                selected_focus = "strategy"
-            result = _focused_llm_tool_result(
+            selected_focus, result = _live_query_tool_result(
                 payload,
                 mode=selected_mode,
                 focus=selected_focus,
                 opponent_relation=opponent_relation,
+                query=query_text,
             )
             _record_route_diagnostic(self,
                 "llm_tool",
@@ -7396,24 +7276,7 @@ class HearthstoneCompanionPlugin(NekoPluginBase):
                 mode=selected_mode,
                 focus=selected_focus,
             )
-            return _model_text_tool_result(
-                result,
-                output=_focused_model_output(
-                    payload,
-                    result,
-                    mode=selected_mode,
-                    focus=selected_focus,
-                    opponent_relation=opponent_relation,
-                    include_advice=(
-                        not query_text or requests_live_advice(query_text)
-                    ),
-                    include_catalog_rules=(
-                        not query_text
-                        or requests_live_advice(query_text)
-                        or requests_live_rules(query_text)
-                    ),
-                ),
-            )
+            return result
         except BaseException as exc:
             _record_route_diagnostic(self,
                 "llm_tool",

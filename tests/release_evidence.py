@@ -50,7 +50,7 @@ PYTHON_IDENTITY_KEYS = frozenset(
 )
 CHAT_ASSET_NAMES = frozenset({"neko-chat-window.iife.js", "neko-chat-window.css"})
 LIFECYCLE_PROXY_SELECTOR_SHA256 = "593b5822800884f547f906ba4af5f1ebeb9936c5b5096b7c2511bb729ebd75c6"
-PASSIVE_CONTEXT_CONTRACT_SHA256 = "ebf0ea3d4fabec6a472a107440233e4622412086cb0e17e77b56e3b7ea761264"
+PASSIVE_CONTEXT_CONTRACT_SHA256 = "f25d1b7574ab1adbcbb7a67e0fd5826d1ef7ec22680851bbceeb2a78ff69ab4a"
 PASSIVE_EVIDENCE_KEYS = frozenset(
     {
         "status",
@@ -59,6 +59,7 @@ PASSIVE_EVIDENCE_KEYS = frozenset(
         "observed_before_submit",
         "envelope_verified",
         "fact_verified",
+        "fact_scope",
         "fact_sha256",
         "fact_count",
         "match_id",
@@ -454,6 +455,7 @@ def _validate_passive_evidence(value: Any, *, checkpoint: Mapping[str, Any]) -> 
         or passive.get("observed_before_submit") is not True
         or passive.get("envelope_verified") is not True
         or passive.get("fact_verified") is not True
+        or passive.get("fact_scope") != "overview_only"
         or not _is_sha256(passive.get("fact_sha256"))
         or not _positive_int(passive.get("fact_count"))
         or not _positive_int(passive.get("match_id"))

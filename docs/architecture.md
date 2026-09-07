@@ -2,12 +2,14 @@
 
 ## 产品原则
 
+本轮收敛设计见 [DESIGN.md](../DESIGN.md)。Agent 和同轮工具共用事实生成，但宿主 Agent 通道容量更小：超限时明确省略详情，不能把两种通道宣称为等价的完整场面查询。
+
 N.E.K.O 的核心是关系与陪伴。插件负责理解游戏现场，不负责用本地模板扮演角色。实现遵循五条边界：
 
 1. 本地层只做公开事实提炼、情绪信号、节奏仲裁和隐私过滤；
 2. 所有主动可见台词由当前 N.E.K.O 角色通过 `ai_behavior="respond"` 生成；
-3. 新鲜对局只在本机维护一份权威状态；逻辑原子的同 revision `part=i/n` 被动分段包以每个 segment 独立的稳定 `coalesce_key` 持续覆盖当前会话，同轮 `@llm_tool` 查询提供更完整、按问题聚焦的事实；
-4. 普通问答可使用新鲜、完整、同 revision 的被动分段包、官方 `@llm_tool` 同轮 callback 或 Agent 入口；工具 callback 没有可信角色、会话或 turn 身份，插件不会另发 tool-result `respond`；
+3. 新鲜对局只在本机维护一份权威状态；被动上下文仅用单条概况告知模式、轮次和阶段，详细区域由同轮 `@llm_tool` 按需读取；
+4. 同轮工具和 Agent 入口复用同源结果生成逻辑；被动概况不证明逐卡事实已送达。工具 callback 没有可信角色、会话或 turn 身份，插件不会另发 tool-result `respond`；
 5. 面板和独立浮层只承担透明诊断，不参与自动陪伴输出。
 
 ```text
@@ -48,7 +50,7 @@ hsbg.cards public API --> fixed-origin background GET --> atomic cache --> obser
 
 监控状态维护单调的 `snapshot_revision`：只有权威 `GameSnapshot` 实际变化时递增，换 source generation 时归零。Hosted UI 以 source generation、revision、状态年龄，以及工具、Agent 和生命周期的稳定状态码展示链路证据。诊断导出复用同一不可变快照，只输出 allowlist 中的计数、完整度和状态码；它不增加新的 LLM 工具或查询路径。
 
-开发验证分成两层：精确真实日志检查点直接运行生产解析器和两个工具 serializer；隔离 E2E 再由正式插件子进程注册同一内存快照的官方工具，并用浏览器观察真实模型回答。官方注册表、精确一次 callback、被动包完整性、生命周期提交、环境稳定和资源清理组成 source-bound 发布证据；模型是否选择工具、最终回答是否完整则单独记录为诊断，不参与 tag 门禁。该探针不修改宿主源码、磁盘配置、已安装插件或运行时查询架构，只连接已确认的隔离实例，并在结束时清理正式插件子进程和临时文件。
+开发验证分成两层：精确真实日志检查点直接运行生产解析器和两个工具 serializer；隔离 E2E 再由正式插件子进程注册同一内存快照的官方工具，并用浏览器观察真实模型回答。官方注册表、精确一次 callback、被动概况合规性、生命周期提交、环境稳定和资源清理组成 source-bound 发布证据；模型是否选择工具、最终回答是否完整则单独记录为诊断，不参与 tag 门禁。该探针不修改宿主源码、磁盘配置、已安装插件或运行时查询架构，只连接已确认的隔离实例，并在结束时清理正式插件子进程和临时文件。
 
 实时链路按日志职责合并而不是二选一：`PowerTaskList.DebugPrintPower` 是动态实体、tag 和 block 的权威实时流；`GameState.DebugPrintGame` 提供模式元数据；`GameState.DebugPrintPower` 只提供最早的新局边界、受限静态实体补全和 `STATE=COMPLETE`/终局 `PLAYSTATE`。新局静态包先进入隔离暂存区，直到 PowerTaskList 确认 `CREATE_GAME` 后才提交；进行中的静态补全只能填空，不能覆盖 PowerTaskList 已观察字段，也不能恢复被 `HIDE_ENTITY` 撤销的可见性。
 
@@ -87,7 +89,7 @@ hsbg.cards public API --> fixed-origin background GET --> atomic cache --> obser
 
 真实宿主诊断把工具能力、用户回答和生命周期分开记录。工具能力从官方 `/api/tools` 核对本插件的远程注册与 loopback callback，再直接发送标准 callback 请求，并以隔离 epoch 证明装饰器 handler 精确执行一次、成功返回对应事实；它不依赖模型是否选择工具。固定问题的可见回答和生命周期台词用于观察真实宿主与模型表现，不能反向要求插件增加私有关联、重试或提示协议。Agent 路由继续作为独立可用查询路径和诊断信号。
 
-普通被动上下文发布逻辑原子的 `hearthstone_live_segment_v2` 分段包。每段是独立完整 JSON，以 `bundle=<base36 revision>@i/n` 绑定整包，经真实宿主 parser 后不超过 180 tokens；整包恰有一个 `contract` 和一个 `schema`，缺段、混版、v1 或 tombstone 均 fail-closed。酒馆卡牌行显式包含 CardID、名称、站位、攻血、星级、实际费用、类型、金色状态、关键词完整度和 `keyword_set_index`；规范关键词名在 schema 的去重 `keyword_sets` 中。招募阶段被动包优先完整商店、战团和手牌，战斗阶段优先当前对手、战团和手牌；其他对手详情由正式查询工具提供。整包按当前阶段控制在宿主 3000-token selector 预算内。每个 segment 使用目标加 segment 名组成的稳定 `coalesce_key`；publisher 仅在全段提交成功后更新 cursor，提交失败、权限撤销、换源或分段集合缩减时会对旧/新 key 并集发送 tombstone。显式配置角色时携带 `target_lanlan` 并按 30 秒续租；未配置角色时省略目标并使用 `active-session` key，宿主仅在恰好一个在线会话时路由，零个或多个在线会话直接丢弃。由于 SDK 提交回执不是宿主消费确认，无目标游标只租约 1 秒，直到状态失效或目标被显式配置。激活后、用户提交前观察到且未被后续状态作废的新鲜、完整、同 revision 分段包可以支撑当前提问，但 `ai_behavior="read"` 在活动语音会话中仍依赖宿主下一次自然 hot-swap，因此不能冒充同轮工具 callback，也不能证明工具能力。
+普通被动上下文仅发布一个有界 `core` 概况，不包含卡牌、商店或经济明细，不再要求模型重组 revision 分段、schema 或关键词字典。详细事实通过显式 `focus` 视图查询取得；概况收到不等于详细事实已送达。发布器沿用稳定 `coalesce_key`、提交拒绝重试及失效覆盖。显式配置角色时携带 `target_lanlan` 并按 30 秒续租；未配置角色时使用 `active-session` key 和 1 秒未确认租约，仅依赖宿主恰好一个在线会话时的路由。`read` 的 SDK 回执不证明宿主消费，活动语音会话仍受自然 hot-swap 时机影响。
 
 公开 SDK 的 push receipt 只确认提交，不确认宿主已消费、生成或播放，也没有返回最终角色文本的正式回调。因此独立浮层不能承接自动角色台词，也不会自动显示解析器事件；它只接受用户显式触发的诊断文本。
 
@@ -107,7 +109,7 @@ hsbg.cards public API --> fixed-origin background GET --> atomic cache --> obser
 
 酒馆卡牌快照保存日志实际观测的 `card_type`、`current_cost`、`premium`、当前位置、冻结和当前关键词；刷新/升本费用优先读取对应 `GAME_MODE_BUTTON_SLOT` 按钮实体。客户端不会在每个招募阶段重发恒定按钮费用，因此当前可见 `PLAY` 按钮只要同一实体在本轮本阶段有明确 tag observation，或完成了当前 GameState 基线，就可沿用其持久 `COST`；该规则不放宽玩家经济 tag、隐藏按钮或已移出场按钮。完整实体包中的 boolean 标签缺失按默认 false，包尚未收尾时保持 `null`，防止截断包伪装成完整状态，也防止旧冻结/金色/关键词续命。商店、手牌、战团、经济和 Choice 分别携带完整度、revision、回合、阶段与观测时间；金币、刷新费用和升本费用还分别保存自己的 observation。金币以当前 `RESOURCES` 建立基线；历史 `RESOURCES_USED/TEMP_RESOURCES` 会过期并按未发生处理，只有同回合同阶段重报后才加入当前值。未观测或已过期的动态值保持 `null`，不使用公共目录或默认规则补猜。`CHANGE_ENTITY` 真正换 CardID 时先撤销旧类型、费用、攻血、星级、金色和关键词，直到新身份重新提供证据。购买拆为 `shop_card_priority_advice`、`purchase_affordability` 和 `specific_purchase_advice`：费用缺失不污染已经具备完整实时商店与规则证据的定性选牌，但会让可负担性与精确购买顺序降为 `partial`。工具结果最前面的 `current_recruit_decision` 按卡标记 `known_affordable`、`known_unaffordable` 或 `unknown_cost_may_be_zero`，并将整店可负担性保持为 `unknown`；`decision_guardrails` 再提供完整证据边界，禁止模型因金币为 0 就把未知费用卡牌判为买不起。升本可负担性、升本策略、刷新、Choice 与站位也有独立 capability，角色必须按被问事项检查对应状态，不能因一个子能力不可用而覆盖另一个已可用能力。
 
-两个 `@llm_tool` 由公开 SDK 在插件构造时自动注册并排队提交给宿主，可在生成首答的同一轮调用。`plugin.toml` 使用 `passive=false`，让用户插件 Agent 在模型未选择工具时仍能发现唯一查询入口。设置、监听、浮层和清空统计入口继续以 `metadata.agent_auto=false` 隐藏。被动分段包按 segment 独立覆盖，语义变化立即更新、完全相同的状态每 30 秒续租；目标只来自显式配置，未配置时走宿主限定的 targetless 单在线会话路由。三条官方链路互补，不假设模型必然调用某个工具，也不把 Agent 的独立结果冒充首答工具结果。
+两个 `@llm_tool` 由公开 SDK 自动注册。同轮局势工具暴露显式 `focus`，Agent 保留 `passive=false` 发现方式并复用同源结果生成逻辑；设置、监听和浮层等管理入口仍以 `agent_auto=false` 隐藏。后台仅覆盖单条概况，不承诺详细问答在未调用查询时仍能完成。工具注册恢复与状态发布独立，不把 Agent 主动结果当作同轮 callback。
 
 发布门禁只检查插件可确定控制的结果：测试、静态检查、固定 SDK、Hosted UI、版本元数据、source-bound 真实宿主链路证据和官方打包验证。证据绑定当前源码，并验证实际 N.E.K.O runtime 与 CPython 环境在单次矩阵执行期间保持稳定；嵌套的模型回答观察允许失败。
 
@@ -131,7 +133,7 @@ Plugin Store 长期只保存赛季/模式/英雄维度的聚合计数。N.E.K.O 
 | --- | --- | --- |
 | `monitor_on_start` | `true` | 启动后监听日志 |
 | `initial_read_max_bytes` | `67108864` | 首次本地恢复最多读取 64 MiB |
-| `llm_data_consent` | `true` | 允许被动分段包、工具、Agent、生命周期和主动解说使用过滤后的玩家可见局势；用户可显式关闭 |
+| `llm_data_consent` | `true` | 允许被动概况、工具、Agent、生命周期和主动解说使用过滤后的玩家可见局势；用户可显式关闭 |
 | `llm_do_not_disturb` | `false` | 开启后抑制中局主动解说；默认允许角色在对局中途低频回应 |
 | `llm_min_priority` | `5` | 主动事件最低优先级 |
 | `llm_cooldown_seconds` | `25` | 普通主动解说冷却 |

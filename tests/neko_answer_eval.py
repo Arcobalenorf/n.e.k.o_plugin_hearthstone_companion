@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import unicodedata
 from collections import Counter
@@ -625,6 +626,85 @@ def inspect_passive_context_segment(text: str) -> dict[str, Any]:
         "part_index": part_index,
         "part_total": part_total,
         "payload": payload,
+    }
+
+
+def inspect_passive_context_summary(text: str) -> dict[str, Any]:
+    """Inspect the current overview contract, not historical detailed bundles."""
+    failure = _segment_bundle_failure("passive_context_summary_invalid")
+    if not isinstance(text, str) or not text.startswith("HS:"):
+        return failure
+    try:
+        payload = json.loads(text[3:])
+    except (TypeError, ValueError):
+        return failure
+    keys = {
+        "kind", "segment", "mode", "phase", "game_number", "round",
+        "active_side", "observed_at", "query_tools",
+    }
+    if not isinstance(payload, dict) or set(payload) != keys:
+        return failure
+    observed_at = payload["observed_at"]
+    if (
+        payload["kind"] != "hearthstone_summary"
+        or payload["segment"] != "core"
+        or payload["mode"] not in {"constructed", "battlegrounds"}
+        or not isinstance(payload["phase"], str)
+        or not isinstance(payload["active_side"], str)
+        or type(payload["game_number"]) is not int
+        or (
+            payload["round"] is not None
+            and (type(payload["round"]) is not int or payload["round"] < 0)
+        )
+        or payload["game_number"] <= 0
+        or type(observed_at) not in (int, float)
+        or not math.isfinite(observed_at)
+        or observed_at <= 0
+        or payload["query_tools"] != ["hearthstone_current_turn", "hearthstone_live_state"]
+    ):
+        return failure
+    return {
+        "passed": True,
+        "reason_codes": [],
+        "revision": f"{payload['game_number']}:{observed_at}",
+        "payload_observed_at": observed_at,
+        "game_number": payload["game_number"],
+        "segment": "core",
+        "part_index": 1,
+        "part_total": 1,
+        "payload": payload,
+    }
+
+
+def evaluate_passive_context_summary(
+    case: AnswerCase, texts: Sequence[str],
+) -> dict[str, Any]:
+    """Prove mode/round/phase delivery only; detail needs a tool callback."""
+    if len(texts) != 1:
+        return _segment_bundle_failure("passive_context_bundle_invalid")
+    inspected = inspect_passive_context_summary(texts[0])
+    if inspected.get("passed") is not True:
+        return inspected
+    payload = inspected["payload"]
+    mode = "constructed" if case.case_id.startswith("constructed_") else "battlegrounds"
+    round_number = 11 if mode == "constructed" else 2 if case.case_id == "bg_shop_v1" else 3
+    phase = "playing" if mode == "constructed" else "recruit"
+    if (
+        payload["mode"] != mode or payload["round"] != round_number
+        or payload["phase"] != phase
+    ):
+        return _segment_bundle_failure("passive_context_checkpoint_mismatch")
+    projection = {key: payload[key] for key in ("mode", "round", "phase")}
+    return {
+        "passed": True,
+        "reason_codes": [],
+        "fact_sha256": _canonical_projection_sha256(projection),
+        "fact_count": len(projection),
+        "fact_scope": "overview_only",
+        "mode": mode,
+        "round": round_number,
+        "revision": inspected["revision"],
+        "segment_count": 1,
     }
 
 

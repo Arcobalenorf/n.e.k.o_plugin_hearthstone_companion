@@ -198,6 +198,7 @@ def _query_lane(case_id: str, tool_name: str) -> dict[str, object]:
                             "observed_before_submit": True,
                             "envelope_verified": True,
                             "fact_verified": True,
+                            "fact_scope": "overview_only",
                             "fact_sha256": "b" * 64,
                             "fact_count": 10,
                             "match_id": 1,
