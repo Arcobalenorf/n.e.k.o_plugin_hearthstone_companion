@@ -49,6 +49,119 @@ from neko_answer_probe import (
 )
 
 
+@pytest.mark.parametrize(
+    "output,reason",
+    [
+        (b"OSError: [Errno 10048] private endpoint", "port_in_use"),
+        (b"OSError: [WinError 10013] private endpoint", "port_access_denied"),
+        (b"ModuleNotFoundError: private module", "import_failed"),
+        (b"PermissionError: private path", "permission_denied"),
+        (b"private unexpected message", None),
+    ],
+)
+def test_startup_exit_reports_only_fixed_error_codes(output, reason):
+    service = object.__new__(probe.OfficialPluginService)
+    service._drain_thread = None
+    service._output_tail = output
+    expected = "plugin_service_startup_" + reason if reason else "plugin_service_exited_during_startup"
+    assert service._startup_exit_reason() == expected
+
+
+def test_service_command_preserves_leading_hyphen_token(tmp_path, monkeypatch):
+    import neko_plugin_e2e_host as host
+
+    settings = _settings(tmp_path)
+    settings.python_executable.touch()
+    http_app = tmp_path / "plugin" / "server" / "http_app.py"
+    http_app.parent.mkdir(parents=True)
+    http_app.touch()
+    service = OfficialPluginService(settings)
+    service._token = "-" + "A" * 42
+    service._inbox = tmp_path / "inbox"
+    service._active_log = tmp_path / "Power.log"
+    monkeypatch.setattr(service, "_prepare_tree", lambda: None)
+    monkeypatch.setattr(service, "_child_environment", lambda: {})
+
+    def offline(*args, **kwargs):
+        raise probe.ProbeSkip("offline")
+
+    commands = []
+
+    def capture(command, **kwargs):
+        commands.append(command)
+        raise OSError("test spawn intercepted")
+
+    monkeypatch.setattr(probe, "_http_json", offline)
+    monkeypatch.setattr(probe, "spawn_owned_process", capture)
+    with pytest.raises(probe.ProbeSkip, match="neko_plugin_service_unavailable"):
+        service.start()
+    monkeypatch.setattr(sys, "argv", commands[0][1:])
+    assert host._parse_args().token == service._token
+
+
+@pytest.mark.parametrize("failure_at", ["http", "wait", "tools", "join"])
+def test_service_stop_reclaims_resources_after_graceful_cleanup_error(tmp_path, monkeypatch, failure_at):
+    service = OfficialPluginService(_settings(tmp_path))
+    service._temporary = tmp_path / "hearthstone-neko-e2e-test"
+    actions = []
+
+    def fail():
+        raise OSError("synthetic") if failure_at == "wait" else RuntimeError("synthetic")
+
+    def http(*args, **kwargs):
+        if failure_at == "http":
+            fail()
+        return 200, {"ok": True}
+
+    def wait(**kwargs):
+        if failure_at == "wait":
+            fail()
+
+    def tools(*args):
+        if failure_at == "tools":
+            fail()
+        return []
+
+    def join(**kwargs):
+        if failure_at == "join":
+            fail()
+
+    service._process = SimpleNamespace(poll=lambda: None, wait=wait)
+    service._drain_thread = SimpleNamespace(join=join)
+    monkeypatch.setattr(probe, "_http_json", http)
+    monkeypatch.setattr(probe, "_tool_list", tools)
+    monkeypatch.setattr(probe, "stop_owned_process_tree", lambda process: actions.append("tree") or True)
+    monkeypatch.setattr(probe, "remove_owned_directory", lambda *args, **kwargs: actions.append("directory") or True)
+    if failure_at == "join":
+        with pytest.raises(RuntimeError, match="synthetic"):
+            service.stop()
+    else:
+        service.stop()
+    assert actions == ["tree", "directory"]
+    assert service.cleanup["service_stopped"] is True
+    assert service.cleanup["temporary_files_removed"] is True
+    assert service.cleanup["tools_cleared"] is (failure_at != "tools")
+
+
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
+def test_service_stop_cleans_then_propagates_control_interruption(tmp_path, monkeypatch, interruption):
+    service = OfficialPluginService(_settings(tmp_path))
+    service._temporary = tmp_path / "hearthstone-neko-e2e-test"
+    service._process = SimpleNamespace(poll=lambda: None)
+    actions = []
+
+    def interrupted(*args, **kwargs):
+        raise interruption()
+
+    monkeypatch.setattr(probe, "_http_json", interrupted)
+    monkeypatch.setattr(probe, "_tool_list", lambda *args: [])
+    monkeypatch.setattr(probe, "stop_owned_process_tree", lambda process: actions.append("tree") or True)
+    monkeypatch.setattr(probe, "remove_owned_directory", lambda *args, **kwargs: actions.append("directory") or True)
+    with pytest.raises(interruption):
+        service.stop()
+    assert actions == ["tree", "directory"]
+
+
 def test_checkpoint_entry_loader_restores_existing_sdk_modules(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -990,6 +1103,42 @@ def _turn_state() -> dict[str, object]:
             }
         ],
     }
+
+
+@pytest.mark.parametrize("competing", [False, True])
+def test_capture_classification_does_not_grade_competing_requests(competing: bool) -> None:
+    state = _turn_state()
+    turns = _matching_turns(state, submitted_at_ms=1_000)
+    assert probe._answer_capture_reason_codes(state, turns, competing_turn=competing) == (
+        ["answer_association_ambiguous"] if competing else []
+    )
+
+
+def test_capture_classification_does_not_grade_partial_or_unended_turn() -> None:
+    state = _turn_state()
+    state["turns"][0]["settled"] = False
+    turns = _matching_turns(state, submitted_at_ms=1_000)
+    assert probe._answer_capture_reason_codes(state, turns, competing_turn=False) == ["answer_capture_incomplete"]
+    state = _turn_state()
+    turns = _matching_turns(state, submitted_at_ms=1_000)
+    state["starts"].append({"turnId": "still-producing"})
+    assert probe._answer_capture_reason_codes(state, turns, competing_turn=False) == ["answer_capture_incomplete"]
+
+
+def test_capture_classification_does_not_grade_multi_turn_request_as_last_turn_only() -> None:
+    state = _turn_state()
+    for field in ("starts", "ends", "turns"):
+        state[field].append({**state[field][0], "turnId": "turn-2"})
+    turns = _matching_turns(state, submitted_at_ms=1_000)
+    assert len(turns) == 2
+    assert probe._answer_capture_reason_codes(state, turns, competing_turn=False) == ["answer_association_ambiguous"]
+
+
+def test_capture_classification_does_not_grade_cancelled_response() -> None:
+    state = _turn_state()
+    state["signals"] = ["answer_cancelled"]
+    turns = _matching_turns(state, submitted_at_ms=1_000)
+    assert probe._answer_capture_reason_codes(state, turns, competing_turn=False) == ["answer_cancelled"]
 
 
 def _settings(tmp_path: Path) -> PluginServiceSettings:
@@ -2308,6 +2457,7 @@ def _lifecycle_ui_state(
         visible_ids = list(modern_ids)
     return {
         "active": active,
+        "display_pending": False,
         "pending": (
             sum(message.get("status") != "sent" for message in messages)
             if pending is None
@@ -2825,7 +2975,7 @@ def test_wait_for_no_active_turn_ignores_historical_streaming_bubbles() -> None:
         @classmethod
         def evaluate(cls, script: str) -> dict[str, int]:
             assert "messageStatus" not in script
-            return {"active": 0}
+            return {"active": 0, "display_pending": False}
 
         @classmethod
         def wait_for_timeout(cls, _milliseconds: int) -> None:
@@ -2833,6 +2983,83 @@ def test_wait_for_no_active_turn_ignores_historical_streaming_bubbles() -> None:
 
     probe._wait_for_no_active_turn(Page(), timeout_seconds=0.1)
     assert Page.waits == 0
+
+
+def test_wait_for_no_active_turn_waits_for_pending_display() -> None:
+    class Page:
+        waits = 0
+
+        def evaluate(self, script: str) -> dict[str, object]:
+            assert "_realisticGeminiQueue" in script
+            assert "_isProcessingRealisticQueue" in script
+            assert "_realisticProcessingOwner" in script
+            return {"active": 0, "display_pending": self.waits < 2}
+
+        def wait_for_timeout(self, _milliseconds: int) -> None:
+            self.waits += 1
+
+    page = Page()
+    probe._wait_for_no_active_turn(page, timeout_seconds=0.1)
+    assert page.waits == 2
+
+
+def test_lifecycle_wait_does_not_accept_first_bubble_before_display_drains() -> None:
+    activity = [
+        {"serial": 11, "eventName": "start", "requestId": "", "turnId": "life-1"},
+        {
+            "serial": 12, "eventName": "end", "requestId": "", "turnId": "life-1",
+            "source": "turn_end_agent_callback",
+        },
+    ]
+
+    class Page:
+        waits = 0
+
+        def evaluate(self, script: str, *_args: object) -> dict[str, object]:
+            assert "_realisticGeminiQueue" in script
+            assert "_isProcessingRealisticQueue" in script
+            assert "_realisticProcessingOwner" in script
+            messages = [{"id": "first", "turnId": "life-1", "status": "streaming"}]
+            if self.waits >= 2:
+                messages.append({"id": "last", "turnId": "life-1", "status": "streaming"})
+            return {
+                **_lifecycle_ui_state(activity, messages),
+                "display_pending": self.waits < 2,
+            }
+
+        def wait_for_timeout(self, _milliseconds: int) -> None:
+            self.waits += 1
+
+    page = Page()
+    result = _wait_for_lifecycle_completion(
+        page, after_serial=10, submission_count=1, lifecycle_stage="resumed",
+        message_baseline={"modern_ids": (), "legacy_count": 0, "host_ids": ()},
+    )
+    assert result["visible_turn_count"] == 1
+    assert page.waits == 2
+
+
+@pytest.mark.parametrize("reason,status", [
+    ("lifecycle_turn_incomplete", "UNVERIFIED"),
+    ("capture_state_invalid", "UNVERIFIED"),
+    ("lifecycle_message_unbound", "UNVERIFIED"),
+    ("unexpected_lifecycle_visible_message", "UNVERIFIED"),
+    ("lifecycle_turn_duplicate_event", "FAIL"),
+    ("unexpected_lifecycle_turn", "FAIL"),
+])
+def test_lifecycle_observation_distinguishes_incomplete_capture(
+    monkeypatch: pytest.MonkeyPatch, reason: str, status: str,
+) -> None:
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise ProbeFailure(reason)
+
+    monkeypatch.setattr(probe, "_wait_for_lifecycle_completion", fail)
+    _observed, observed_status, reasons = probe._observe_lifecycle_completion(
+        object(), after_serial=10, submission_count=1, lifecycle_stage="resumed",
+        message_baseline={},
+    )
+    assert observed_status == status
+    assert reasons == [reason]
 
 
 def test_lifecycle_wait_rejects_unknown_end_source() -> None:
@@ -3195,6 +3422,7 @@ def test_case_matrix_records_probe_error_and_continues(monkeypatch: pytest.Monke
 
     assert attempted == ["0", "1"]
     assert reports[0]["status"] == "ERROR"
+    assert reports[0]["answer_observation_status"] == "UNVERIFIED"
     assert reports[0]["reason_codes"] == ["checkpoint_turn_unavailable"]
     assert reports[1]["status"] == "PASS"
 

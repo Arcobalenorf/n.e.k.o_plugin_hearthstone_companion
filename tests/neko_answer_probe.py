@@ -15,6 +15,7 @@ import threading
 import time
 import tomllib
 from dataclasses import dataclass
+from http.client import HTTPException
 from pathlib import Path
 from typing import Any, Callable, Mapping
 from urllib.error import HTTPError, URLError
@@ -253,10 +254,22 @@ _CAPTURE_SCRIPT = r"""
       ).filter((node) => !baselineModern.includes(String(node.dataset.messageId || '')));
       const legacy = Array.from(document.querySelectorAll('.message.gemini'))
         .slice(baselineLegacy);
-      const texts = Array.from(new Set(modern.concat(legacy)))
+      const host = window.reactChatWindowHost;
+      const hostState = host && typeof host.getState === 'function' ? host.getState() : null;
+      const messages = Array.isArray(hostState?.messages) ? hostState.messages : [];
+      const messageTurns = new Map(messages.map((message) => [String(message.id), String(message.turnId || '')]));
+      const candidates = Array.from(new Set(modern.concat(legacy)));
+      const unknown = candidates.some((node) => !String(
+        node.dataset.turnId || messageTurns.get(String(node.dataset.messageId || '')) || ''
+      ));
+      const exclusive = current.starts.length === 1 && current.starts[0].turnId === turnId;
+      const texts = candidates.filter((node) => {
+        const owner = String(node.dataset.turnId || messageTurns.get(String(node.dataset.messageId || '')) || '');
+        return owner ? owner === turnId : exclusive;
+      })
         .map(extractAssistantText)
         .filter(Boolean);
-      return {modern, legacy, texts};
+      return {modern, legacy, texts, ambiguous: unknown && !exclusive};
     }
     const turn = {
       answer: '',
@@ -287,38 +300,40 @@ _CAPTURE_SCRIPT = r"""
     const observer = new MutationObserver(scheduleCheck);
     const settleTimeout = window.setTimeout(() => {
       if (finished) return;
+      checkStable();
       finished = true;
       observer.disconnect();
-      turn.settleFailure = 'dom_not_settled';
-    }, 3000);
-    function finalize(settledTexts) {
-      if (finished) return;
-      finished = true;
-      window.clearTimeout(settleTimeout);
-      observer.disconnect();
-      const starts = current.starts.filter((item) => item.turnId === turnId);
-      turn.startAt = starts.length === 1 ? starts[0].at : null;
-      turn.answer = settledTexts.join('\n');
-      turn.bubbleCount = settledTexts.length;
-      turn.visible = settledTexts.length > 0;
-      turn.settled = true;
-    }
+      if (!turn.settled) turn.settleFailure = turn.settleFailure || 'display_not_complete';
+    }, Math.max(0, current.submittedAt + __ANSWER_TIMEOUT_MS__ - Date.now()));
     function checkStable() {
       if (finished) return;
+      if (window.__hearthstoneAnswerProbe.current !== current) {
+        finished = true;
+        observer.disconnect();
+        window.clearTimeout(settleTimeout);
+        return;
+      }
       const collected = collectVisible();
       const hasCandidate = collected.modern.length > 0 || collected.legacy.length > 0;
       const signature = collected.texts.join('\n');
-      // This callback only starts after the authoritative assistant turn-end
-      // event. React may retain "streaming" on persisted tool-round bubbles,
-      // so status="sent" is not a completion signal. Two stable animation
-      // frames ensure the final DOM mutation has landed without waiting on a
-      // status transition that may never occur.
-      if (hasCandidate && signature) {
+      const starts = current.starts.filter((item) => item.turnId === turnId);
+      turn.startAt = starts.length === 1 ? starts[0].at : null;
+      turn.answer = signature;
+      turn.bubbleCount = collected.texts.length;
+      turn.visible = collected.texts.length > 0;
+      const queue = window._realisticGeminiQueue;
+      const pendingDisplay = (Array.isArray(queue) && queue.length > 0)
+        || Boolean(window._isProcessingRealisticQueue || window._realisticProcessingOwner);
+      // The authoritative assistant turn-end only ends server output. The
+      // pinned host can still be displaying queued sentences. Observe until
+      // the request deadline; later mutations invalidate an earlier settle.
+      turn.settled = false;
+      turn.settleFailure = collected.ambiguous ? 'answer_association_ambiguous' : '';
+      if (!pendingDisplay && !collected.ambiguous && hasCandidate && signature) {
         stableFrames = signature === lastSignature ? stableFrames + 1 : 0;
         lastSignature = signature;
         if (stableFrames >= 1) {
-          finalize(collected.texts);
-          return;
+          turn.settled = true;
         }
       } else {
         stableFrames = 0;
@@ -344,7 +359,9 @@ _CAPTURE_SCRIPT = r"""
     if (current && current.submittedAt) current.signals.push('websocket_disconnected');
   });
 }
-""".replace("__ANSWER_TEXT_EXTRACTOR__", _ANSWER_TEXT_EXTRACTOR)
+""".replace("__ANSWER_TEXT_EXTRACTOR__", _ANSWER_TEXT_EXTRACTOR).replace(
+    "__ANSWER_TIMEOUT_MS__", str(int(ANSWER_TIMEOUT_SECONDS * 1000))
+)
 
 _ARM_SCRIPT = r"""
 (question) => {
@@ -1204,13 +1221,15 @@ def _http_json(
         headers["Content-Type"] = "application/json"
     request = Request(url, data=data, method=method, headers=headers)
     try:
-        with urlopen(request, timeout=timeout) as response:
-            status = int(response.status)
-            body = response.read(1_048_576)
-    except HTTPError as exc:
-        status = int(exc.code)
-        body = exc.read(1_048_576)
-    except (OSError, URLError, TimeoutError) as exc:
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                status = int(response.status)
+                body = response.read(1_048_576)
+        except HTTPError as exc:
+            with exc:
+                status = int(exc.code)
+                body = exc.read(1_048_576)
+    except (OSError, URLError, TimeoutError, HTTPException) as exc:
         raise ProbeSkip("neko_unavailable") from exc
     try:
         value = json.loads(body.decode("utf-8"))
@@ -1456,6 +1475,7 @@ class OfficialPluginService:
         self._process: subprocess.Popen[bytes] | None = None
         self._drain_thread: threading.Thread | None = None
         self._output_hash = hashlib.sha256()
+        self._output_tail = b""
         self._activation = 0
         self._prepared_edge_case = ""
         self._edge_preparation_evidence: dict[str, Any] = {}
@@ -1573,6 +1593,21 @@ class OfficialPluginService:
             if not chunk:
                 return
             self._output_hash.update(chunk)
+            self._output_tail = (self._output_tail + chunk)[-8192:]
+
+    def _startup_exit_reason(self) -> str:
+        if self._drain_thread is not None:
+            self._drain_thread.join(timeout=1.0)
+        output = self._output_tail.lower()
+        for markers, reason in (
+            ((b"address already in use", b"winerror 10048", b"errno 10048"), "port_in_use"),
+            ((b"winerror 10013", b"errno 10013"), "port_access_denied"),
+            ((b"modulenotfounderror", b"importerror"), "import_failed"),
+            ((b"permissionerror",), "permission_denied"),
+        ):
+            if any(marker in output for marker in markers):
+                return "plugin_service_startup_" + reason
+        return "plugin_service_exited_during_startup"
 
     def _verify_main_registration(self) -> bool:
         tools = _tool_list(self.settings.main_base_url, self.settings.role)
@@ -1608,8 +1643,7 @@ class OfficialPluginService:
             "127.0.0.1",
             "--port",
             str(parsed_plugin.port),
-            "--token",
-            self._token,
+            f"--token={self._token}",
             "--inbox-root",
             str(self._inbox),
             "--active-log",
@@ -1640,7 +1674,7 @@ class OfficialPluginService:
         last_health: Mapping[str, Any] = {}
         while time.monotonic() < deadline:
             if self._process.poll() is not None:
-                raise ProbeFailure("plugin_service_exited_during_startup")
+                raise ProbeFailure(self._startup_exit_reason())
             try:
                 status, last_health = _http_json(
                     "GET",
@@ -1663,7 +1697,7 @@ class OfficialPluginService:
                 # before that point is valid but the PUB event has no consumer.
                 time.sleep(MESSAGE_BRIDGE_SETTLE_SECONDS)
                 if self._process.poll() is not None or not self._verify_main_registration():
-                    raise ProbeFailure("plugin_service_exited_during_startup")
+                    raise ProbeFailure(self._startup_exit_reason())
                 return
             time.sleep(0.1)
         raise ProbeFailure("plugin_service_startup_timeout")
@@ -2064,48 +2098,59 @@ class OfficialPluginService:
 
     def stop(self) -> None:
         process = self._process
-        if process is not None and process.poll() is None:
-            try:
-                status, body = _http_json(
-                    "POST",
-                    self._control_url("stop"),
-                    timeout=20.0,
-                    extra_headers=self.control_headers,
-                )
-                self.cleanup["plugin_stopped"] = status == 200 and body.get("ok") is True
-            except (ProbeSkip, ProbeFailure):
-                self.cleanup["plugin_stopped"] = False
-            try:
-                _http_json(
-                    "POST",
-                    self._control_url("shutdown"),
-                    timeout=2.0,
-                    extra_headers=self.control_headers,
-                )
-            except (ProbeSkip, ProbeFailure):
-                pass
-            try:
-                process.wait(timeout=20.0)
-            except subprocess.TimeoutExpired:
-                pass
-        tree_stopped = stop_owned_process_tree(process)
-        self.cleanup["service_stopped"] = bool(tree_stopped and (process is None or process.poll() is not None))
+        self.cleanup.update(plugin_stopped=False, tools_cleared=False, service_stopped=False)
+        if self._temporary is not None:
+            self.cleanup["temporary_files_removed"] = False
         try:
-            remaining = _tool_list(self.settings.main_base_url, self.settings.role)
-            self.cleanup["tools_cleared"] = not any(
-                str(tool.get("source") or "") == PLUGIN_TOOL_SOURCE for tool in remaining
-            )
-        except (ProbeSkip, ProbeFailure):
-            self.cleanup["tools_cleared"] = False
-        if self.cleanup["service_stopped"] and self.cleanup["tools_cleared"]:
-            self.cleanup["plugin_stopped"] = True
-        if self._drain_thread is not None:
-            self._drain_thread.join(timeout=2.0)
-        if self._temporary is not None and tree_stopped:
-            self.cleanup["temporary_files_removed"] = remove_owned_directory(
-                self._temporary,
-                required_prefix="hearthstone-neko-e2e-",
-            )
+            if process is not None and process.poll() is None:
+                try:
+                    status, body = _http_json(
+                        "POST",
+                        self._control_url("stop"),
+                        timeout=20.0,
+                        extra_headers=self.control_headers,
+                    )
+                    self.cleanup["plugin_stopped"] = status == 200 and body.get("ok") is True
+                except Exception:
+                    pass
+                try:
+                    _http_json(
+                        "POST",
+                        self._control_url("shutdown"),
+                        timeout=2.0,
+                        extra_headers=self.control_headers,
+                    )
+                except Exception:
+                    pass
+                try:
+                    process.wait(timeout=20.0)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+        finally:
+            # Graceful shutdown is optional; even a control interruption must
+            # reach the owned-process cleanup before it propagates.
+            tree_stopped = stop_owned_process_tree(process)
+            self.cleanup["service_stopped"] = bool(tree_stopped)
+            try:
+                try:
+                    remaining = _tool_list(self.settings.main_base_url, self.settings.role)
+                    self.cleanup["tools_cleared"] = not any(
+                        str(tool.get("source") or "") == PLUGIN_TOOL_SOURCE for tool in remaining
+                    )
+                except Exception:
+                    pass
+                if self.cleanup["service_stopped"] and self.cleanup["tools_cleared"]:
+                    self.cleanup["plugin_stopped"] = True
+            finally:
+                try:
+                    if self._drain_thread is not None:
+                        self._drain_thread.join(timeout=2.0)
+                finally:
+                    if self._temporary is not None and tree_stopped:
+                        self.cleanup["temporary_files_removed"] = remove_owned_directory(
+                            self._temporary,
+                            required_prefix="hearthstone-neko-e2e-",
+                        )
 
     def __enter__(self) -> OfficialPluginService:
         try:
@@ -2139,7 +2184,7 @@ def _answer_summary(
 ) -> Mapping[str, Any]:
     if turn is None or result is None:
         return {
-            "status": "FAIL",
+            "status": "UNVERIFIED",
             "reason_codes": ["no_completed_answer"],
             "visible": False,
         }
@@ -2464,10 +2509,12 @@ def _wait_for_no_active_turn(page: Any, *, timeout_seconds: float = 20.0) -> Non
     while time.monotonic() < deadline:
         state = page.evaluate(
             """() => ({
-              active: Object.keys(window.__hearthstoneAnswerProbe?.activeTurnIds || {}).length
+              active: Object.keys(window.__hearthstoneAnswerProbe?.activeTurnIds || {}).length,
+              display_pending: Boolean(window._realisticGeminiQueue?.length
+                || window._isProcessingRealisticQueue || window._realisticProcessingOwner)
             })"""
         )
-        if isinstance(state, Mapping) and state.get("active") == 0:
+        if isinstance(state, Mapping) and state.get("active") == 0 and state.get("display_pending") is False:
             return
         page.wait_for_timeout(100)
     raise ProbeFailure("preexisting_turn_inflight")
@@ -2538,6 +2585,8 @@ def _wait_for_lifecycle_completion(
                 : null;
               return {
               active: Object.keys(window.__hearthstoneAnswerProbe?.activeTurnIds || {}).length,
+              display_pending: Boolean(window._realisticGeminiQueue?.length
+                || window._isProcessingRealisticQueue || window._realisticProcessingOwner),
               activity: (window.__hearthstoneAnswerProbe?.activity || []).slice(),
               pending: modern.filter(
                 (node) => String(node.dataset.messageStatus || '') !== 'sent'
@@ -2597,6 +2646,11 @@ def _wait_for_lifecycle_completion(
             if len(completed) > submission_count:
                 raise ProbeFailure("unexpected_lifecycle_turn")
             if not completed:
+                page.wait_for_timeout(100)
+                continue
+            if not isinstance(state.get("display_pending"), bool):
+                raise ProbeFailure("capture_state_invalid")
+            if state["display_pending"]:
                 page.wait_for_timeout(100)
                 continue
             host_messages = state.get("host_messages")
@@ -2688,7 +2742,14 @@ def _observe_lifecycle_completion(
             message_baseline=message_baseline,
         )
     except ProbeFailure as exc:
-        return fallback, "FAIL", [str(exc)]
+        incomplete = str(exc) in {
+            "lifecycle_turn_incomplete",
+            "capture_state_invalid",
+            "lifecycle_message_unbound",
+            "unexpected_lifecycle_visible_message",
+            "lifecycle_message_status_invalid",
+        }
+        return fallback, "UNVERIFIED" if incomplete else "FAIL", [str(exc)]
     reasons: list[str] = []
     if observed.get("submission_count") != submission_count:
         reasons.append("lifecycle_observed_submission_count_mismatch")
@@ -2720,6 +2781,16 @@ def _tool_fact_matches(call: Mapping[str, Any], expected_sha256: str) -> bool:
         return False
     observed = str(contract.get("fact_sha256") or "")
     return bool(re.fullmatch(r"[0-9a-f]{64}", observed) and secrets.compare_digest(observed, expected_sha256))
+
+
+def _verified_tool_names(calls: list[Mapping[str, Any]], expected_sha256: str) -> list[str]:
+    return [
+        str(call.get("name") or "")
+        for call in calls
+        if call.get("status") == "completed"
+        and call.get("is_error") is False
+        and _tool_fact_matches(call, expected_sha256)
+    ]
 
 
 def _public_output_contract(
@@ -2777,6 +2848,9 @@ def _run_lifecycle_case(
                 lifecycle_stage=pre_stage,
                 message_baseline=pre_baseline,
             )
+            # A failed observation must not carry a still-draining pre-event
+            # display into the next lifecycle checkpoint's baseline.
+            _wait_for_no_active_turn(page)
         else:
             pre_observation_status = "PASS"
             pre_observation_reasons = []
@@ -2868,6 +2942,30 @@ def _query_case_deterministic_reason_codes(
     )
 
 
+def _answer_capture_reason_codes(
+    state: Mapping[str, Any],
+    turns: list[Mapping[str, Any]],
+    *,
+    competing_turn: bool,
+) -> list[str]:
+    """Keep incomplete or ambiguous capture separate from model answer grading."""
+    reasons: list[str] = []
+    raw_turns = state.get("turns")
+    if not isinstance(raw_turns, list):
+        reasons.append("capture_state_invalid")
+    elif not turns or len(turns) != len(raw_turns) or any(
+        not isinstance(state.get(key), list) or len(state[key]) != len(turns)
+        for key in ("starts", "ends")
+    ):
+        reasons.append("answer_capture_incomplete")
+    if competing_turn or len(turns) > 1:
+        reasons.append("answer_association_ambiguous")
+    signals = state.get("signals")
+    if isinstance(signals, list):
+        reasons.extend(signal for signal in signals if signal in {"answer_cancelled", "websocket_disconnected"})
+    return reasons
+
+
 def _run_query_case(
     page: Any,
     loaded: LoadedCase,
@@ -2905,17 +3003,16 @@ def _run_query_case(
 
     def called_before(turn: Mapping[str, Any]) -> list[str]:
         ended_at = float(turn.get("endedAt") or 0) / 1000.0
-        return [
-            str(call["name"])
-            for call in _successful_calls(
+        return _verified_tool_names(
+            _successful_calls(
                 service,
                 epoch,
                 submitted_wall=submitted_wall,
                 expires_wall=expires_wall,
                 ended_wall=ended_at or None,
-            )
-            if _tool_fact_matches(call, activation.tool_fact_sha256)
-        ]
+            ),
+            activation.tool_fact_sha256,
+        )
 
     remaining = ANSWER_TIMEOUT_SECONDS - max(0.0, time.time() - submitted_wall)
     deadline = time.monotonic() + max(0.0, remaining)
@@ -2927,7 +3024,7 @@ def _run_query_case(
     route_observations_by_key: dict[tuple[str, float], Mapping[str, Any]] = {}
     next_route_poll_at = 0.0
     answer_stable_since: float | None = None
-    answer_activity_signature: tuple[int, int, int] | None = None
+    answer_activity_signature: tuple[Any, ...] | None = None
 
     def refresh_route_observations() -> tuple[Mapping[str, Any], ...]:
         nonlocal next_route_poll_at
@@ -2959,29 +3056,13 @@ def _run_query_case(
             if isinstance(state, Mapping)
             else []
         )
-        if turns:
-            if turns and first_turn is None and isinstance(turns[0], Mapping):
-                first_turn = turns[0]
-                first_result = evaluate_delivery(
-                    loaded.case,
-                    str(first_turn.get("answer") or ""),
-                    visible=bool(first_turn.get("visible")),
-                    called_tools=called_before(first_turn),
-                )
-            for turn in turns:
-                if not isinstance(turn, Mapping):
-                    continue
-                delivery = evaluate_delivery(
-                    loaded.case,
-                    str(turn.get("answer") or ""),
-                    visible=bool(turn.get("visible")),
-                    called_tools=called_before(turn),
-                )
-                if delivery["passed"]:
-                    eventual_turn = turn
-                    eventual_result = delivery
-                    break
-        if eventual_result is not None:
+        # Capture completion must not depend on whether the answer is correct.
+        # Require every observed start to finish before the final UI bridge wait.
+        capture_complete = bool(turns) and all(
+            isinstance(state.get(key), list) and len(state[key]) == len(turns)
+            for key in ("starts", "ends", "turns")
+        )
+        if capture_complete:
             activity_signature = tuple(
                 len(value) if isinstance(value, list) else 0
                 for value in (
@@ -2989,13 +3070,16 @@ def _run_query_case(
                     state.get("ends"),
                     state.get("turns"),
                 )
-            )
+            ) + tuple((turn.get("turnId"), turn.get("answer")) for turn in turns)
             now = time.monotonic()
             if activity_signature != answer_activity_signature:
                 answer_activity_signature = activity_signature
                 answer_stable_since = now
             elif answer_stable_since is not None and now - answer_stable_since >= MESSAGE_BRIDGE_SETTLE_SECONDS:
                 break
+        else:
+            answer_stable_since = None
+            answer_activity_signature = None
         signals = state.get("signals") if isinstance(state, Mapping) else []
         if isinstance(signals, list) and "websocket_disconnected" in signals:
             break
@@ -3038,7 +3122,17 @@ def _run_query_case(
         if isinstance(state, Mapping)
         else []
     )
-    if turns:
+    competing_turn = (
+        _has_competing_turn(
+            state,
+            submitted_at_ms=submitted_at_ms,
+            route_observations=route_observations,
+        )
+        if isinstance(state, Mapping)
+        else True
+    )
+    capture_reasons = _answer_capture_reason_codes(state, turns, competing_turn=competing_turn)
+    if turns and not capture_reasons:
         first_turn = turns[0]
         first_result = evaluate_delivery(
             loaded.case,
@@ -3066,16 +3160,19 @@ def _run_query_case(
                 called_tools=called_before(turn),
             ),
         )
-        for turn in turns
+        for turn in (turns if not capture_reasons else [])
         if isinstance(turn, Mapping)
     ]
     passed_turns = [turn for turn, delivery in evaluated_turns if delivery.get("passed")]
     if privacy_answers is not None:
         privacy_answers.update(
-            answer for turn, _delivery in evaluated_turns if (answer := str(turn.get("answer") or "").strip())
+            answer
+            for turn in (state.get("turns") or [])
+            if isinstance(turn, Mapping) and (answer := str(turn.get("answer") or "").strip())
         )
 
     answer_called_names = called_before(eventual_turn) if eventual_turn is not None else []
+    observed_called_names = _verified_tool_names(calls, activation.tool_fact_sha256)
     answer_delivery_route = (
         "proactive_query"
         if eventual_turn is not None and eventual_turn.get("source") == "turn_end_agent_callback"
@@ -3108,16 +3205,7 @@ def _run_query_case(
     )
 
     signals = state.get("signals") if isinstance(state, Mapping) else []
-    competing_turn = (
-        _has_competing_turn(
-            state,
-            submitted_at_ms=submitted_at_ms,
-            route_observations=route_observations,
-        )
-        if isinstance(state, Mapping)
-        else True
-    )
-    case_reasons: list[str] = []
+    case_reasons: list[str] = list(capture_reasons)
     raw_turns = state.get("turns") if isinstance(state, Mapping) else None
     if not isinstance(raw_turns, list):
         case_reasons.append("capture_state_invalid")
@@ -3131,7 +3219,7 @@ def _run_query_case(
         case_reasons.append("duplicate_visible_answer")
     if len(passed_turns) > 1:
         case_reasons.append("duplicate_correct_answer")
-    if eventual_result is None or not eventual_result.get("passed"):
+    if not capture_reasons and (eventual_result is None or not eventual_result.get("passed")):
         case_reasons.extend(
             list(eventual_result.get("reason_codes") or [])
             if eventual_result is not None
@@ -3164,7 +3252,7 @@ def _run_query_case(
         }
         for call in calls
     ]
-    answer_observation_status = "PASS" if not case_reasons else "FAIL"
+    answer_observation_status = "UNVERIFIED" if capture_reasons else "PASS" if not case_reasons else "FAIL"
     deterministic_reasons = _query_case_deterministic_reason_codes(passive_context)
     return {
         "case_id": loaded.case.case_id,
@@ -3182,7 +3270,7 @@ def _run_query_case(
         "route": {
             "status": "OBSERVED" if query_route_verified else "NOT_OBSERVED",
             "expected_tool": loaded.case.expected_tool,
-            "expected_tool_called": loaded.case.expected_tool in answer_called_names,
+            "expected_tool_called": loaded.case.expected_tool in observed_called_names,
             "delivery_route": answer_delivery_route,
             "evidence_source": evidence_source,
             "query_route_verified": query_route_verified,
@@ -3287,6 +3375,7 @@ def _run_cases(
                 "case_id": loaded.case.case_id,
                 "lane": lane,
                 "status": "BLOCKED_BY_LIFECYCLE" if lifecycle_blocked else "ERROR",
+                "answer_observation_status": "UNVERIFIED",
                 "checkpoint": {
                     "kind": loaded.case.kind,
                     "line": loaded.line,
@@ -3303,12 +3392,12 @@ def _run_cases(
                     "tool_calls": [],
                 },
                 "first_answer": {
-                    "status": "FAIL",
+                    "status": "UNVERIFIED",
                     "reason_codes": ["no_completed_answer"],
                     "visible": False,
                 },
                 "eventual_answer": {
-                    "status": "FAIL",
+                    "status": "UNVERIFIED",
                     "reason_codes": ["no_completed_answer"],
                     "visible": False,
                 },
@@ -3778,15 +3867,16 @@ def _run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         set_enabled_skip(str(exc))
     except ProbeFailure as exc:
         report.update(status="ERROR", reason_code=str(exc))
-    except BaseException:
-        report.update(status="ERROR", reason_code=f"probe_internal_error_{stage}")
+    except BaseException as exc:
+        report.update(status="ERROR", reason_code=f"probe_internal_error_{stage}", error_type=type(exc).__name__)
     finally:
         if service is not None:
             try:
                 service.stop()
                 report["cleanup"].update(service.cleanup)
-            except BaseException:
+            except BaseException as exc:
                 report.update(status="ERROR")
+                report["cleanup_error_type"] = type(exc).__name__
                 report.setdefault("reason_code", "plugin_service_cleanup_failed")
                 report["cleanup_reason_code"] = "plugin_service_cleanup_failed"
             if not all(service.cleanup.values()):
